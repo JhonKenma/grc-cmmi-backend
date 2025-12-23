@@ -1,0 +1,696 @@
+# apps/respuestas/serializers.py
+
+from rest_framework import serializers
+from django.db import transaction
+from django.utils import timezone
+
+from .models import (
+    TipoDocumento,
+    Respuesta,
+    HistorialRespuesta,
+    Evidencia,
+    CalculoNivel,
+    Iniciativa
+)
+from apps.encuestas.models import Pregunta, Dimension
+from apps.asignaciones.models import Asignacion
+from apps.usuarios.models import Usuario
+
+
+# ============================================
+# SERIALIZERS DE TIPOS DE DOCUMENTO
+# ============================================
+
+class TipoDocumentoSerializer(serializers.ModelSerializer):
+    """Serializer para tipos de documento"""
+    
+    class Meta:
+        model = TipoDocumento
+        fields = [
+            'id', 'empresa', 'nombre', 'descripcion', 
+            'requiere_fecha', 'activo'
+        ]
+        read_only_fields = ['id']
+
+
+class TipoDocumentoListSerializer(serializers.ModelSerializer):
+    """Serializer simplificado para listados"""
+    
+    class Meta:
+        model = TipoDocumento
+        fields = ['id', 'nombre', 'descripcion']
+
+
+# ============================================
+# SERIALIZERS DE EVIDENCIAS
+# ============================================
+
+class EvidenciaSerializer(serializers.ModelSerializer):
+    """Serializer completo para evidencias"""
+    
+    subido_por_nombre = serializers.CharField(
+        source='subido_por.nombre_completo', 
+        read_only=True
+    )
+    url_archivo = serializers.SerializerMethodField()
+    tamanio_mb = serializers.SerializerMethodField()
+    tipo_documento_display = serializers.CharField(
+        source='get_tipo_documento_enum_display',
+        read_only=True
+    )
+    
+    class Meta:
+        model = Evidencia
+        fields = [
+            'id', 'respuesta',
+            'codigo_documento',  # ⭐ NUEVO
+            'tipo_documento_enum', 'tipo_documento_display',
+            'titulo_documento', 'objetivo_documento', 
+            'fecha_ultima_actualizacion', 'nombre_archivo_original',
+            'archivo', 'tamanio_bytes', 'tamanio_mb', 'url_archivo',
+            'subido_por', 'subido_por_nombre',
+            'fecha_creacion', 'activo'
+        ]
+        read_only_fields = [
+            'id', 'nombre_archivo_original', 'tamanio_bytes', 
+            'url_archivo', 'tamanio_mb', 'fecha_creacion'
+        ]
+    
+    def get_url_archivo(self, obj):
+        """Retorna URL del archivo"""
+        if obj.archivo:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.archivo.url)
+            return obj.archivo.url
+        return None
+    
+    def get_tamanio_mb(self, obj):
+        """Retorna tamaño en MB"""
+        return obj.tamanio_mb
+    
+    def validate(self, attrs):
+        """Validaciones"""
+        respuesta = attrs.get('respuesta')
+        
+        # Validar máximo 3 evidencias
+        if respuesta and not self.instance:
+            if respuesta.evidencias.count() >= 3:
+                raise serializers.ValidationError({
+                    'respuesta': 'Solo se permiten máximo 3 archivos de evidencia por respuesta'
+                })
+        
+        return attrs
+
+
+
+class EvidenciaCreateSerializer(serializers.ModelSerializer):
+    """Serializer para crear evidencias con archivo"""
+    
+    class Meta:
+        model = Evidencia
+        fields = [
+            'respuesta',
+            'codigo_documento',  # ⭐ NUEVO
+            'tipo_documento_enum', 
+            'titulo_documento',
+            'objetivo_documento', 
+            'fecha_ultima_actualizacion', 
+            'archivo'
+        ]
+    
+    def validate_codigo_documento(self, value):
+        """Validar código de documento"""
+        if not value or len(value.strip()) == 0:
+            raise serializers.ValidationError('El código de documento es obligatorio')
+        
+        # Limpiar espacios y convertir a mayúsculas
+        return value.strip().upper()
+    
+    def validate_archivo(self, value):
+        """Validar archivo"""
+        import os
+        ext = os.path.splitext(value.name)[1].lower()
+        if ext not in Evidencia.EXTENSIONES_PERMITIDAS:
+            raise serializers.ValidationError(
+                f'Extensión no permitida. Válidas: {", ".join(Evidencia.EXTENSIONES_PERMITIDAS)}'
+            )
+        
+        # Validar tamaño (10MB)
+        if value.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError('El archivo no puede superar los 10MB')
+        
+        return value
+    
+    def create(self, validated_data):
+        """Crear evidencia con auditoría"""
+        request = self.context.get('request')
+        if request and request.user:
+            validated_data['subido_por'] = request.user
+        
+        return super().create(validated_data)
+
+class VerificarCodigoDocumentoSerializer(serializers.Serializer):
+    """Serializer para verificar si un código de documento ya existe"""
+    
+    codigo_documento = serializers.CharField(required=True)
+    
+    def validate_codigo_documento(self, value):
+        return value.strip().upper()
+
+
+# ============================================
+# SERIALIZERS DE HISTORIAL
+# ============================================
+
+class HistorialRespuestaSerializer(serializers.ModelSerializer):
+    """Serializer para historial de cambios"""
+    
+    usuario_nombre = serializers.CharField(
+        source='usuario.nombre_completo',
+        read_only=True
+    )
+    tipo_cambio_display = serializers.CharField(
+        source='get_tipo_cambio_display',
+        read_only=True
+    )
+    
+    class Meta:
+        model = HistorialRespuesta
+        fields = [
+            'id', 'respuesta', 'tipo_cambio', 'tipo_cambio_display',
+            'usuario', 'usuario_nombre',
+            'valor_anterior_respuesta', 'valor_anterior_justificacion',
+            'valor_anterior_comentarios',
+            'valor_nuevo_respuesta', 'valor_nuevo_justificacion',
+            'valor_nuevo_comentarios',
+            'motivo', 'ip_address', 'user_agent', 'timestamp'
+        ]
+        read_only_fields = ['id', 'timestamp']
+
+
+# ============================================
+# SERIALIZERS DE RESPUESTAS
+# ============================================
+
+class RespuestaListSerializer(serializers.ModelSerializer):
+    """Serializer simplificado para listados"""
+    
+    pregunta_codigo = serializers.CharField(source='pregunta.codigo', read_only=True)
+    pregunta_texto = serializers.CharField(source='pregunta.texto', read_only=True)
+    respuesta_display = serializers.CharField(
+        source='get_respuesta_display',
+        read_only=True
+    )
+    estado_display = serializers.CharField(
+        source='get_estado_display',
+        read_only=True
+    )
+    respondido_por_nombre = serializers.CharField(
+        source='respondido_por.nombre_completo',
+        read_only=True
+    )
+    total_evidencias = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Respuesta
+        fields = [
+            'id', 'asignacion', 'pregunta', 'pregunta_codigo', 'pregunta_texto',
+            'respuesta', 'respuesta_display', 'justificacion',
+            'estado', 'estado_display', 'respondido_por', 'respondido_por_nombre',
+            'respondido_at', 'total_evidencias', 'version'
+        ]
+    
+    def get_total_evidencias(self, obj):
+        """Total de evidencias"""
+        return obj.evidencias.filter(activo=True).count()
+
+
+class RespuestaDetailSerializer(serializers.ModelSerializer):
+    """Serializer detallado con evidencias e historial"""
+    
+    pregunta_codigo = serializers.CharField(source='pregunta.codigo', read_only=True)
+    pregunta_texto = serializers.CharField(source='pregunta.texto', read_only=True)
+    pregunta_objetivo = serializers.CharField(source='pregunta.objetivo', read_only=True)
+    respuesta_display = serializers.CharField(source='get_respuesta_display', read_only=True)
+    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
+    respondido_por_nombre = serializers.CharField(
+        source='respondido_por.nombre_completo',
+        read_only=True
+    )
+    modificado_por_nombre = serializers.CharField(
+        source='modificado_por.nombre_completo',
+        read_only=True
+    )
+    
+    evidencias = EvidenciaSerializer(many=True, read_only=True)
+    historial = HistorialRespuestaSerializer(many=True, read_only=True)
+    
+    class Meta:
+        model = Respuesta
+        fields = [
+            'id', 'asignacion', 'pregunta', 'pregunta_codigo', 'pregunta_texto',
+            'pregunta_objetivo', 'respuesta', 'respuesta_display',
+            'justificacion', 'comentarios_adicionales',
+            'estado', 'estado_display',
+            'respondido_por', 'respondido_por_nombre', 'respondido_at',
+            'modificado_por', 'modificado_por_nombre', 'modificado_at',
+            'version', 'evidencias', 'historial'
+        ]
+
+
+class RespuestaCreateSerializer(serializers.ModelSerializer):
+    """Serializer para crear respuestas"""
+    
+    class Meta:
+        model = Respuesta
+        fields = [
+            'asignacion', 'pregunta', 'respuesta', 
+            'justificacion', 'comentarios_adicionales'
+        ]
+    
+    def validate(self, attrs):
+        """Validaciones"""
+        asignacion = attrs.get('asignacion')
+        pregunta = attrs.get('pregunta')
+        respuesta = attrs.get('respuesta')  # ⭐ NUEVO
+        justificacion = attrs.get('justificacion', '')
+        
+        # Validar que la pregunta pertenezca a la dimensión de la asignación
+        if pregunta.dimension != asignacion.dimension:
+            raise serializers.ValidationError({
+                'pregunta': 'La pregunta no pertenece a la dimensión de esta asignación'
+            })
+        
+        # Validar que no exista ya una respuesta
+        if Respuesta.objects.filter(
+            asignacion=asignacion,
+            pregunta=pregunta
+        ).exists():
+            raise serializers.ValidationError({
+                'pregunta': 'Ya existe una respuesta para esta pregunta'
+            })
+        
+        # ⭐ NUEVA VALIDACIÓN: Para "Sí Cumple", justificación obligatoria
+        if respuesta == 'SI_CUMPLE' and len(justificacion.strip()) < 10:
+            raise serializers.ValidationError({
+                'justificacion': 'Para respuestas "Sí Cumple", la justificación debe tener al menos 10 caracteres'
+            })
+        
+        # Validar longitud mínima general
+        if len(justificacion.strip()) < 10:
+            raise serializers.ValidationError({
+                'justificacion': 'La justificación debe tener al menos 10 caracteres'
+            })
+        
+        return attrs
+    
+    def create(self, validated_data):
+        """Crear respuesta con auditoría"""
+        request = self.context.get('request')
+        
+        with transaction.atomic():
+            # Establecer usuario que responde
+            if request and request.user:
+                validated_data['respondido_por'] = request.user
+            
+            # Crear respuesta en borrador por defecto
+            validated_data['estado'] = 'borrador'
+            validated_data['version'] = 1
+            
+            respuesta = Respuesta.objects.create(**validated_data)
+            
+            # Crear registro de auditoría
+            HistorialRespuesta.objects.create(
+                respuesta=respuesta,
+                tipo_cambio='creacion',
+                usuario=request.user if request else None,
+                valor_nuevo_respuesta=respuesta.respuesta,
+                valor_nuevo_justificacion=respuesta.justificacion,
+                motivo='Creación inicial de respuesta',
+                ip_address=self._get_client_ip(request),
+                user_agent=self._get_user_agent(request)
+            )
+            
+            return respuesta
+    
+    def _get_client_ip(self, request):
+        """Obtener IP del cliente"""
+        if not request:
+            return None
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0]
+        return request.META.get('REMOTE_ADDR')
+    
+    def _get_user_agent(self, request):
+        """Obtener User Agent"""
+        if not request:
+            return ''
+        return request.META.get('HTTP_USER_AGENT', '')[:255]
+
+
+class RespuestaUpdateSerializer(serializers.ModelSerializer):
+    """Serializer para actualizar respuestas (Usuario)"""
+    
+    class Meta:
+        model = Respuesta
+        fields = ['respuesta', 'justificacion', 'comentarios_adicionales']
+    
+    def validate(self, attrs):
+        """Validaciones"""
+        # Solo permitir actualizar si está en borrador
+        if self.instance.estado != 'borrador':
+            raise serializers.ValidationError({
+                'estado': 'Solo se pueden editar respuestas en estado borrador'
+            })
+        
+        # ⭐ Obtener respuesta actual o nueva
+        respuesta = attrs.get('respuesta', self.instance.respuesta)
+        justificacion = attrs.get('justificacion', self.instance.justificacion)
+        
+        # ⭐ NUEVA VALIDACIÓN: Para "Sí Cumple", justificación obligatoria
+        if respuesta == 'SI_CUMPLE' and len(justificacion.strip()) < 10:
+            raise serializers.ValidationError({
+                'justificacion': 'Para respuestas "Sí Cumple", la justificación debe tener al menos 10 caracteres'
+            })
+        
+        # Validar longitud mínima general
+        if len(justificacion.strip()) < 10:
+            raise serializers.ValidationError({
+                'justificacion': 'La justificación debe tener al menos 10 caracteres'
+            })
+        
+        return attrs
+    
+    def update(self, instance, validated_data):
+        """Actualizar con auditoría"""
+        request = self.context.get('request')
+        
+        with transaction.atomic():
+            # Guardar valores anteriores
+            valor_anterior_respuesta = instance.respuesta
+            valor_anterior_justificacion = instance.justificacion
+            valor_anterior_comentarios = instance.comentarios_adicionales
+            
+            # Actualizar respuesta
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            
+            instance.save()
+            
+            # Crear registro de auditoría
+            HistorialRespuesta.objects.create(
+                respuesta=instance,
+                tipo_cambio='modificacion_respuesta',
+                usuario=request.user if request else None,
+                valor_anterior_respuesta=valor_anterior_respuesta,
+                valor_anterior_justificacion=valor_anterior_justificacion,
+                valor_anterior_comentarios=valor_anterior_comentarios,
+                valor_nuevo_respuesta=instance.respuesta,
+                valor_nuevo_justificacion=instance.justificacion,
+                valor_nuevo_comentarios=instance.comentarios_adicionales,
+                motivo='Actualización por el usuario',
+                ip_address=self._get_client_ip(request),
+                user_agent=self._get_user_agent(request)
+            )
+            
+            return instance
+    
+    def _get_client_ip(self, request):
+        if not request:
+            return None
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0]
+        return request.META.get('REMOTE_ADDR')
+    
+    def _get_user_agent(self, request):
+        if not request:
+            return ''
+        return request.META.get('HTTP_USER_AGENT', '')[:255]
+
+
+class RespuestaEnviarSerializer(serializers.Serializer):
+    """Serializer para enviar respuesta (marcar como enviada)"""
+    
+    def validate(self, attrs):
+        """Validaciones antes de enviar"""
+        respuesta = self.instance
+        
+        # Validar que esté en borrador
+        if respuesta.estado != 'borrador':
+            raise serializers.ValidationError({
+                'estado': 'Solo se pueden enviar respuestas en estado borrador'
+            })
+        
+        # ⭐ ACTUALIZADO: Si es "Sí Cumple", debe tener evidencias
+        if respuesta.respuesta == 'SI_CUMPLE':
+            if not respuesta.evidencias.filter(activo=True).exists():
+                raise serializers.ValidationError({
+                    'evidencias': 'Las respuestas "Sí Cumple" requieren al menos una evidencia'
+                })
+        
+        return attrs
+    
+    def save(self):
+        """Enviar respuesta"""
+        respuesta = self.instance
+        request = self.context.get('request')
+        
+        with transaction.atomic():
+            respuesta.estado = 'enviado'
+            respuesta.save()
+            
+            # Crear registro de auditoría
+            HistorialRespuesta.objects.create(
+                respuesta=respuesta,
+                tipo_cambio='modificacion_respuesta',
+                usuario=request.user if request else None,
+                valor_anterior_respuesta='borrador',
+                valor_nuevo_respuesta='enviado',
+                motivo='Respuesta enviada por el usuario',
+                ip_address=self._get_client_ip(request),
+                user_agent=self._get_user_agent(request)
+            )
+            
+            return respuesta
+    
+    def _get_client_ip(self, request):
+        if not request:
+            return None
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0]
+        return request.META.get('REMOTE_ADDR')
+    
+    def _get_user_agent(self, request):
+        if not request:
+            return ''
+        return request.META.get('HTTP_USER_AGENT', '')[:255]
+
+
+class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
+    """
+    Serializer para que el Administrador modifique respuestas del usuario
+    ⭐ NUEVA FUNCIONALIDAD
+    """
+    
+    motivo_modificacion = serializers.CharField(
+        write_only=True,
+        required=True,
+        min_length=10,
+        help_text='Motivo de la modificación (mínimo 10 caracteres)'
+    )
+    
+    class Meta:
+        model = Respuesta
+        fields = [
+            'respuesta', 'justificacion', 'comentarios_adicionales',
+            'motivo_modificacion'
+        ]
+    
+    def validate(self, attrs):
+        """Validaciones para admin"""
+        request = self.context.get('request')
+        
+        # Validar que el usuario sea administrador
+        if not request or request.user.rol not in ['administrador', 'superadmin']:
+            raise serializers.ValidationError({
+                'permiso': 'Solo administradores pueden modificar respuestas'
+            })
+        
+        # Validar que la respuesta esté enviada
+        if self.instance.estado not in ['enviado', 'modificado_admin']:
+            raise serializers.ValidationError({
+                'estado': 'Solo se pueden modificar respuestas enviadas'
+            })
+        
+        return attrs
+    
+    def update(self, instance, validated_data):
+        """Modificar respuesta con auditoría completa"""
+        request = self.context.get('request')
+        motivo = validated_data.pop('motivo_modificacion')
+        
+        with transaction.atomic():
+            # Guardar valores anteriores
+            valor_anterior_respuesta = instance.respuesta
+            valor_anterior_justificacion = instance.justificacion
+            valor_anterior_comentarios = instance.comentarios_adicionales
+            
+            # Actualizar respuesta
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            
+            instance.estado = 'modificado_admin'
+            instance.modificado_por = request.user
+            instance.modificado_at = timezone.now()
+            instance.version += 1
+            instance.save()
+            
+            # ⭐ CREAR REGISTRO DE AUDITORÍA
+            HistorialRespuesta.objects.create(
+                respuesta=instance,
+                tipo_cambio='modificacion_respuesta',
+                usuario=request.user,
+                valor_anterior_respuesta=valor_anterior_respuesta,
+                valor_anterior_justificacion=valor_anterior_justificacion,
+                valor_anterior_comentarios=valor_anterior_comentarios,
+                valor_nuevo_respuesta=instance.respuesta,
+                valor_nuevo_justificacion=instance.justificacion,
+                valor_nuevo_comentarios=instance.comentarios_adicionales,
+                motivo=f'Modificación por administrador: {motivo}',
+                ip_address=self._get_client_ip(request),
+                user_agent=self._get_user_agent(request)
+            )
+            
+            return instance
+    
+    def _get_client_ip(self, request):
+        if not request:
+            return None
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0]
+        return request.META.get('REMOTE_ADDR')
+    
+    def _get_user_agent(self, request):
+        if not request:
+            return ''
+        return request.META.get('HTTP_USER_AGENT', '')[:255]
+
+
+# ============================================
+# SERIALIZERS DE CÁLCULO DE NIVEL
+# ============================================
+
+class CalculoNivelSerializer(serializers.ModelSerializer):
+    """Serializer para cálculos de nivel de madurez"""
+    
+    dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True)
+    dimension_codigo = serializers.CharField(source='dimension.codigo', read_only=True)
+    clasificacion_gap_display = serializers.CharField(
+        source='get_clasificacion_gap_display',
+        read_only=True
+    )
+    
+    class Meta:
+        model = CalculoNivel
+        fields = [
+            'id', 'asignacion', 'dimension', 'dimension_nombre', 'dimension_codigo',
+            'nivel_actual', 'nivel_deseado', 'gap',
+            'total_preguntas', 
+            # ⭐ NUEVOS CAMPOS
+            'respuestas_si_cumple', 'respuestas_cumple_parcial', 
+            'respuestas_no_cumple', 'respuestas_no_aplica',
+            # ⚠️ CAMPOS LEGACY (mantener por compatibilidad o eliminar después)
+            'respuestas_yes', 'respuestas_no', 'respuestas_na',
+            'porcentaje_cumplimiento', 'clasificacion_gap', 'clasificacion_gap_display',
+            'calculado_at'
+        ]
+        read_only_fields = ['id', 'calculado_at']
+
+
+# ============================================
+# SERIALIZERS DE INICIATIVAS
+# ============================================
+
+class IniciativaListSerializer(serializers.ModelSerializer):
+    """Serializer simplificado para listados"""
+    
+    dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True)
+    empresa_nombre = serializers.CharField(source='empresa.nombre', read_only=True)
+    responsable_nombre = serializers.CharField(
+        source='responsable.nombre_completo',
+        read_only=True
+    )
+    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
+    prioridad_display = serializers.CharField(source='get_prioridad_display', read_only=True)
+    dias_restantes = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Iniciativa
+        fields = [
+            'id', 'titulo', 'dimension', 'dimension_nombre',
+            'empresa', 'empresa_nombre', 'responsable', 'responsable_nombre',
+            'estado', 'estado_display', 'prioridad', 'prioridad_display',
+            'fecha_inicio_estimada', 'fecha_termino_estimada',
+            'porcentaje_avance', 'dias_restantes'
+        ]
+    
+    def get_dias_restantes(self, obj):
+        return obj.dias_restantes
+
+
+class IniciativaDetailSerializer(serializers.ModelSerializer):
+    """Serializer detallado de iniciativas"""
+    
+    calculo_nivel = CalculoNivelSerializer(read_only=True)
+    dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True)
+    empresa_nombre = serializers.CharField(source='empresa.nombre', read_only=True)
+    responsable_nombre = serializers.CharField(
+        source='responsable.nombre_completo',
+        read_only=True
+    )
+    asignado_por_nombre = serializers.CharField(
+        source='asignado_por.nombre_completo',
+        read_only=True
+    )
+    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
+    prioridad_display = serializers.CharField(source='get_prioridad_display', read_only=True)
+    dias_restantes = serializers.SerializerMethodField()
+    requiere_alerta = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Iniciativa
+        fields = '__all__'
+    
+    def get_dias_restantes(self, obj):
+        return obj.dias_restantes
+    
+    def get_requiere_alerta(self, obj):
+        return obj.requiere_alerta
+
+
+class IniciativaCreateSerializer(serializers.ModelSerializer):
+    """Serializer para crear iniciativas"""
+    
+    class Meta:
+        model = Iniciativa
+        fields = [
+            'calculo_nivel', 'dimension', 'empresa',
+            'titulo', 'descripcion', 'objetivo',
+            'prioridad', 'responsable',
+            'fecha_inicio_estimada', 'fecha_termino_estimada',
+            'presupuesto_estimado', 'moneda', 'dias_alerta_previo'
+        ]
+    
+    def create(self, validated_data):
+        """Crear iniciativa con auditoría"""
+        request = self.context.get('request')
+        
+        if request and request.user:
+            validated_data['asignado_por'] = request.user
+        
+        return super().create(validated_data)

@@ -1,0 +1,656 @@
+# apps/respuestas/views.py
+
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.db import transaction
+from django.db.models import Q, Count
+
+from apps.core.mixins import ResponseMixin
+from .models import (
+    TipoDocumento,
+    Respuesta,
+    HistorialRespuesta,
+    Evidencia,
+    CalculoNivel,
+    Iniciativa
+)
+from .serializers import (
+    TipoDocumentoSerializer,
+    TipoDocumentoListSerializer,
+    RespuestaListSerializer,
+    RespuestaDetailSerializer,
+    RespuestaCreateSerializer,
+    RespuestaUpdateSerializer,
+    RespuestaEnviarSerializer,
+    RespuestaModificarAdminSerializer,
+    EvidenciaSerializer,
+    EvidenciaCreateSerializer,
+    HistorialRespuestaSerializer,
+    CalculoNivelSerializer,
+    IniciativaListSerializer,
+    IniciativaDetailSerializer,
+    IniciativaCreateSerializer,
+    VerificarCodigoDocumentoSerializer,
+)
+
+
+# ============================================
+# VIEWSET: TIPOS DE DOCUMENTO
+# ============================================
+
+class TipoDocumentoViewSet(ResponseMixin, viewsets.ModelViewSet):
+    """
+    ViewSet para gestionar tipos de documentos
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        
+        if user.rol == 'superadmin':
+            return TipoDocumento.objects.all()
+        else:
+            return TipoDocumento.objects.filter(empresa=user.empresa)
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return TipoDocumentoListSerializer
+        return TipoDocumentoSerializer
+    
+    def perform_create(self, serializer):
+        """Crear tipo de documento para la empresa del usuario"""
+        serializer.save(empresa=self.request.user.empresa)
+
+
+# ============================================
+# VIEWSET: RESPUESTAS
+# ============================================
+
+class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
+    """
+    ViewSet para gestionar respuestas
+    
+    Endpoints:
+    - GET /api/respuestas/ - Listar respuestas
+    - GET /api/respuestas/{id}/ - Detalle de respuesta
+    - POST /api/respuestas/ - Crear respuesta
+    - PATCH /api/respuestas/{id}/ - Actualizar respuesta (solo borrador)
+    - POST /api/respuestas/{id}/enviar/ - Enviar respuesta
+    - POST /api/respuestas/{id}/modificar_admin/ - Admin modifica respuesta
+    - GET /api/respuestas/{id}/historial/ - Historial de cambios
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Respuesta.objects.select_related(
+            'asignacion',
+            'pregunta',
+            'respondido_por',
+            'modificado_por'
+        ).prefetch_related('evidencias')
+        
+        # Filtrar por asignación si se proporciona
+        asignacion_id = self.request.query_params.get('asignacion')
+        if asignacion_id:
+            queryset = queryset.filter(asignacion_id=asignacion_id)
+        
+        # Permisos por rol
+        if user.rol == 'superadmin':
+            return queryset
+        elif user.rol == 'administrador':
+            # Ver respuestas de su empresa
+            return queryset.filter(asignacion__empresa=user.empresa)
+        else:
+            # Ver solo sus propias respuestas
+            return queryset.filter(respondido_por=user)
+        
+        return queryset.order_by('pregunta__orden')
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return RespuestaListSerializer
+        elif self.action == 'retrieve':
+            return RespuestaDetailSerializer
+        elif self.action == 'create':
+            return RespuestaCreateSerializer
+        elif self.action == 'update' or self.action == 'partial_update':
+            return RespuestaUpdateSerializer
+        elif self.action == 'enviar':
+            return RespuestaEnviarSerializer
+        elif self.action == 'modificar_admin':
+            return RespuestaModificarAdminSerializer
+        return RespuestaDetailSerializer
+    
+    def perform_update(self, serializer):
+        """Actualizar respuesta (solo en borrador)"""
+        instance = self.get_object()
+        
+        # Validar que sea el creador
+        if instance.respondido_por != self.request.user:
+            return self.error_response(
+                message='Solo puedes editar tus propias respuestas',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        serializer.save()
+    
+    @action(detail=True, methods=['post'])
+    def enviar(self, request, pk=None):
+        """
+        Enviar respuesta (cambiar de borrador a enviado)
+        POST /api/respuestas/{id}/enviar/
+        """
+        respuesta = self.get_object()
+        
+        # Validar que sea el creador
+        if respuesta.respondido_por != request.user:
+            return self.error_response(
+                message='Solo puedes enviar tus propias respuestas',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        serializer = self.get_serializer(respuesta, data={})
+        serializer.is_valid(raise_exception=True)
+        respuesta_actualizada = serializer.save()
+        
+        return self.success_response(
+            data=RespuestaDetailSerializer(respuesta_actualizada).data,
+            message='Respuesta enviada exitosamente',
+            status_code=status.HTTP_200_OK
+        )
+    
+    @action(detail=True, methods=['post'])
+    def modificar_admin(self, request, pk=None):
+        """
+        Administrador modifica respuesta del usuario
+        POST /api/respuestas/{id}/modificar_admin/
+        
+        Body:
+        {
+            "respuesta": "SI_CUMPLE|CUMPLE_PARCIAL|NO_CUMPLE|NO_APLICA",  # ⭐ ACTUALIZADO
+            "justificacion": "...",
+            "comentarios_adicionales": "...",
+            "motivo_modificacion": "Explicación del cambio"
+        }
+        """
+        respuesta = self.get_object()
+        
+        # Validar permisos
+        if request.user.rol not in ['administrador', 'superadmin']:
+            return self.error_response(
+                message='Solo administradores pueden modificar respuestas',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        serializer = self.get_serializer(respuesta, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        respuesta_actualizada = serializer.save()
+        
+        return self.success_response(
+            data=RespuestaDetailSerializer(respuesta_actualizada).data,
+            message='Respuesta modificada exitosamente',
+            status_code=status.HTTP_200_OK
+        )
+        @action(detail=True, methods=['get'])
+        def historial(self, request, pk=None):
+            """
+            Obtener historial de cambios de una respuesta
+            GET /api/respuestas/{id}/historial/
+            """
+            respuesta = self.get_object()
+            historial = respuesta.historial.all().order_by('-timestamp')
+            
+            serializer = HistorialRespuestaSerializer(historial, many=True)
+            
+            return Response(serializer.data)
+
+
+# ============================================
+# VIEWSET: EVIDENCIAS
+# ============================================
+
+class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
+    """
+    ViewSet para gestionar evidencias
+    
+    Endpoints:
+    - GET /api/evidencias/ - Listar evidencias
+    - GET /api/evidencias/{id}/ - Detalle de evidencia
+    - POST /api/evidencias/ - Subir evidencia
+    - DELETE /api/evidencias/{id}/ - Eliminar evidencia
+    - POST /api/evidencias/verificar_codigo/ - ⭐ Verificar código duplicado
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Evidencia.objects.select_related(
+            'respuesta',
+            'respuesta__asignacion',
+            'respuesta__pregunta',
+            'subido_por'
+        )
+        
+        # Filtrar por respuesta si se proporciona
+        respuesta_id = self.request.query_params.get('respuesta')
+        if respuesta_id:
+            queryset = queryset.filter(respuesta_id=respuesta_id)
+        
+        # Permisos por rol
+        if user.rol == 'superadmin':
+            return queryset
+        elif user.rol == 'administrador':
+            return queryset.filter(respuesta__asignacion__empresa=user.empresa)
+        else:
+            return queryset.filter(respuesta__respondido_por=user)
+        
+        return queryset.order_by('-fecha_creacion')
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return EvidenciaCreateSerializer
+        elif self.action == 'verificar_codigo':
+            return VerificarCodigoDocumentoSerializer
+        return EvidenciaSerializer
+    
+    # ⭐ NUEVO: Endpoint para verificar código duplicado
+    @action(detail=False, methods=['post'])
+    def verificar_codigo(self, request):
+        """
+        Verificar si un código de documento ya existe en la empresa
+        POST /api/evidencias/verificar_codigo/
+        
+        Body:
+        {
+            "codigo_documento": "POL-SEG-001"
+        }
+        
+        Response:
+        {
+            "existe": true,
+            "evidencias_encontradas": [
+                {
+                    "id": "uuid",
+                    "codigo_documento": "POL-SEG-001",
+                    "tipo_documento_display": "Política",
+                    "titulo_documento": "Política de Seguridad",
+                    "pregunta_codigo": "D1-P001",
+                    "pregunta_texto": "...",
+                    "dimension_nombre": "Gestión de Procesos",
+                    "subido_por": "Juan Pérez",
+                    "fecha_creacion": "2024-12-18",
+                    "puede_reutilizar": true
+                }
+            ],
+            "total_encontradas": 2,
+            "mensaje": "Se encontraron 2 documentos con este código"
+        }
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        codigo_documento = serializer.validated_data['codigo_documento']
+        user = request.user
+        
+        # Buscar evidencias con el mismo código en la empresa
+        evidencias_existentes = Evidencia.buscar_por_codigo(
+            codigo_documento,
+            user.empresa
+        )
+        
+        if not evidencias_existentes.exists():
+            return Response({
+                'existe': False,
+                'evidencias_encontradas': [],
+                'total_encontradas': 0,
+                'mensaje': 'No se encontraron documentos con este código'
+            })
+        
+        # Serializar evidencias encontradas
+        evidencias_data = []
+        for evidencia in evidencias_existentes:
+            evidencias_data.append({
+                'id': str(evidencia.id),
+                'codigo_documento': evidencia.codigo_documento,
+                'tipo_documento': evidencia.tipo_documento_enum,
+                'tipo_documento_display': evidencia.get_tipo_documento_enum_display(),
+                'titulo_documento': evidencia.titulo_documento,
+                'objetivo_documento': evidencia.objetivo_documento,
+                'pregunta_codigo': evidencia.respuesta.pregunta.codigo,
+                'pregunta_texto': evidencia.respuesta.pregunta.texto,
+                'dimension_nombre': evidencia.respuesta.pregunta.dimension.nombre,
+                'subido_por': evidencia.subido_por.nombre_completo if evidencia.subido_por else 'Desconocido',
+                'fecha_creacion': evidencia.fecha_creacion.strftime('%Y-%m-%d'),
+                'url_archivo': evidencia.url_archivo,
+                'puede_reutilizar': True
+            })
+        
+        return Response({
+            'existe': True,
+            'evidencias_encontradas': evidencias_data,
+            'total_encontradas': len(evidencias_data),
+            'mensaje': f'Se {"encontró" if len(evidencias_data) == 1 else "encontraron"} {len(evidencias_data)} documento{"" if len(evidencias_data) == 1 else "s"} con este código'
+        })
+    
+    def perform_destroy(self, instance):
+        """Eliminar evidencia (solo en borrador)"""
+        respuesta = instance.respuesta
+        
+        if respuesta.estado != 'borrador':
+            return self.error_response(
+                message='Solo se pueden eliminar evidencias de respuestas en borrador',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if respuesta.respondido_por != self.request.user:
+            return self.error_response(
+                message='Solo puedes eliminar evidencias de tus propias respuestas',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Crear registro de auditoría
+        HistorialRespuesta.objects.create(
+            respuesta=respuesta,
+            tipo_cambio='eliminado_evidencia',
+            usuario=self.request.user,
+            motivo=f'Evidencia eliminada: {instance.codigo_documento} - {instance.titulo_documento}',
+            ip_address=self._get_client_ip(),
+            user_agent=self._get_user_agent()
+        )
+        
+        instance.delete()
+    
+    def _get_client_ip(self):
+        x_forwarded_for = self.request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0]
+        return self.request.META.get('REMOTE_ADDR')
+    
+    def _get_user_agent(self):
+        return self.request.META.get('HTTP_USER_AGENT', '')[:255]
+
+
+# ============================================
+# VIEWSET: HISTORIAL DE RESPUESTAS
+# ============================================
+
+class HistorialRespuestaViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet para ver historial de cambios (solo lectura)
+    
+    Endpoints:
+    - GET /api/historial-respuestas/ - Listar historial
+    - GET /api/historial-respuestas/{id}/ - Detalle de cambio
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = HistorialRespuestaSerializer
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = HistorialRespuesta.objects.select_related(
+            'respuesta',
+            'usuario'
+        )
+        
+        # Filtrar por respuesta si se proporciona
+        respuesta_id = self.request.query_params.get('respuesta')
+        if respuesta_id:
+            queryset = queryset.filter(respuesta_id=respuesta_id)
+        
+        # Permisos por rol
+        if user.rol == 'superadmin':
+            return queryset
+        elif user.rol == 'administrador':
+            return queryset.filter(respuesta__asignacion__empresa=user.empresa)
+        else:
+            return queryset.filter(respuesta__respondido_por=user)
+        
+        return queryset.order_by('-timestamp')
+
+
+# ============================================
+# VIEWSET: CÁLCULO DE NIVEL
+# ============================================
+
+class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet para cálculos de nivel de madurez (solo lectura)
+    
+    Endpoints:
+    - GET /api/calculos-nivel/ - Listar cálculos
+    - GET /api/calculos-nivel/{id}/ - Detalle de cálculo
+    - GET /api/calculos-nivel/por_empresa/ - Cálculos por empresa
+    - GET /api/calculos-nivel/por_dimension/ - Cálculos por dimensión
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = CalculoNivelSerializer
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = CalculoNivel.objects.select_related(
+            'asignacion',
+            'dimension'
+        )
+        
+        # Permisos por rol
+        if user.rol == 'superadmin':
+            return queryset
+        elif user.rol == 'administrador':
+            return queryset.filter(asignacion__empresa=user.empresa)
+        else:
+            return queryset.filter(asignacion__usuario_asignado=user)
+        
+        return queryset.order_by('-calculado_at')
+    
+    @action(detail=False, methods=['get'])
+    def por_empresa(self, request):
+        """
+        Obtener cálculos agrupados por empresa
+        GET /api/calculos-nivel/por_empresa/
+        """
+        user = request.user
+        
+        if user.rol not in ['superadmin', 'administrador']:
+            return self.error_response(
+                message='No tienes permisos para ver esta información',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        calculos = self.get_queryset()
+        
+        # Agrupar por empresa
+        from django.db.models import Avg, Count
+        resumen = calculos.values(
+            'asignacion__empresa__nombre'
+        ).annotate(
+            total_calculos=Count('id'),
+            nivel_promedio=Avg('nivel_actual'),
+            gap_promedio=Avg('gap')
+        )
+        
+        return Response(resumen)
+    
+    @action(detail=False, methods=['get'])
+    def por_dimension(self, request):
+        """
+        Obtener cálculos agrupados por dimensión
+        GET /api/calculos-nivel/por_dimension/
+        """
+        calculos = self.get_queryset()
+        
+        # Agrupar por dimensión
+        from django.db.models import Avg, Count
+        resumen = calculos.values(
+            'dimension__nombre',
+            'dimension__codigo'
+        ).annotate(
+            total_calculos=Count('id'),
+            nivel_promedio=Avg('nivel_actual'),
+            gap_promedio=Avg('gap'),
+            cumplimiento_promedio=Avg('porcentaje_cumplimiento')
+        )
+        
+        return Response(resumen)
+
+
+# ============================================
+# VIEWSET: INICIATIVAS
+# ============================================
+
+class IniciativaViewSet(ResponseMixin, viewsets.ModelViewSet):
+    """
+    ViewSet para gestionar iniciativas de remediación
+    
+    Endpoints:
+    - GET /api/iniciativas/ - Listar iniciativas
+    - GET /api/iniciativas/{id}/ - Detalle de iniciativa
+    - POST /api/iniciativas/ - Crear iniciativa
+    - PATCH /api/iniciativas/{id}/ - Actualizar iniciativa
+    - DELETE /api/iniciativas/{id}/ - Eliminar iniciativa
+    - GET /api/iniciativas/mis_iniciativas/ - Iniciativas asignadas a mí
+    - GET /api/iniciativas/por_vencer/ - Iniciativas próximas a vencer
+    - POST /api/iniciativas/{id}/actualizar_progreso/ - Actualizar progreso
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Iniciativa.objects.select_related(
+            'calculo_nivel',
+            'dimension',
+            'empresa',
+            'responsable',
+            'asignado_por'
+        )
+        
+        # Permisos por rol
+        if user.rol == 'superadmin':
+            return queryset
+        elif user.rol == 'administrador':
+            return queryset.filter(empresa=user.empresa)
+        else:
+            return queryset.filter(responsable=user)
+        
+        # Filtros opcionales
+        estado = self.request.query_params.get('estado')
+        if estado:
+            queryset = queryset.filter(estado=estado)
+        
+        prioridad = self.request.query_params.get('prioridad')
+        if prioridad:
+            queryset = queryset.filter(prioridad=prioridad)
+        
+        return queryset.order_by('-prioridad', 'fecha_termino_estimada')
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return IniciativaListSerializer
+        elif self.action == 'create':
+            return IniciativaCreateSerializer
+        return IniciativaDetailSerializer
+    
+    @action(detail=False, methods=['get'])
+    def mis_iniciativas(self, request):
+        """
+        Obtener iniciativas asignadas al usuario actual
+        GET /api/iniciativas/mis_iniciativas/
+        """
+        iniciativas = Iniciativa.objects.filter(
+            responsable=request.user,
+            activo=True
+        ).select_related(
+            'dimension',
+            'empresa',
+            'asignado_por'
+        ).order_by('-prioridad', 'fecha_termino_estimada')
+        
+        serializer = IniciativaListSerializer(iniciativas, many=True)
+        
+        return Response({
+            'total': iniciativas.count(),
+            'iniciativas': serializer.data
+        })
+    
+    @action(detail=False, methods=['get'])
+    def por_vencer(self, request):
+        """
+        Obtener iniciativas próximas a vencer (dentro de 7 días)
+        GET /api/iniciativas/por_vencer/
+        """
+        from django.utils import timezone
+        from datetime import timedelta
+        
+        fecha_limite = timezone.now().date() + timedelta(days=7)
+        
+        iniciativas = self.get_queryset().filter(
+            estado__in=['planificada', 'en_progreso'],
+            fecha_termino_estimada__lte=fecha_limite,
+            fecha_termino_estimada__gte=timezone.now().date()
+        ).order_by('fecha_termino_estimada')
+        
+        serializer = IniciativaListSerializer(iniciativas, many=True)
+        
+        return Response({
+            'total': iniciativas.count(),
+            'iniciativas': serializer.data
+        })
+    
+    @action(detail=True, methods=['post'])
+    def actualizar_progreso(self, request, pk=None):
+        """
+        Actualizar progreso de una iniciativa
+        POST /api/iniciativas/{id}/actualizar_progreso/
+        
+        Body:
+        {
+            "porcentaje_avance": 50,
+            "estado": "en_progreso"  # opcional
+        }
+        """
+        iniciativa = self.get_object()
+        
+        # Validar que sea el responsable o administrador
+        if request.user != iniciativa.responsable and request.user.rol not in ['administrador', 'superadmin']:
+            return self.error_response(
+                message='Solo el responsable o un administrador puede actualizar el progreso',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        porcentaje = request.data.get('porcentaje_avance')
+        nuevo_estado = request.data.get('estado')
+        
+        if porcentaje is not None:
+            try:
+                porcentaje = float(porcentaje)
+                if porcentaje < 0 or porcentaje > 100:
+                    return self.error_response(
+                        message='El porcentaje debe estar entre 0 y 100',
+                        status_code=status.HTTP_400_BAD_REQUEST
+                    )
+                iniciativa.porcentaje_avance = porcentaje
+            except ValueError:
+                return self.error_response(
+                    message='Porcentaje inválido',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+        
+        if nuevo_estado and nuevo_estado in dict(Iniciativa.ESTADOS).keys():
+            iniciativa.estado = nuevo_estado
+            
+            # Si se completa, registrar fecha real
+            if nuevo_estado == 'completada':
+                from django.utils import timezone
+                iniciativa.fecha_termino_real = timezone.now().date()
+        
+        iniciativa.save()
+        
+        serializer = IniciativaDetailSerializer(iniciativa)
+        
+        return self.success_response(
+            data=serializer.data,
+            message='Progreso actualizado exitosamente',
+            status_code=status.HTTP_200_OK
+        )
