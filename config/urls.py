@@ -1,0 +1,46 @@
+# config/urls.py
+from django.contrib import admin
+from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
+
+# Swagger / OpenAPI
+from drf_spectacular.views import (
+    SpectacularAPIView,
+    SpectacularSwaggerView,
+    SpectacularRedocView
+)
+
+urlpatterns = [
+    # ==============================
+    # 🔹 Django Admin
+    # ==============================
+    path('admin/', admin.site.urls),
+
+    # ==============================
+    # 🔹 Endpoints de las aplicaciones
+    # ==============================
+    path('api/empresas/', include('apps.empresas.urls')),
+    path('api/auth/', include('apps.usuarios.urls')),
+    path('api/encuestas/', include('apps.encuestas.urls')),
+    # ⭐ NO BORRAR
+    path('api/', include('apps.notificaciones.urls')),  # ← Quitar "notificaciones/"
+    path('api/asignaciones/', include('apps.asignaciones.urls')),
+    path('api/', include('apps.respuestas.urls')),
+    
+    path('api/dashboard/', include('apps.dashboard.urls')),
+
+    # ==============================
+    # 🔹 Documentación OpenAPI / Swagger / Redoc
+    # ==============================
+    path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
+    path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
+    path('api/redoc/', SpectacularRedocView.as_view(url_name='schema'), name='redoc'),
+]
+
+# ==============================
+# 🔹 Archivos estáticos y media
+# ==============================
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
