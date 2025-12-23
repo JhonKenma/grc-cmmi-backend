@@ -1,0 +1,153 @@
+<!-- templates/notificaciones/email_notificacion.html -->
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ titulo }}</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7fa;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 600px;
+            margin: 40px auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #ffffff;
+            padding: 30px 20px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 600;
+        }
+        .content {
+            padding: 30px 40px;
+            color: #333333;
+        }
+        .content h2 {
+            color: #667eea;
+            font-size: 20px;
+            margin-bottom: 15px;
+        }
+        .content p {
+            line-height: 1.6;
+            font-size: 15px;
+            color: #555555;
+            margin-bottom: 20px;
+        }
+        .priority-badge {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 20px;
+        }
+        .priority-baja {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+        .priority-normal {
+            background-color: #e3f2fd;
+            color: #1565c0;
+        }
+        .priority-alta {
+            background-color: #fff3e0;
+            color: #e65100;
+        }
+        .priority-urgente {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+        .button {
+            display: inline-block;
+            padding: 14px 32px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #ffffff !important;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 15px;
+            margin-top: 20px;
+            transition: transform 0.2s;
+        }
+        .button:hover {
+            transform: translateY(-2px);
+        }
+        .footer {
+            background-color: #f8f9fa;
+            padding: 20px 40px;
+            text-align: center;
+            font-size: 13px;
+            color: #666666;
+            border-top: 1px solid #e9ecef;
+        }
+        .footer a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .divider {
+            height: 1px;
+            background-color: #e9ecef;
+            margin: 25px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>🔔 Sistema GRC</h1>
+        </div>
+
+        <!-- Content -->
+        <div class="content">
+            <h2>{{ notificacion.titulo }}</h2>
+            
+            {% if notificacion.prioridad != 'normal' %}
+            <span class="priority-badge priority-{{ notificacion.prioridad }}">
+                Prioridad: {{ prioridad }}
+            </span>
+            {% endif %}
+            
+            <p>Hola <strong>{{ usuario.nombre_completo }}</strong>,</p>
+            
+            <p>{{ notificacion.mensaje }}</p>
+            
+            {% if notificacion.url_accion %}
+            <div style="text-align: center; margin-top: 30px;">
+                <a href="{{ notificacion.url_accion }}" class="button">
+                    Ver Detalles
+                </a>
+            </div>
+            {% endif %}
+            
+            <div class="divider"></div>
+            
+            <p style="font-size: 13px; color: #888888;">
+                Recibiste este correo porque tienes activadas las notificaciones por email en el Sistema GRC.
+            </p>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>
+                © {{ "now"|date:"Y" }} Sistema GRC - Governance, Risk & Compliance<br>
+                <a href="#">Configurar notificaciones</a> | <a href="#">Soporte</a>
+            </p>
+        </div>
+    </div>
+</body>
+</html>
