@@ -470,7 +470,7 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
             'porcentaje_completado': round((completadas / total * 100) if total > 0 else 0, 2)
         })
         
- # =========================================================================
+    # =========================================================================
     # ⭐ NUEVO ENDPOINT: REVISAR ASIGNACIÓN
     # =========================================================================
     
@@ -478,19 +478,9 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
     def revisar(self, request, pk=None):
         """
         Aprobar o rechazar una asignación que requiere revisión
-        POST /api/asignaciones/{id}/revisar/
-        
-        Body:
-        {
-            "accion": "aprobar" | "rechazar",
-            "comentarios": "Observaciones del revisor"
-        }
-        
-        PERMISOS: SuperAdmin o Administrador de la empresa
         """
         asignacion = self.get_object()
         
-        # ⭐ DEBUG
         print(f"🔍 ANTES - Asignación ID: {asignacion.id}")
         print(f"   Estado actual: {asignacion.estado}")
         print(f"   Requiere revisión: {asignacion.requiere_revision}")
@@ -498,21 +488,18 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        # Validar que la asignación requiera revisión
         if not asignacion.requiere_revision:
             return self.error_response(
                 message='Esta asignación no requiere revisión',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validar que esté en estado pendiente_revision
         if asignacion.estado != 'pendiente_revision':
             return self.error_response(
                 message=f'La asignación debe estar en estado "Pendiente de Revisión". Estado actual: {asignacion.get_estado_display()}',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validar permisos: Admin solo puede revisar asignaciones de su empresa
         if request.user.rol == 'administrador':
             if asignacion.empresa != request.user.empresa:
                 return self.error_response(
@@ -525,35 +512,44 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
                 accion = serializer.validated_data['accion']
                 comentarios = serializer.validated_data.get('comentarios', '')
                 
-                asignacion.revisado_por = request.user
-                asignacion.fecha_revision = timezone.now()
-                asignacion.comentarios_revision = comentarios
-                
+                # ⭐ FIX: Actualizar campos directamente con update()
                 if accion == 'aprobar':
-                    asignacion.estado = 'completado'
-                    asignacion.fecha_completado = timezone.now()
-                    mensaje = f'Asignación aprobada exitosamente'
+                    Asignacion.objects.filter(pk=asignacion.pk).update(
+                        estado='completado',
+                        fecha_completado=timezone.now(),
+                        revisado_por=request.user,
+                        fecha_revision=timezone.now(),
+                        comentarios_revision=comentarios
+                    )
+                    mensaje = 'Asignación aprobada exitosamente'
                     
-                    # 🔔 Notificar al usuario que fue aprobada
+                    # Recargar objeto
+                    asignacion.refresh_from_db()
+                    
+                    # 🔔 Notificar
                     NotificacionAsignacionService.notificar_revision_aprobada(asignacion)
                     
                 else:  # rechazar
-                    asignacion.estado = 'rechazado'
-                    asignacion.preguntas_respondidas = 0  # Resetear para que vuelva a responder
-                    asignacion.porcentaje_avance = 0
-                    mensaje = f'Asignación rechazada. El usuario deberá completarla nuevamente.'
+                    Asignacion.objects.filter(pk=asignacion.pk).update(
+                        estado='rechazado',
+                        preguntas_respondidas=0,
+                        porcentaje_avance=0,
+                        revisado_por=request.user,
+                        fecha_revision=timezone.now(),
+                        comentarios_revision=comentarios
+                    )
+                    mensaje = 'Asignación rechazada. El usuario deberá completarla nuevamente.'
                     
-                    # 🔔 Notificar al usuario que fue rechazada
+                    # Recargar objeto
+                    asignacion.refresh_from_db()
+                    
+                    # 🔔 Notificar
                     NotificacionAsignacionService.notificar_revision_rechazada(asignacion)
                 
-                asignacion.save()
-                
-                # ⭐ DEBUG
                 print(f"✅ DESPUÉS - Asignación ID: {asignacion.id}")
                 print(f"   Nuevo estado: {asignacion.estado}")
                 print(f"   Acción: {accion}")
                 
-                # ⭐ VERIFICAR EN BASE DE DATOS
                 asignacion.refresh_from_db()
                 print(f"🔄 VERIFICACIÓN DB - Estado en DB: {asignacion.estado}")
                 
@@ -564,12 +560,13 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
         
         except Exception as e:
             print(f"❌ ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return self.error_response(
                 message='Error al procesar la revisión',
                 errors=str(e),
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-    
     # =========================================================================
     # ⭐ NUEVO ENDPOINT: LISTAR ASIGNACIONES PENDIENTES DE REVISIÓN
     # =========================================================================
