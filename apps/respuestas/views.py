@@ -7,6 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
 from django.db.models import Q, Count
 
+from apps.asignaciones.models import Asignacion
 from apps.core.mixins import ResponseMixin
 from .models import (
     TipoDocumento,
@@ -161,20 +162,66 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
             message='Respuesta enviada exitosamente',
             status_code=status.HTTP_200_OK
         )
+        
+    @action(detail=False, methods=['get'])
+    def revision(self, request):
+        """
+        Obtener respuestas para revisión con evidencias incluidas
+        GET /api/respuestas/revision/?asignacion={id}
+        """
+        asignacion_id = request.query_params.get('asignacion')
+        
+        if not asignacion_id:
+            return self.error_response(
+                message='Se requiere el parámetro asignacion',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validar que el usuario tenga permisos
+        try:
+            asignacion = Asignacion.objects.get(id=asignacion_id)
+        except Asignacion.DoesNotExist:
+            return self.error_response(
+                message='Asignación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Validar permisos
+        if request.user.rol == 'administrador':
+            if asignacion.empresa != request.user.empresa:
+                return self.error_response(
+                    message='No tienes permisos para ver esta asignación',
+                    status_code=status.HTTP_403_FORBIDDEN
+                )
+        elif request.user.rol not in ['superadmin']:
+            return self.error_response(
+                message='No tienes permisos',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        queryset = Respuesta.objects.filter(
+            asignacion_id=asignacion_id,
+            activo=True
+        ).select_related(
+            'pregunta',
+            'pregunta__dimension',
+            'respondido_por'
+        ).prefetch_related(
+            'evidencias'  # ⭐ SOLO evidencias, sin tipo_documento
+        ).order_by('pregunta__orden')
+        
+        serializer = RespuestaDetailSerializer(queryset, many=True)
+        
+        return Response({
+            'count': queryset.count(),
+            'results': serializer.data
+        })
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'])  # ⭐ DEBE SER detail=True
     def modificar_admin(self, request, pk=None):
         """
         Administrador modifica respuesta del usuario
         POST /api/respuestas/{id}/modificar_admin/
-        
-        Body:
-        {
-            "respuesta": "SI_CUMPLE|CUMPLE_PARCIAL|NO_CUMPLE|NO_APLICA",  # ⭐ ACTUALIZADO
-            "justificacion": "...",
-            "comentarios_adicionales": "...",
-            "motivo_modificacion": "Explicación del cambio"
-        }
         """
         respuesta = self.get_object()
         
@@ -194,18 +241,6 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
             message='Respuesta modificada exitosamente',
             status_code=status.HTTP_200_OK
         )
-        @action(detail=True, methods=['get'])
-        def historial(self, request, pk=None):
-            """
-            Obtener historial de cambios de una respuesta
-            GET /api/respuestas/{id}/historial/
-            """
-            respuesta = self.get_object()
-            historial = respuesta.historial.all().order_by('-timestamp')
-            
-            serializer = HistorialRespuestaSerializer(historial, many=True)
-            
-            return Response(serializer.data)
 
 
 # ============================================
