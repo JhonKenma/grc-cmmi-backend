@@ -7,7 +7,8 @@ from .views import (
     DimensionViewSet,
     PreguntaViewSet,
     NivelReferenciaViewSet,  # ⭐ AGREGAR ESTE
-    ConfigNivelDeseadoViewSet
+    ConfigNivelDeseadoViewSet,
+    EvaluacionEmpresaViewSet 
 )
 
 router = DefaultRouter()
@@ -16,7 +17,8 @@ router.register(r'encuestas', EncuestaViewSet, basename='encuesta')
 router.register(r'dimensiones', DimensionViewSet, basename='dimension')
 router.register(r'preguntas', PreguntaViewSet, basename='pregunta')
 router.register(r'niveles-referencia', NivelReferenciaViewSet, basename='nivel-referencia')  # ⭐ AGREGAR ESTE
-router.register(r'config-niveles', ConfigNivelDeseadoViewSet, basename='config-nivel')
+router.register(r'niveles-deseados', ConfigNivelDeseadoViewSet, basename='config-nivel') 
+router.register(r'evaluaciones-empresa', EvaluacionEmpresaViewSet, basename='evaluacion-empresa')
 
 urlpatterns = [
     path('', include(router.urls)),
