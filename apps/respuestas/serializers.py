@@ -210,6 +210,11 @@ class RespuestaListSerializer(serializers.ModelSerializer):
         source='respondido_por.nombre_completo',
         read_only=True
     )
+    # ⭐ NUEVOS CAMPOS
+    nivel_madurez_display = serializers.CharField(
+        source='get_nivel_madurez_display_verbose',
+        read_only=True
+    )
     total_evidencias = serializers.SerializerMethodField()
     
     class Meta:
@@ -217,6 +222,8 @@ class RespuestaListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'asignacion', 'pregunta', 'pregunta_codigo', 'pregunta_texto',
             'respuesta', 'respuesta_display', 'justificacion',
+            # ⭐ NUEVOS CAMPOS
+            'nivel_madurez', 'nivel_madurez_display', 'justificacion_madurez',
             'estado', 'estado_display', 'respondido_por', 'respondido_por_nombre',
             'respondido_at', 'total_evidencias', 'version'
         ]
@@ -242,6 +249,11 @@ class RespuestaDetailSerializer(serializers.ModelSerializer):
         source='modificado_por.nombre_completo',
         read_only=True
     )
+    # ⭐ NUEVOS CAMPOS
+    nivel_madurez_display = serializers.CharField(
+        source='get_nivel_madurez_display_verbose',
+        read_only=True
+    )
     
     evidencias = EvidenciaSerializer(many=True, read_only=True)
     historial = HistorialRespuestaSerializer(many=True, read_only=True)
@@ -252,11 +264,14 @@ class RespuestaDetailSerializer(serializers.ModelSerializer):
             'id', 'asignacion', 'pregunta', 'pregunta_codigo', 'pregunta_texto',
             'pregunta_objetivo', 'respuesta', 'respuesta_display',
             'justificacion', 'comentarios_adicionales',
+            # ⭐ NUEVOS CAMPOS
+            'nivel_madurez', 'nivel_madurez_display', 'justificacion_madurez',
             'estado', 'estado_display',
             'respondido_por', 'respondido_por_nombre', 'respondido_at',
             'modificado_por', 'modificado_por_nombre', 'modificado_at',
             'version', 'evidencias', 'historial'
         ]
+
 
 
 class RespuestaCreateSerializer(serializers.ModelSerializer):
@@ -266,17 +281,21 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
         model = Respuesta
         fields = [
             'asignacion', 'pregunta', 'respuesta', 
-            'justificacion', 'comentarios_adicionales'
+            'justificacion', 'comentarios_adicionales',
+            # ⭐ NUEVOS CAMPOS
+            'nivel_madurez', 'justificacion_madurez'
         ]
     
     def validate(self, attrs):
         """Validaciones"""
         asignacion = attrs.get('asignacion')
         pregunta = attrs.get('pregunta')
-        respuesta = attrs.get('respuesta')  # ⭐ NUEVO
+        respuesta = attrs.get('respuesta')
         justificacion = attrs.get('justificacion', '')
+        nivel_madurez = attrs.get('nivel_madurez', 0)
+        justificacion_madurez = attrs.get('justificacion_madurez', '')
         
-        # Validar que la pregunta pertenezca a la dimensión de la asignación
+        # Validar que la pregunta pertenezca a la dimensión
         if pregunta.dimension != asignacion.dimension:
             raise serializers.ValidationError({
                 'pregunta': 'La pregunta no pertenece a la dimensión de esta asignación'
@@ -291,16 +310,33 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
                 'pregunta': 'Ya existe una respuesta para esta pregunta'
             })
         
-        # ⭐ NUEVA VALIDACIÓN: Para "Sí Cumple", justificación obligatoria
+        # Validar justificación según respuesta
         if respuesta == 'SI_CUMPLE' and len(justificacion.strip()) < 10:
             raise serializers.ValidationError({
                 'justificacion': 'Para respuestas "Sí Cumple", la justificación debe tener al menos 10 caracteres'
             })
         
-        # Validar longitud mínima general
         if len(justificacion.strip()) < 10:
             raise serializers.ValidationError({
                 'justificacion': 'La justificación debe tener al menos 10 caracteres'
+            })
+        
+        # ⭐ VALIDACIONES DE NIVEL DE MADUREZ
+        if respuesta in ['NO_CUMPLE', 'NO_APLICA']:
+            if nivel_madurez != 0:
+                raise serializers.ValidationError({
+                    'nivel_madurez': 'El nivel de madurez debe ser 0 para "No Cumple" o "No Aplica"'
+                })
+        
+        if nivel_madurez > 0:
+            if len(justificacion_madurez.strip()) < 10:
+                raise serializers.ValidationError({
+                    'justificacion_madurez': 'Debes justificar por qué consideras ese nivel de madurez (mínimo 10 caracteres)'
+                })
+        
+        if (nivel_madurez * 2) % 1 != 0:
+            raise serializers.ValidationError({
+                'nivel_madurez': 'El nivel de madurez debe ser en incrementos de 0.5 (ej: 1.0, 1.5, 2.0, etc.)'
             })
         
         return attrs
@@ -310,17 +346,14 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         
         with transaction.atomic():
-            # Establecer usuario que responde
             if request and request.user:
                 validated_data['respondido_por'] = request.user
             
-            # Crear respuesta en borrador por defecto
             validated_data['estado'] = 'borrador'
             validated_data['version'] = 1
             
             respuesta = Respuesta.objects.create(**validated_data)
             
-            # Crear registro de auditoría
             HistorialRespuesta.objects.create(
                 respuesta=respuesta,
                 tipo_cambio='creacion',
@@ -335,7 +368,6 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
             return respuesta
     
     def _get_client_ip(self, request):
-        """Obtener IP del cliente"""
         if not request:
             return None
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -344,7 +376,6 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
         return request.META.get('REMOTE_ADDR')
     
     def _get_user_agent(self, request):
-        """Obtener User Agent"""
         if not request:
             return ''
         return request.META.get('HTTP_USER_AGENT', '')[:255]
@@ -355,30 +386,51 @@ class RespuestaUpdateSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Respuesta
-        fields = ['respuesta', 'justificacion', 'comentarios_adicionales']
+        fields = [
+            'respuesta', 'justificacion', 'comentarios_adicionales',
+            # ⭐ NUEVOS CAMPOS
+            'nivel_madurez', 'justificacion_madurez'
+        ]
     
     def validate(self, attrs):
         """Validaciones"""
-        # Solo permitir actualizar si está en borrador
         if self.instance.estado != 'borrador':
             raise serializers.ValidationError({
                 'estado': 'Solo se pueden editar respuestas en estado borrador'
             })
         
-        # ⭐ Obtener respuesta actual o nueva
         respuesta = attrs.get('respuesta', self.instance.respuesta)
         justificacion = attrs.get('justificacion', self.instance.justificacion)
+        nivel_madurez = attrs.get('nivel_madurez', self.instance.nivel_madurez)
+        justificacion_madurez = attrs.get('justificacion_madurez', self.instance.justificacion_madurez)
         
-        # ⭐ NUEVA VALIDACIÓN: Para "Sí Cumple", justificación obligatoria
+        # Validar justificación
         if respuesta == 'SI_CUMPLE' and len(justificacion.strip()) < 10:
             raise serializers.ValidationError({
                 'justificacion': 'Para respuestas "Sí Cumple", la justificación debe tener al menos 10 caracteres'
             })
         
-        # Validar longitud mínima general
         if len(justificacion.strip()) < 10:
             raise serializers.ValidationError({
                 'justificacion': 'La justificación debe tener al menos 10 caracteres'
+            })
+        
+        # ⭐ VALIDACIONES DE NIVEL DE MADUREZ
+        if respuesta in ['NO_CUMPLE', 'NO_APLICA']:
+            if nivel_madurez != 0:
+                raise serializers.ValidationError({
+                    'nivel_madurez': 'El nivel de madurez debe ser 0 para "No Cumple" o "No Aplica"'
+                })
+        
+        if nivel_madurez > 0:
+            if len(justificacion_madurez.strip()) < 10:
+                raise serializers.ValidationError({
+                    'justificacion_madurez': 'Debes justificar por qué consideras ese nivel de madurez (mínimo 10 caracteres)'
+                })
+        
+        if (nivel_madurez * 2) % 1 != 0:
+            raise serializers.ValidationError({
+                'nivel_madurez': 'El nivel de madurez debe ser en incrementos de 0.5'
             })
         
         return attrs
@@ -388,18 +440,15 @@ class RespuestaUpdateSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         
         with transaction.atomic():
-            # Guardar valores anteriores
             valor_anterior_respuesta = instance.respuesta
             valor_anterior_justificacion = instance.justificacion
             valor_anterior_comentarios = instance.comentarios_adicionales
             
-            # Actualizar respuesta
             for attr, value in validated_data.items():
                 setattr(instance, attr, value)
             
             instance.save()
             
-            # Crear registro de auditoría
             HistorialRespuesta.objects.create(
                 respuesta=instance,
                 tipo_cambio='modificacion_respuesta',
@@ -438,17 +487,23 @@ class RespuestaEnviarSerializer(serializers.Serializer):
         """Validaciones antes de enviar"""
         respuesta = self.instance
         
-        # Validar que esté en borrador
         if respuesta.estado != 'borrador':
             raise serializers.ValidationError({
                 'estado': 'Solo se pueden enviar respuestas en estado borrador'
             })
         
-        # ⭐ ACTUALIZADO: Si es "Sí Cumple", debe tener evidencias
-        if respuesta.respuesta == 'SI_CUMPLE':
+        # ⭐ ACTUALIZADO: Validar evidencias para SI_CUMPLE y CUMPLE_PARCIAL
+        if respuesta.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL']:
             if not respuesta.evidencias.filter(activo=True).exists():
                 raise serializers.ValidationError({
-                    'evidencias': 'Las respuestas "Sí Cumple" requieren al menos una evidencia'
+                    'evidencias': f'Las respuestas "{respuesta.get_respuesta_display()}" requieren al menos una evidencia'
+                })
+        
+        # ⭐ NUEVO: Validar nivel de madurez
+        if respuesta.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL']:
+            if respuesta.nivel_madurez == 0:
+                raise serializers.ValidationError({
+                    'nivel_madurez': 'Debes indicar un nivel de madurez mayor a 0 si cumples total o parcialmente'
                 })
         
         return attrs
@@ -462,7 +517,6 @@ class RespuestaEnviarSerializer(serializers.Serializer):
             respuesta.estado = 'enviado'
             respuesta.save()
             
-            # Crear registro de auditoría
             HistorialRespuesta.objects.create(
                 respuesta=respuesta,
                 tipo_cambio='modificacion_respuesta',
@@ -490,11 +544,9 @@ class RespuestaEnviarSerializer(serializers.Serializer):
         return request.META.get('HTTP_USER_AGENT', '')[:255]
 
 
+
 class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
-    """
-    Serializer para que el Administrador modifique respuestas del usuario
-    ⭐ NUEVA FUNCIONALIDAD
-    """
+    """Serializer para que el Administrador modifique respuestas del usuario"""
     
     motivo_modificacion = serializers.CharField(
         write_only=True,
@@ -507,6 +559,8 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
         model = Respuesta
         fields = [
             'respuesta', 'justificacion', 'comentarios_adicionales',
+            # ⭐ NUEVOS CAMPOS
+            'nivel_madurez', 'justificacion_madurez',
             'motivo_modificacion'
         ]
     
@@ -514,13 +568,11 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
         """Validaciones para admin"""
         request = self.context.get('request')
         
-        # Validar que el usuario sea administrador
         if not request or request.user.rol not in ['administrador', 'superadmin']:
             raise serializers.ValidationError({
                 'permiso': 'Solo administradores pueden modificar respuestas'
             })
         
-        # Validar que la respuesta esté enviada
         if self.instance.estado not in ['enviado', 'modificado_admin']:
             raise serializers.ValidationError({
                 'estado': 'Solo se pueden modificar respuestas enviadas'
@@ -534,12 +586,10 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
         motivo = validated_data.pop('motivo_modificacion')
         
         with transaction.atomic():
-            # Guardar valores anteriores
             valor_anterior_respuesta = instance.respuesta
             valor_anterior_justificacion = instance.justificacion
             valor_anterior_comentarios = instance.comentarios_adicionales
             
-            # Actualizar respuesta
             for attr, value in validated_data.items():
                 setattr(instance, attr, value)
             
@@ -549,7 +599,6 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
             instance.version += 1
             instance.save()
             
-            # ⭐ CREAR REGISTRO DE AUDITORÍA
             HistorialRespuesta.objects.create(
                 respuesta=instance,
                 tipo_cambio='modificacion_respuesta',
@@ -579,6 +628,7 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
         if not request:
             return ''
         return request.META.get('HTTP_USER_AGENT', '')[:255]
+
 
 
 # ============================================
