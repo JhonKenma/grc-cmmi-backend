@@ -45,7 +45,7 @@ class TipoDocumento(BaseModel):
 class Respuesta(BaseModel):
     """
     Respuesta de un usuario a una pregunta específica
-    ⭐ ACTUALIZADO: Con 4 opciones de respuesta según puntaje CMMI
+    ⭐ ACTUALIZADO: Con 4 opciones de respuesta según puntaje CMMI + Nivel de Madurez
     """
     
     # ⭐ ACTUALIZADO: 4 opciones de respuesta
@@ -87,6 +87,23 @@ class Respuesta(BaseModel):
         default='',
         help_text='Obligatorio para "Sí Cumple" (mínimo 10 caracteres)'
     )
+    
+    # ⭐ NUEVOS CAMPOS DE NIVEL DE MADUREZ
+    nivel_madurez = models.DecimalField(
+        max_digits=2,
+        decimal_places=1,
+        default=0.0,
+        verbose_name='Nivel de Madurez',
+        help_text='Nivel de madurez de implementación (0 a 5 en incrementos de 0.5). Representa qué tan maduro está el proceso implementado.'
+    )
+    
+    justificacion_madurez = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Justificación del Nivel de Madurez',
+        help_text='Explicación de por qué se considera ese nivel de madurez'
+    )
+    
     comentarios_adicionales = models.TextField(
         blank=True,
         default='',
@@ -156,7 +173,7 @@ class Respuesta(BaseModel):
                 'pregunta': 'La pregunta no pertenece a la dimensión de esta asignación'
             })
         
-        # ⭐ VALIDACIÓN OBLIGATORIA: Para "Sí Cumple", justificación mínima 10 caracteres
+        # ⭐ VALIDACIÓN 1: Para "Sí Cumple", justificación mínima 10 caracteres
         if self.respuesta == 'SI_CUMPLE':
             if not self.justificacion or len(self.justificacion.strip()) < 10:
                 raise ValidationError({
@@ -170,11 +187,39 @@ class Respuesta(BaseModel):
                     'justificacion': 'La justificación debe tener al menos 10 caracteres'
                 })
         
-        # ⭐ VALIDACIÓN: Para "Sí Cumple" enviado, debe tener evidencias
-        if self.pk and self.respuesta == 'SI_CUMPLE' and self.estado in ['enviado', 'modificado_admin']:
+        # ⭐ VALIDACIÓN 2: Nivel de madurez debe ser 0 si NO_CUMPLE o NO_APLICA
+        if self.respuesta in ['NO_CUMPLE', 'NO_APLICA']:
+            if self.nivel_madurez != 0:
+                raise ValidationError({
+                    'nivel_madurez': 'El nivel de madurez debe ser 0 para "No Cumple" o "No Aplica"'
+                })
+        
+        # ⭐ VALIDACIÓN 3: Si tiene nivel de madurez > 0, requiere justificación de madurez
+        if self.nivel_madurez > 0:
+            if not self.justificacion_madurez or len(self.justificacion_madurez.strip()) < 10:
+                raise ValidationError({
+                    'justificacion_madurez': 'Debes justificar por qué consideras ese nivel de madurez (mínimo 10 caracteres)'
+                })
+        
+        # ⭐ VALIDACIÓN 4: Para SI_CUMPLE o CUMPLE_PARCIAL, nivel de madurez debe ser > 0
+        if self.estado in ['enviado', 'modificado_admin']:
+            if self.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL']:
+                if self.nivel_madurez == 0:
+                    raise ValidationError({
+                        'nivel_madurez': 'Debes indicar un nivel de madurez mayor a 0 si cumples total o parcialmente'
+                    })
+        
+        # ⭐ VALIDACIÓN 5: Nivel de madurez debe ser múltiplo de 0.5
+        if (self.nivel_madurez * 2) % 1 != 0:
+            raise ValidationError({
+                'nivel_madurez': 'El nivel de madurez debe ser en incrementos de 0.5 (ej: 1.0, 1.5, 2.0, etc.)'
+            })
+        
+        # ⭐ VALIDACIÓN 6: Para "Sí Cumple" o "Cumple Parcial" enviado, debe tener evidencias
+        if self.pk and self.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL'] and self.estado in ['enviado', 'modificado_admin']:
             if not self.evidencias.filter(activo=True).exists():
                 raise ValidationError({
-                    'evidencias': 'Las respuestas "Sí Cumple" requieren al menos una evidencia'
+                    'evidencias': f'Las respuestas "{self.get_respuesta_display()}" requieren al menos una evidencia'
                 })
         
         # Máximo 3 evidencias
@@ -198,7 +243,7 @@ class Respuesta(BaseModel):
     
     def get_puntaje(self):
         """
-        ⭐ NUEVO MÉTODO: Retorna el puntaje según la respuesta
+        ⭐ Retorna el puntaje según la respuesta
         - SI_CUMPLE: 1.0
         - CUMPLE_PARCIAL: 0.5
         - NO_CUMPLE: 0.0
@@ -211,8 +256,12 @@ class Respuesta(BaseModel):
             'NO_APLICA': None,  # Excluido
         }
         return puntajes.get(self.respuesta, 0.0)
-
-
+    
+    def get_nivel_madurez_display_verbose(self):
+        """Retorna solo el número del nivel de madurez"""
+        return str(self.nivel_madurez)
+    
+    
 class HistorialRespuesta(models.Model):
     """
     Registro de auditoría para cambios en respuestas
@@ -494,100 +543,160 @@ class Evidencia(BaseModel):
 
 class CalculoNivel(BaseModel):
     """
-    Resultados calculados del nivel de madurez
+    Almacena el cálculo del nivel de madurez alcanzado vs deseado por dimensión
+    Se recalcula cada vez que se completa/aprueba una asignación
     """
     
     CLASIFICACION_GAP = [
-        ('cumplido', 'Cumplido'),
-        ('superado', 'Superado'),
-        ('bajo', 'Bajo'),
-        ('medio', 'Medio'),
-        ('alto', 'Alto'),
-        ('critico', 'Crítico'),
+        ('critico', 'Crítico'),        # GAP >= 3
+        ('alto', 'Alto'),              # GAP >= 2
+        ('medio', 'Medio'),            # GAP >= 1
+        ('bajo', 'Bajo'),              # GAP < 1
+        ('cumplido', 'Cumplido'),      # GAP <= 0
+        ('superado', 'Superado'),      # Nivel actual > nivel deseado
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    evaluacion_empresa = models.ForeignKey(
+        'encuestas.EvaluacionEmpresa',
+        on_delete=models.CASCADE,
+        related_name='calculos_nivel',
+        verbose_name='Evaluación Empresa',
+        null=True,          # ⭐ AGREGAR
+        blank=True,         # ⭐ AGREGAR
+    )
+    
     asignacion = models.OneToOneField(
-        Asignacion,
+        'asignaciones.Asignacion',
         on_delete=models.CASCADE,
         related_name='calculo_nivel',
         verbose_name='Asignación'
     )
+    
     dimension = models.ForeignKey(
-        Dimension,
+        'encuestas.Dimension',
         on_delete=models.CASCADE,
         related_name='calculos',
         verbose_name='Dimensión'
     )
     
-    nivel_actual = models.IntegerField(
-        choices=[(i, f'Nivel {i}') for i in range(1, 6)],
-        verbose_name='Nivel Actual'
+    empresa = models.ForeignKey(
+        'empresas.Empresa',
+        on_delete=models.CASCADE,
+        related_name='calculos_nivel',
+        verbose_name='Empresa'
     )
-    nivel_deseado = models.IntegerField(
-        choices=[(i, f'Nivel {i}') for i in range(1, 6)],
-        verbose_name='Nivel Deseado'
+    
+    usuario = models.ForeignKey(
+        'usuarios.Usuario',
+        on_delete=models.CASCADE,
+        related_name='calculos_nivel',
+        verbose_name='Usuario'
     )
-    gap = models.IntegerField(verbose_name='GAP')
     
-    total_preguntas = models.IntegerField(default=0)
-    respuestas_yes = models.IntegerField(default=0)
-    respuestas_no = models.IntegerField(default=0)
-    respuestas_na = models.IntegerField(default=0)
+    # ⭐ NIVELES
+    nivel_deseado = models.DecimalField(
+        max_digits=2,
+        decimal_places=1,
+        verbose_name='Nivel Deseado',
+        help_text='Nivel objetivo definido por el administrador (1-5)'
+    )
     
-    porcentaje_cumplimiento = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=0
+    nivel_actual = models.DecimalField(
+        max_digits=2,
+        decimal_places=1,
+        verbose_name='Nivel Actual',
+        help_text='Promedio de nivel_madurez de todas las respuestas del usuario'
+    )
+    
+    gap = models.DecimalField(
+        max_digits=3,
+        decimal_places=1,
+        verbose_name='GAP',
+        help_text='Diferencia: Nivel Deseado - Nivel Actual'
     )
     
     clasificacion_gap = models.CharField(
         max_length=20,
-        choices=CLASIFICACION_GAP
+        choices=CLASIFICACION_GAP,
+        verbose_name='Clasificación del GAP'
     )
     
-    calculado_at = models.DateTimeField(auto_now=True)
+    # ⭐ ESTADÍSTICAS DE RESPUESTAS
+    total_preguntas = models.IntegerField(
+        default=0,
+        verbose_name='Total de Preguntas'
+    )
+    
+    respuestas_si_cumple = models.IntegerField(
+        default=0,
+        verbose_name='Respuestas Sí Cumple'
+    )
+    
+    respuestas_cumple_parcial = models.IntegerField(
+        default=0,
+        verbose_name='Respuestas Cumple Parcial'
+    )
+    
+    respuestas_no_cumple = models.IntegerField(
+        default=0,
+        verbose_name='Respuestas No Cumple'
+    )
+    
+    respuestas_no_aplica = models.IntegerField(
+        default=0,
+        verbose_name='Respuestas No Aplica'
+    )
+    
+    porcentaje_cumplimiento = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        verbose_name='% Cumplimiento',
+        help_text='Porcentaje de preguntas con Sí Cumple o Cumple Parcial'
+    )
+    
+    calculado_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name='Fecha de Cálculo'
+    )
     
     class Meta:
         db_table = 'calculos_nivel'
         verbose_name = 'Cálculo de Nivel'
         verbose_name_plural = 'Cálculos de Nivel'
         ordering = ['-calculado_at']
+        unique_together = [['asignacion', 'dimension']]
         indexes = [
-            models.Index(fields=['asignacion']),
-            models.Index(fields=['dimension']),
+            models.Index(fields=['empresa', 'dimension']),
+            models.Index(fields=['usuario', 'dimension']),
+            models.Index(fields=['clasificacion_gap']),
+            models.Index(fields=['calculado_at']),
         ]
     
     def __str__(self):
-        return f"{self.dimension.nombre} - Nivel {self.nivel_actual}"
+        return f"{self.usuario.nombre_completo} - {self.dimension.nombre} (GAP: {self.gap})"
     
-    @staticmethod
-    def calcular_nivel_desde_porcentaje(porcentaje):
-        if porcentaje <= 20:
-            return 1
-        elif porcentaje <= 40:
-            return 2
-        elif porcentaje <= 60:
-            return 3
-        elif porcentaje <= 80:
-            return 4
-        else:
-            return 5
-    
-    @staticmethod
-    def clasificar_gap(gap):
-        if gap == 0:
-            return 'cumplido'
-        elif gap < 0:
-            return 'superado'
-        elif gap == 1:
-            return 'bajo'
-        elif gap == 2:
-            return 'medio'
-        elif gap == 3:
-            return 'alto'
-        else:
-            return 'critico'
+    def save(self, *args, **kwargs):
+        # Calcular GAP
+        self.gap = self.nivel_deseado - self.nivel_actual
+        
+        # Clasificar GAP
+        if self.gap >= 3:
+            self.clasificacion_gap = 'critico'
+        elif self.gap >= 2:
+            self.clasificacion_gap = 'alto'
+        elif self.gap >= 1:
+            self.clasificacion_gap = 'medio'
+        elif self.gap > 0:
+            self.clasificacion_gap = 'bajo'
+        elif self.gap == 0:
+            self.clasificacion_gap = 'cumplido'
+        else:  # gap < 0
+            self.clasificacion_gap = 'superado'
+        
+        super().save(*args, **kwargs)
 
 
 class Iniciativa(BaseModel):

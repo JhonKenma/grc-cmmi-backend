@@ -9,10 +9,10 @@ import uuid
 
 class Asignacion(BaseModel):
     """
-    Asignación de una evaluación completa o dimensión específica a un usuario.
+    Asignación de dimensión específica a un usuario dentro de una evaluación.
     
-    - Si dimension=NULL: Asignación de evaluación completa (SuperAdmin → Administrador)
-    - Si dimension=UUID: Asignación de dimensión específica (Administrador → Usuario)
+    Cada asignación ahora está vinculada a una EvaluacionEmpresa específica,
+    lo que permite separar datos entre diferentes evaluaciones de la misma empresa.
     """
     
     ESTADOS = [
@@ -26,35 +26,46 @@ class Asignacion(BaseModel):
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
+    # ⭐ NUEVO CAMPO - Vínculo a la evaluación específica
+    evaluacion_empresa = models.ForeignKey(
+        'encuestas.EvaluacionEmpresa',
+        on_delete=models.CASCADE,
+        related_name='asignaciones',
+        verbose_name='Evaluación Empresa',
+        null=True,        # ⭐ AGREGAR TEMPORALMENTE
+        blank=True,       # ⭐ AGREGAR TEMPORALMENTE
+        help_text='Evaluación específica a la que pertenece esta asignación'
+    )
+    
+    # Campos heredados (se mantienen por compatibilidad y queries)
     encuesta = models.ForeignKey(
         Encuesta,
         on_delete=models.CASCADE,
-        related_name='asignaciones',
+        related_name='asignaciones_directas',  # ⭐ Cambiar nombre para evitar conflicto
         verbose_name='Encuesta'
     )
     
-    # ⭐ CAMBIO PRINCIPAL: Permitir NULL en dimension
     dimension = models.ForeignKey(
         Dimension,
         on_delete=models.CASCADE,
         related_name='asignaciones',
         verbose_name='Dimensión',
-        null=True,          # ⭐ AGREGAR
-        blank=True,         # ⭐ AGREGAR
-        help_text='Si es NULL, la asignación es de la evaluación completa'
+        null=True,
+        blank=True,
+        help_text='Dimensión asignada (NULL si es evaluación completa)'
     )
     
     usuario_asignado = models.ForeignKey(
         Usuario,
         on_delete=models.CASCADE,
-        related_name='asignaciones_recibidas',  # ⭐ CAMBIAR related_name para evitar conflicto
+        related_name='asignaciones_recibidas',
         verbose_name='Usuario Asignado'
     )
     
     empresa = models.ForeignKey(
         Empresa,
         on_delete=models.CASCADE,
-        related_name='asignaciones',
+        related_name='asignaciones_directas',  # ⭐ Cambiar nombre para evitar conflicto
         verbose_name='Empresa'
     )
     
@@ -62,14 +73,25 @@ class Asignacion(BaseModel):
         Usuario,
         on_delete=models.SET_NULL,
         null=True,
-        blank=True,  # ⭐ AGREGAR
+        blank=True,
         related_name='asignaciones_creadas',
         verbose_name='Asignado Por'
     )
     
-    fecha_asignacion = models.DateTimeField(auto_now_add=True, verbose_name='Fecha de Asignación')
-    fecha_limite = models.DateField(verbose_name='Fecha Límite')
-    fecha_completado = models.DateTimeField(null=True, blank=True, verbose_name='Fecha de Completado')
+    fecha_asignacion = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name='Fecha de Asignación'
+    )
+    
+    fecha_limite = models.DateField(
+        verbose_name='Fecha Límite'
+    )
+    
+    fecha_completado = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Fecha de Completado'
+    )
     
     estado = models.CharField(
         max_length=20,
@@ -78,8 +100,16 @@ class Asignacion(BaseModel):
         verbose_name='Estado'
     )
     
-    total_preguntas = models.IntegerField(default=0, verbose_name='Total de Preguntas')
-    preguntas_respondidas = models.IntegerField(default=0, verbose_name='Preguntas Respondidas')
+    total_preguntas = models.IntegerField(
+        default=0,
+        verbose_name='Total de Preguntas'
+    )
+    
+    preguntas_respondidas = models.IntegerField(
+        default=0,
+        verbose_name='Preguntas Respondidas'
+    )
+    
     porcentaje_avance = models.DecimalField(
         max_digits=5,
         decimal_places=2,
@@ -87,36 +117,13 @@ class Asignacion(BaseModel):
         verbose_name='Porcentaje de Avance'
     )
     
-    observaciones = models.TextField(blank=True, default='', verbose_name='Observaciones')  # ⭐ AGREGAR default=''
+    observaciones = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Observaciones'
+    )
     
-    class Meta:
-        db_table = 'asignaciones'
-        verbose_name = 'Asignación'
-        verbose_name_plural = 'Asignaciones'
-        ordering = ['-fecha_asignacion']
-        
-        # ⭐ CAMBIAR unique_together a constraints para manejar NULL
-        constraints = [
-            models.UniqueConstraint(
-                fields=['encuesta', 'dimension', 'usuario_asignado'],
-                name='unique_asignacion_dimension',
-                condition=models.Q(dimension__isnull=False)  # Solo aplica cuando dimension NO es NULL
-            ),
-            models.UniqueConstraint(
-                fields=['encuesta', 'usuario_asignado'],
-                name='unique_asignacion_evaluacion',
-                condition=models.Q(dimension__isnull=True)  # Solo aplica cuando dimension ES NULL
-            ),
-        ]
-        
-        indexes = [
-            models.Index(fields=['usuario_asignado', 'estado']),
-            models.Index(fields=['empresa', 'estado']),
-            models.Index(fields=['fecha_limite']),
-            models.Index(fields=['dimension']),  # ⭐ AGREGAR índice
-        ]
-        
-    # ⭐ NUEVOS CAMPOS
+    # Campos de revisión
     requiere_revision = models.BooleanField(
         default=False,
         verbose_name='Requiere Revisión',
@@ -152,10 +159,34 @@ class Asignacion(BaseModel):
         help_text='Observaciones del revisor al aprobar o rechazar'
     )
     
+    class Meta:
+        db_table = 'asignaciones'
+        verbose_name = 'Asignación'
+        verbose_name_plural = 'Asignaciones'
+        ordering = ['-fecha_asignacion']
+        
+        # ⭐ CONSTRAINTS ACTUALIZADOS - Únicos por evaluación
+        constraints = [
+            models.UniqueConstraint(
+                fields=['evaluacion_empresa', 'dimension', 'usuario_asignado'],
+                name='unique_asignacion_evaluacion_dimension_usuario',
+                condition=models.Q(dimension__isnull=False, activo=True)
+            ),
+        ]
+        
+        # ⭐ INDEXES ACTUALIZADOS
+        indexes = [
+            models.Index(fields=['evaluacion_empresa', 'estado']),
+            models.Index(fields=['usuario_asignado', 'estado']),
+            models.Index(fields=['empresa', 'estado']),
+            models.Index(fields=['fecha_limite']),
+            models.Index(fields=['dimension']),
+        ]
+    
     def __str__(self):
         if self.dimension:
-            return f"{self.dimension.nombre} - {self.usuario_asignado.nombre_completo} ({self.estado})"
-        return f"{self.encuesta.nombre} (Completa) - {self.usuario_asignado.nombre_completo} ({self.estado})"
+            return f"{self.evaluacion_empresa} - {self.dimension.nombre} - {self.usuario_asignado.nombre_completo} ({self.estado})"
+        return f"{self.evaluacion_empresa} (Completa) - {self.usuario_asignado.nombre_completo} ({self.estado})"
     
     def save(self, *args, **kwargs):
         # Calcular total de preguntas
@@ -168,43 +199,42 @@ class Asignacion(BaseModel):
                     for dim in self.encuesta.dimensiones.filter(activo=True)
                 )
         
-        # ⭐ LÓGICA ACTUALIZADA DE ESTADO
-        if self.preguntas_respondidas >= self.total_preguntas and self.total_preguntas > 0:
-            if self.requiere_revision and self.estado != 'rechazado':
-                # Si requiere revisión, pasar a pendiente_revision
-                if self.estado != 'pendiente_revision':
+        # Lógica de estado
+        if self.estado not in ['completado', 'rechazado', 'pendiente_revision']:
+            if self.preguntas_respondidas >= self.total_preguntas and self.total_preguntas > 0:
+                if self.requiere_revision:
                     self.estado = 'pendiente_revision'
                     self.fecha_envio_revision = timezone.now()
-            else:
-                # Sin revisión, marcar como completado directamente
-                self.estado = 'completado'
-                if not self.fecha_completado:
-                    self.fecha_completado = timezone.now()
-        elif self.preguntas_respondidas > 0:
-            if self.estado not in ['pendiente_revision', 'rechazado', 'completado']:
+                else:
+                    self.estado = 'completado'
+                    if not self.fecha_completado:
+                        self.fecha_completado = timezone.now()
+            elif self.preguntas_respondidas > 0:
                 self.estado = 'en_progreso'
         
         # Calcular porcentaje
         if self.total_preguntas > 0:
             self.porcentaje_avance = (self.preguntas_respondidas / self.total_preguntas) * 100
         
-        # Verificar si está vencido (excepto si ya está completado)
+        # Verificar si está vencido
         if self.estado not in ['completado', 'rechazado'] and self.fecha_limite < timezone.now().date():
             self.estado = 'vencido'
         
         super().save(*args, **kwargs)
-    
-    def __str__(self):
-        if self.dimension:
-            return f"{self.dimension.nombre} - {self.usuario_asignado.nombre_completo} ({self.estado})"
-        return f"{self.encuesta.nombre} (Completa) - {self.usuario_asignado.nombre_completo} ({self.estado})"
+        
+        # ⭐ ACTUALIZAR progreso de la evaluación
+        if self.evaluacion_empresa_id:
+            try:
+                self.evaluacion_empresa.actualizar_progreso()
+            except Exception as e:
+                # No fallar el guardado si falla la actualización de progreso
+                print(f"⚠️ Error al actualizar progreso de evaluación: {e}")
     
     @property
     def dias_restantes(self):
         """Calcula días restantes hasta la fecha límite"""
         if self.estado == 'completado':
             return 0
-        
         delta = self.fecha_limite - timezone.now().date()
         return delta.days
     
@@ -220,3 +250,45 @@ class Asignacion(BaseModel):
     def es_evaluacion_completa(self):
         """Indica si es una asignación de evaluación completa"""
         return self.dimension is None
+    
+    def actualizar_progreso(self):
+        """
+        Actualiza el progreso de la asignación basado en respuestas
+        """
+        from apps.respuestas.models import Respuesta
+        from apps.encuestas.models import Pregunta
+        
+        # Contar preguntas totales de la dimensión
+        if self.dimension:
+            total_preguntas = Pregunta.objects.filter(
+                dimension=self.dimension,
+                activo=True
+            ).count()
+        else:
+            # Si es evaluación completa
+            total_preguntas = sum(
+                dim.preguntas.filter(activo=True).count() 
+                for dim in self.encuesta.dimensiones.filter(activo=True)
+            )
+        
+        # Contar respuestas activas de esta asignación
+        respuestas_enviadas = Respuesta.objects.filter(
+            asignacion=self,
+            activo=True
+        ).count()
+        
+        # Actualizar campos
+        self.total_preguntas = total_preguntas
+        self.preguntas_respondidas = respuestas_enviadas
+        
+        # Calcular porcentaje
+        if total_preguntas > 0:
+            self.porcentaje_avance = (respuestas_enviadas / total_preguntas) * 100
+        else:
+            self.porcentaje_avance = 0
+        
+        # Actualizar estado si estaba pendiente y ahora tiene progreso
+        if self.estado == 'pendiente' and respuestas_enviadas > 0:
+            self.estado = 'en_progreso'
+        
+        print(f"📊 Progreso actualizado: {respuestas_enviadas}/{total_preguntas} ({self.porcentaje_avance:.0f}%)")
