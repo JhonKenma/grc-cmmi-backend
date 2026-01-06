@@ -31,6 +31,7 @@ INSTALLED_APPS = [
     'apps.asignaciones',
     'apps.respuestas',
     'apps.dashboard',
+    'apps.reportes',
     'apps.notificaciones',
     'django_extensions',
 
