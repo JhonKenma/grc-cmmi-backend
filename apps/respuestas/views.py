@@ -6,6 +6,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
 from django.db.models import Q, Count
+from django.utils import timezone
+from apps.respuestas.services import CalculoNivelService 
 
 from apps.asignaciones.models import Asignacion
 from apps.core.mixins import ResponseMixin
@@ -141,8 +143,12 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def enviar(self, request, pk=None):
         """
-        Enviar respuesta (cambiar de borrador a enviado)
+        Enviar respuesta individual (cambiar de borrador a enviado)
         POST /api/respuestas/{id}/enviar/
+        
+        Cuando se envía la ÚLTIMA respuesta (progreso = 100%):
+        - Si requiere_revision → estado='pendiente_revision' (sin GAP)
+        - Si NO requiere_revision → estado='completado' (CON GAP)
         """
         respuesta = self.get_object()
         
@@ -162,7 +168,32 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
             message='Respuesta enviada exitosamente',
             status_code=status.HTTP_200_OK
         )
+    
+    @action(detail=True, methods=['post'])
+    def modificar_admin(self, request, pk=None):
+        """
+        Administrador modifica respuesta del usuario
+        POST /api/respuestas/{id}/modificar_admin/
+        """
+        respuesta = self.get_object()
         
+        # Validar permisos
+        if request.user.rol not in ['administrador', 'superadmin']:
+            return self.error_response(
+                message='Solo administradores pueden modificar respuestas',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        serializer = self.get_serializer(respuesta, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        respuesta_actualizada = serializer.save()
+        
+        return self.success_response(
+            data=RespuestaDetailSerializer(respuesta_actualizada).data,
+            message='Respuesta modificada exitosamente',
+            status_code=status.HTTP_200_OK
+        )
+
     @action(detail=False, methods=['get'])
     def revision(self, request):
         """
@@ -179,6 +210,7 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
         
         # Validar que el usuario tenga permisos
         try:
+            from apps.asignaciones.models import Asignacion
             asignacion = Asignacion.objects.get(id=asignacion_id)
         except Asignacion.DoesNotExist:
             return self.error_response(
@@ -207,7 +239,7 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
             'pregunta__dimension',
             'respondido_por'
         ).prefetch_related(
-            'evidencias'  # ⭐ SOLO evidencias, sin tipo_documento
+            'evidencias'
         ).order_by('pregunta__orden')
         
         serializer = RespuestaDetailSerializer(queryset, many=True)
@@ -216,33 +248,6 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
             'count': queryset.count(),
             'results': serializer.data
         })
-    
-    @action(detail=True, methods=['post'])  # ⭐ DEBE SER detail=True
-    def modificar_admin(self, request, pk=None):
-        """
-        Administrador modifica respuesta del usuario
-        POST /api/respuestas/{id}/modificar_admin/
-        """
-        respuesta = self.get_object()
-        
-        # Validar permisos
-        if request.user.rol not in ['administrador', 'superadmin']:
-            return self.error_response(
-                message='Solo administradores pueden modificar respuestas',
-                status_code=status.HTTP_403_FORBIDDEN
-            )
-        
-        serializer = self.get_serializer(respuesta, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        respuesta_actualizada = serializer.save()
-        
-        return self.success_response(
-            data=RespuestaDetailSerializer(respuesta_actualizada).data,
-            message='Respuesta modificada exitosamente',
-            status_code=status.HTTP_200_OK
-        )
-
-
 # ============================================
 # VIEWSET: EVIDENCIAS
 # ============================================

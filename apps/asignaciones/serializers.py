@@ -1,7 +1,7 @@
 # apps/asignaciones/serializers.py
 from rest_framework import serializers
 from .models import Asignacion
-from apps.encuestas.models import Encuesta, Dimension
+from apps.encuestas.models import Encuesta, Dimension, EvaluacionEmpresa  
 from apps.usuarios.models import Usuario
 from apps.empresas.models import Empresa
 from apps.encuestas.serializers import DimensionListSerializer, EncuestaListSerializer
@@ -18,6 +18,10 @@ from datetime import date, timedelta
 
 class AsignacionSerializer(serializers.ModelSerializer):
     """Serializer completo de asignaciones con información relacionada"""
+    
+    # ⭐ NUEVO - Info de evaluación empresa
+    evaluacion_empresa_info = serializers.SerializerMethodField()
+    
     encuesta_info = EncuestaListSerializer(source='encuesta', read_only=True)
     dimension_info = DimensionListSerializer(source='dimension', read_only=True)
     usuario_asignado_info = UsuarioListSerializer(source='usuario_asignado', read_only=True)
@@ -31,7 +35,7 @@ class AsignacionSerializer(serializers.ModelSerializer):
     dias_restantes = serializers.ReadOnlyField()
     esta_vencido = serializers.ReadOnlyField()
     
-    # ⭐ CAMPOS DE REVISIÓN (NUEVOS)
+    # Campos de revisión
     requiere_revision = serializers.BooleanField(read_only=True)
     fecha_envio_revision = serializers.DateTimeField(read_only=True)
     revisado_por_nombre = serializers.CharField(
@@ -59,7 +63,9 @@ class AsignacionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Asignacion
         fields = [
-            'id', 'encuesta', 'encuesta_info', 'dimension', 'dimension_info',
+            'id', 
+            'evaluacion_empresa', 'evaluacion_empresa_info',  # ⭐ NUEVO
+            'encuesta', 'encuesta_info', 'dimension', 'dimension_info',
             'usuario_asignado', 'usuario_asignado_info', 'empresa', 'empresa_info',
             'asignado_por', 'asignado_por_nombre',
             'fecha_asignacion', 'fecha_limite', 'fecha_completado',
@@ -67,7 +73,6 @@ class AsignacionSerializer(serializers.ModelSerializer):
             'total_preguntas', 'preguntas_respondidas', 'porcentaje_avance',
             'observaciones', 'activo',
             'nivel_deseado', 'motivo_nivel',
-            # ⭐ CAMPOS DE REVISIÓN
             'requiere_revision', 'fecha_envio_revision', 
             'revisado_por', 'revisado_por_nombre',
             'fecha_revision', 'comentarios_revision',
@@ -78,6 +83,19 @@ class AsignacionSerializer(serializers.ModelSerializer):
             'estado', 'total_preguntas', 'preguntas_respondidas', 'porcentaje_avance',
             'fecha_creacion', 'fecha_actualizacion'
         ]
+    
+        # ⭐ NUEVO MÉTODO
+    def get_evaluacion_empresa_info(self, obj):
+        """Información de la evaluación empresa"""
+        if obj.evaluacion_empresa:
+            return {
+                'id': str(obj.evaluacion_empresa.id),
+                'encuesta_nombre': obj.evaluacion_empresa.encuesta.nombre,
+                'empresa_nombre': obj.evaluacion_empresa.empresa.nombre,
+                'estado': obj.evaluacion_empresa.estado,
+                'porcentaje_avance': float(obj.evaluacion_empresa.porcentaje_avance),
+            }
+        return None
     
     def validate_fecha_limite(self, value):
         """Validar que la fecha límite sea futura"""
@@ -205,27 +223,52 @@ class AsignacionSerializer(serializers.ModelSerializer):
 
 
 class AsignacionListSerializer(serializers.ModelSerializer):
-    """Serializer simplificado para listado de asignaciones"""
+    # Info de encuesta
     encuesta_nombre = serializers.CharField(source='encuesta.nombre', read_only=True)
-    dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True)
-    usuario_asignado_nombre = serializers.CharField(
-        source='usuario_asignado.nombre_completo',
-        read_only=True
-    )
-    empresa_nombre = serializers.CharField(source='empresa.nombre', read_only=True)
+    
+    # ⭐ NUEVO: Info de evaluacion_empresa
+    evaluacion_empresa_id = serializers.UUIDField(source='evaluacion_empresa.id', read_only=True, allow_null=True)
+    evaluacion_nombre = serializers.SerializerMethodField()
+    
+    # Info de dimensión
+    dimension_id = serializers.UUIDField(source='dimension.id', read_only=True, allow_null=True)
+    dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True, allow_null=True)
+    dimension_codigo = serializers.CharField(source='dimension.codigo', read_only=True, allow_null=True)
+    
+    # Info de usuario asignado
+    usuario_asignado_nombre = serializers.CharField(source='usuario_asignado.nombre_completo', read_only=True)
+    usuario_asignado_email = serializers.EmailField(source='usuario_asignado.email', read_only=True)
+    
+    # Campos calculados
+    dias_restantes = serializers.IntegerField(read_only=True)
     estado_display = serializers.CharField(source='get_estado_display', read_only=True)
-    dias_restantes = serializers.ReadOnlyField()
     
     class Meta:
         model = Asignacion
         fields = [
-            'id', 'encuesta_nombre', 'dimension_nombre',
-            'usuario_asignado_nombre', 'empresa_nombre',
-            'fecha_limite', 'estado', 'estado_display',
-            'porcentaje_avance', 'dias_restantes', 'fecha_creacion',
-            'requiere_revision'  # ⭐ AGREGADO
+            'id',
+            'evaluacion_empresa_id',      # ⭐ NUEVO
+            'evaluacion_nombre',           # ⭐ NUEVO
+            'encuesta_nombre',
+            'dimension_id',
+            'dimension_nombre',
+            'dimension_codigo',
+            'usuario_asignado_nombre',
+            'usuario_asignado_email',
+            'fecha_limite',
+            'estado',
+            'estado_display',
+            'porcentaje_avance',
+            'dias_restantes',
+            'requiere_revision',           # ⭐ IMPORTANTE
+            'fecha_creacion',
         ]
-
+    
+    def get_evaluacion_nombre(self, obj):
+        """Retorna nombre de la encuesta de la evaluacion_empresa"""
+        if obj.evaluacion_empresa:
+            return obj.evaluacion_empresa.encuesta.nombre
+        return obj.encuesta.nombre if obj.encuesta else None
 
 # =============================================================================
 # SERIALIZERS PARA ASIGNACIÓN
@@ -233,104 +276,76 @@ class AsignacionListSerializer(serializers.ModelSerializer):
 
 class AsignacionEvaluacionCompletaSerializer(serializers.Serializer):
     """
-    Serializer para asignar EVALUACIÓN COMPLETA a un Administrador
-    Solo SuperAdmin puede usar esto
+    ⚠️ DEPRECADO - Usar AsignarEvaluacionSerializer en /api/evaluaciones-empresa/asignar/
+    
+    Este serializer ya no se usa. Las evaluaciones ahora se asignan a través de
+    EvaluacionEmpresa, no como asignaciones directas.
     """
-    encuesta_id = serializers.UUIDField(required=True, help_text='ID de la encuesta a asignar')
-    administrador_id = serializers.IntegerField(required=True, help_text='ID del administrador de empresa')
-    fecha_limite = serializers.DateField(required=True, help_text='Fecha límite de completación')
-    observaciones = serializers.CharField(required=False, allow_blank=True, help_text='Observaciones opcionales')
-    
-    def validate_encuesta_id(self, value):
-        """Validar que la encuesta exista y esté activa"""
-        try:
-            encuesta = Encuesta.objects.get(id=value, activo=True)
-            if encuesta.total_dimensiones == 0:
-                raise serializers.ValidationError('La encuesta no tiene dimensiones configuradas')
-            return value
-        except Encuesta.DoesNotExist:
-            raise serializers.ValidationError('Encuesta no encontrada o inactiva')
-    
-    def validate_administrador_id(self, value):
-        """Validar que sea un administrador con empresa"""
-        try:
-            usuario = Usuario.objects.get(id=value, activo=True)
-            if usuario.rol != 'administrador':
-                raise serializers.ValidationError('El usuario debe ser un administrador de empresa')
-            if not usuario.empresa:
-                raise serializers.ValidationError('El administrador debe tener una empresa asignada')
-            return value
-        except Usuario.DoesNotExist:
-            raise serializers.ValidationError('Usuario no encontrado o inactivo')
-    
-    def validate_fecha_limite(self, value):
-        """Validar que la fecha límite sea futura"""
-        if value < timezone.now().date():
-            raise serializers.ValidationError('La fecha límite debe ser futura')
-        
-        if value > timezone.now().date() + timedelta(days=365):
-            raise serializers.ValidationError('La fecha límite no puede ser mayor a 1 año')
-        
-        return value
+    encuesta_id = serializers.UUIDField(required=True)
+    administrador_id = serializers.IntegerField(required=True)
+    fecha_limite = serializers.DateField(required=True)
+    observaciones = serializers.CharField(required=False, allow_blank=True)
     
     def validate(self, attrs):
-        """Validación cruzada"""
-        encuesta = Encuesta.objects.get(id=attrs['encuesta_id'])
-        usuario = Usuario.objects.get(id=attrs['administrador_id'])
-        
-        # Verificar que no exista ya una asignación de esta encuesta para este usuario
-        if Asignacion.objects.filter(
-            encuesta=encuesta,
-            usuario_asignado=usuario,
-            empresa=usuario.empresa,
-            dimension__isnull=True,  # ⭐ Asegurar que sea evaluación completa
-            activo=True
-        ).exists():
-            raise serializers.ValidationError({
-                'encuesta_id': f'El administrador {usuario.nombre_completo} ya tiene asignada esta evaluación'
-            })
-        
-        return attrs
-
-
+        raise serializers.ValidationError(
+            'Este endpoint está deprecado. Use /api/evaluaciones-empresa/asignar/ en su lugar.'
+        )
 class AsignacionDimensionSerializer(serializers.Serializer):
     """
-    Serializer para asignar una o varias dimensiones a un usuario
+    Serializer para asignar dimensiones a un usuario
     """
-    encuesta_id = serializers.UUIDField(required=True, help_text='ID de la encuesta')
-    dimension_ids = serializers.ListField(  # ⭐ CAMBIO: Ahora es una lista
+    # ⭐ NUEVO - REQUERIDO
+    evaluacion_empresa_id = serializers.UUIDField(
+        required=True,
+        help_text='ID de la evaluación empresa'
+    )
+    
+    dimension_ids = serializers.ListField(
         child=serializers.UUIDField(),
         required=True,
         help_text='Lista de IDs de dimensiones a asignar'
     )
-    usuario_id = serializers.IntegerField(required=True, help_text='ID del usuario a asignar')
-    fecha_limite = serializers.DateField(required=True, help_text='Fecha límite')
-    observaciones = serializers.CharField(required=False, allow_blank=True, help_text='Observaciones')
+    
+    usuario_id = serializers.IntegerField(
+        required=True,
+        help_text='ID del usuario a asignar'
+    )
+    
+    fecha_limite = serializers.DateField(
+        required=True,
+        help_text='Fecha límite'
+    )
+    
+    observaciones = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='Observaciones'
+    )
+    
     requiere_revision = serializers.BooleanField(
         required=False,
         default=False,
         help_text='¿Requiere revisión del administrador?'
     )
     
-    def validate_encuesta_id(self, value):
-        """Validar encuesta"""
+    # ⭐ NUEVO - Validar evaluacion_empresa
+    def validate_evaluacion_empresa_id(self, value):
+        """Validar que la evaluación exista"""
         try:
-            Encuesta.objects.get(id=value, activo=True)
+            EvaluacionEmpresa.objects.get(id=value, activo=True)
             return value
-        except Encuesta.DoesNotExist:
-            raise serializers.ValidationError('Encuesta no encontrada')
+        except EvaluacionEmpresa.DoesNotExist:
+            raise serializers.ValidationError('Evaluación no encontrada o inactiva')
     
     def validate_dimension_ids(self, value):
         """Validar dimensiones"""
         if not value:
             raise serializers.ValidationError('Debes seleccionar al menos una dimensión')
         
-        # Verificar que todas las dimensiones existan y estén activas
         dimensiones = Dimension.objects.filter(id__in=value, activo=True)
         if dimensiones.count() != len(value):
             raise serializers.ValidationError('Una o más dimensiones no existen o están inactivas')
         
-        # Verificar que todas tengan preguntas
         for dimension in dimensiones:
             if dimension.total_preguntas == 0:
                 raise serializers.ValidationError(
@@ -359,55 +374,49 @@ class AsignacionDimensionSerializer(serializers.Serializer):
             raise serializers.ValidationError('La fecha límite no puede ser mayor a 1 año')
         return value
     
-def validate(self, attrs):
-    """Validación cruzada"""
-    user = self.context['request'].user
-    dimension_ids = attrs.get('dimension_ids')
-    encuesta = Encuesta.objects.get(id=attrs['encuesta_id'])
-    usuario = Usuario.objects.get(id=attrs['usuario_id'])
-    
-    # Validar que todas las dimensiones pertenezcan a la encuesta
-    dimensiones = Dimension.objects.filter(id__in=dimension_ids)
-    for dimension in dimensiones:
-        if dimension.encuesta != encuesta:
-            raise serializers.ValidationError({
-                'dimension_ids': f'La dimensión "{dimension.nombre}" no pertenece a esta encuesta'
-            })
-    
-    # Validar permisos según rol
-    if user.rol == 'administrador':
-        if usuario.empresa != user.empresa:
-            raise serializers.ValidationError({
-                'usuario_id': 'Solo puedes asignar a usuarios de tu propia empresa'
-            })
+    def validate(self, attrs):
+        """Validación cruzada"""
+        user = self.context['request'].user
+        dimension_ids = attrs.get('dimension_ids')
+        evaluacion_empresa = EvaluacionEmpresa.objects.get(id=attrs['evaluacion_empresa_id'])
+        usuario = Usuario.objects.get(id=attrs['usuario_id'])
         
-        if not Asignacion.objects.filter(
-            encuesta=encuesta,
-            usuario_asignado=user,
-            empresa=user.empresa,
-            dimension__isnull=True,
-            activo=True
-        ).exists():
-            raise serializers.ValidationError({
-                'encuesta_id': 'No tienes asignada esta evaluación, no puedes delegar dimensiones'
-            })
-    
-    # ⭐ CAMBIO CLAVE: Verificar que las dimensiones NO estén asignadas a NADIE en la empresa
-    for dimension_id in dimension_ids:
-        # Buscar si existe asignación activa de esta dimensión en la empresa
-        asignacion_existente = Asignacion.objects.filter(
-            dimension_id=dimension_id,
-            empresa=usuario.empresa,  # ⭐ Cualquier usuario de la empresa
-            activo=True
-        ).select_related('usuario_asignado').first()
+        # ⭐ Validar que las dimensiones pertenezcan a la encuesta de la evaluación
+        dimensiones = Dimension.objects.filter(id__in=dimension_ids)
+        for dimension in dimensiones:
+            if dimension.encuesta != evaluacion_empresa.encuesta:
+                raise serializers.ValidationError({
+                    'dimension_ids': f'La dimensión "{dimension.nombre}" no pertenece a la encuesta de esta evaluación'
+                })
         
-        if asignacion_existente:
-            dimension = Dimension.objects.get(id=dimension_id)
-            raise serializers.ValidationError({
-                'dimension_ids': f'La dimensión "{dimension.nombre}" ya está asignada a {asignacion_existente.usuario_asignado.nombre_completo}'
-            })
-    
-    return attrs
+        # Validar permisos
+        if user.rol == 'administrador':
+            if usuario.empresa != user.empresa:
+                raise serializers.ValidationError({
+                    'usuario_id': 'Solo puedes asignar a usuarios de tu propia empresa'
+                })
+            
+            # ⭐ Validar que el admin sea responsable de esta evaluación
+            if evaluacion_empresa.administrador != user:
+                raise serializers.ValidationError({
+                    'evaluacion_empresa_id': 'No eres el administrador responsable de esta evaluación'
+                })
+        
+        # ⭐ Verificar que las dimensiones NO estén asignadas en ESTA evaluación
+        for dimension_id in dimension_ids:
+            asignacion_existente = Asignacion.objects.filter(
+                evaluacion_empresa=evaluacion_empresa,  # ⭐ CLAVE: Filtrar por evaluación
+                dimension_id=dimension_id,
+                activo=True
+            ).select_related('usuario_asignado').first()
+            
+            if asignacion_existente:
+                dimension = Dimension.objects.get(id=dimension_id)
+                raise serializers.ValidationError({
+                    'dimension_ids': f'La dimensión "{dimension.nombre}" ya está asignada a {asignacion_existente.usuario_asignado.nombre_completo} en esta evaluación'
+                })
+        
+        return attrs
 
 
 class AsignacionCreateSerializer(serializers.ModelSerializer):

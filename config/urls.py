@@ -27,6 +27,7 @@ urlpatterns = [
     path('api/', include('apps.notificaciones.urls')),  # ← Quitar "notificaciones/"
     path('api/asignaciones/', include('apps.asignaciones.urls')),
     path('api/', include('apps.respuestas.urls')),
+    path('api/', include('apps.reportes.urls')),
     
     path('api/dashboard/', include('apps.dashboard.urls')),
 

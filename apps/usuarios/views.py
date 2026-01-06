@@ -255,6 +255,29 @@ class UsuarioViewSet(ResponseMixin, viewsets.ModelViewSet):
         return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
+    def por_empresa(self, request):
+        """
+        Obtener usuarios de una empresa específica
+        GET /api/usuarios/por_empresa/?empresa_id=1&rol=administrador
+        """
+        empresa_id = request.query_params.get('empresa_id')
+        rol = request.query_params.get('rol')
+        
+        if not empresa_id:
+            return Response({'error': 'empresa_id es requerido'}, status=400)
+        
+        queryset = Usuario.objects.filter(
+            empresa_id=empresa_id,
+            activo=True
+        )
+        
+        if rol:
+            queryset = queryset.filter(rol=rol)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response({'results': serializer.data})
+    
+    @action(detail=False, methods=['get'])
     def estadisticas(self, request):
         """
         Estadísticas de usuarios
@@ -287,3 +310,4 @@ class UsuarioViewSet(ResponseMixin, viewsets.ModelViewSet):
             'usuarios_inactivos': total - activos,
             'por_rol': por_rol
         })
+        

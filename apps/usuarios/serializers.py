@@ -6,7 +6,7 @@ from apps.empresas.serializers import EmpresaSerializer
 
 class UsuarioSerializer(serializers.ModelSerializer):
     """Serializer completo de usuario"""
-    empresa_info = EmpresaSerializer(source='empresa', read_only=True)
+    empresa_info = serializers.SerializerMethodField()  # ⭐ CAMBIAR A SerializerMethodField
     password = serializers.CharField(
         write_only=True,
         required=False,
@@ -31,7 +31,13 @@ class UsuarioSerializer(serializers.ModelSerializer):
             'password': {'write_only': True},
             'email': {'required': True}
         }
-    
+
+    def get_empresa_info(self, obj):
+        """Devuelve información de la empresa usando el serializer"""
+        if obj.empresa:
+            return EmpresaSerializer(obj.empresa).data
+        return None
+
     def validate_email(self, value):
         """Validar que el email sea único"""
         if self.instance:
@@ -146,6 +152,19 @@ class UsuarioSerializer(serializers.ModelSerializer):
         
         instance.save()
         return instance
+    
+    # ⭐ AGREGAR ESTE MÉTODO
+    def get_empresa_info(self, obj):
+        """Retorna información de la empresa con UUID como string"""
+        if obj.empresa:
+            return {
+                'id': str(obj.empresa.id),  # ⭐ CONVERTIR UUID A STRING
+                'nombre': obj.empresa.nombre,
+                'ruc': obj.empresa.ruc,
+                'razon_social': obj.empresa.razon_social,
+                'sector': obj.empresa.sector,
+            }
+        return None
 
 class UsuarioListSerializer(serializers.ModelSerializer):
     """Serializer simplificado para listados"""

@@ -1,4 +1,5 @@
 # apps/encuestas/models.py
+from django.utils import timezone
 from django.db import models
 from apps.core.models import BaseModel
 from apps.empresas.models import Empresa
@@ -159,6 +160,17 @@ class ConfigNivelDeseado(BaseModel):
     Cada empresa puede tener objetivos diferentes
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    evaluacion_empresa = models.ForeignKey(
+        'EvaluacionEmpresa',
+        on_delete=models.CASCADE,
+        related_name='configuraciones_nivel',
+        verbose_name='Evaluación Empresa',
+        null=True,           # ⭐ DEBE ESTAR
+        blank=True,          # ⭐ DEBE ESTAR
+        help_text='A qué evaluación específica pertenece esta configuración'
+    )
+   
     dimension = models.ForeignKey(
         Dimension,
         on_delete=models.CASCADE,
@@ -193,11 +205,193 @@ class ConfigNivelDeseado(BaseModel):
         verbose_name = 'Configuración Nivel Deseado'
         verbose_name_plural = 'Configuraciones Niveles Deseados'
         ordering = ['-fecha_creacion']
-        unique_together = [['dimension', 'empresa']]
+        unique_together = [['evaluacion_empresa', 'dimension']]
         indexes = [
-            models.Index(fields=['dimension', 'empresa']),
+            models.Index(fields=['evaluacion_empresa', 'dimension']),
             models.Index(fields=['empresa']),
         ]
     
     def __str__(self):
         return f"{self.empresa.nombre} - {self.dimension.nombre} - Nivel {self.nivel_deseado}"
+    
+    
+class EvaluacionEmpresa(BaseModel):
+    """
+    Relación entre una Empresa y una Encuesta asignada.
+    
+    Flujo:
+    1. SuperAdmin asigna una evaluación (encuesta) a una empresa
+    2. El Admin de esa empresa configura niveles deseados
+    3. El Admin asigna dimensiones a usuarios
+    4. Se generan reportes GAP filtrados por esta evaluación
+    """
+    
+    ESTADOS = [
+        ('activa', 'Activa'),
+        ('en_progreso', 'En Progreso'),
+        ('completada', 'Completada'),
+        ('vencida', 'Vencida'),
+        ('cancelada', 'Cancelada'),
+    ]
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    empresa = models.ForeignKey(
+        Empresa,
+        on_delete=models.CASCADE,
+        related_name='evaluaciones_asignadas',
+        verbose_name='Empresa'
+    )
+    
+    encuesta = models.ForeignKey(
+        Encuesta,
+        on_delete=models.CASCADE,
+        related_name='asignaciones_empresas',
+        verbose_name='Encuesta'
+    )
+    
+    administrador = models.ForeignKey(
+        'usuarios.Usuario',
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='evaluaciones_administradas',
+        verbose_name='Administrador Responsable',
+        help_text='Administrador de la empresa a quien se asignó'
+    )
+    
+    asignado_por = models.ForeignKey(
+        'usuarios.Usuario',
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='evaluaciones_asignadas_creadas',
+        verbose_name='Asignado Por',
+        help_text='SuperAdmin que asignó la evaluación'
+    )
+    
+    fecha_asignacion = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name='Fecha de Asignación'
+    )
+    
+    fecha_limite = models.DateField(
+        verbose_name='Fecha Límite Global',
+        help_text='Fecha límite para completar toda la evaluación'
+    )
+    
+    fecha_completado = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Fecha de Completado'
+    )
+    
+    estado = models.CharField(
+        max_length=20,
+        choices=ESTADOS,
+        default='activa',
+        verbose_name='Estado'
+    )
+    
+    observaciones = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Observaciones'
+    )
+    
+    # Métricas de progreso
+    total_dimensiones = models.IntegerField(
+        default=0,
+        verbose_name='Total de Dimensiones'
+    )
+    
+    dimensiones_asignadas = models.IntegerField(
+        default=0,
+        verbose_name='Dimensiones Asignadas a Usuarios'
+    )
+    
+    dimensiones_completadas = models.IntegerField(
+        default=0,
+        verbose_name='Dimensiones Completadas'
+    )
+    
+    porcentaje_avance = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        verbose_name='Porcentaje de Avance'
+    )
+    
+    class Meta:
+        db_table = 'evaluaciones_empresas'
+        verbose_name = 'Evaluación Empresa'
+        verbose_name_plural = 'Evaluaciones Empresas'
+        ordering = ['-fecha_asignacion']
+        unique_together = [['empresa', 'encuesta', 'activo']]
+        indexes = [
+            models.Index(fields=['empresa', 'estado']),
+            models.Index(fields=['administrador']),
+            models.Index(fields=['fecha_limite']),
+        ]
+    
+    def __str__(self):
+        return f"{self.empresa.nombre} - {self.encuesta.nombre} ({self.get_estado_display()})"
+    
+    def save(self, *args, **kwargs):
+        # Calcular total de dimensiones al crear
+        if not self.pk and not self.total_dimensiones:
+            self.total_dimensiones = self.encuesta.dimensiones.filter(activo=True).count()
+        
+        # Verificar si está vencida
+        if self.estado not in ['completada', 'cancelada']:
+            if self.fecha_limite < timezone.now().date():
+                self.estado = 'vencida'
+        
+        super().save(*args, **kwargs)
+    
+    def actualizar_progreso(self):
+        """Actualiza el progreso basándose en las asignaciones"""
+        from apps.asignaciones.models import Asignacion
+        
+        # Contar dimensiones asignadas (únicas)
+        self.dimensiones_asignadas = Asignacion.objects.filter(
+            evaluacion_empresa=self,
+            dimension__isnull=False,
+            activo=True
+        ).values('dimension').distinct().count()
+        
+        # Contar dimensiones completadas (únicas)
+        self.dimensiones_completadas = Asignacion.objects.filter(
+            evaluacion_empresa=self,
+            dimension__isnull=False,
+            estado='completado',
+            activo=True
+        ).values('dimension').distinct().count()
+        
+        # Calcular porcentaje
+        if self.total_dimensiones > 0:
+            self.porcentaje_avance = (self.dimensiones_completadas / self.total_dimensiones) * 100
+        
+        # Actualizar estado
+        if self.dimensiones_completadas == self.total_dimensiones and self.total_dimensiones > 0:
+            self.estado = 'completada'
+            if not self.fecha_completado:
+                self.fecha_completado = timezone.now()
+        elif self.dimensiones_asignadas > 0:
+            self.estado = 'en_progreso'
+        
+        self.save()
+    
+    @property
+    def dias_restantes(self):
+        """Calcula días restantes hasta la fecha límite"""
+        if self.estado == 'completada':
+            return 0
+        delta = self.fecha_limite - timezone.now().date()
+        return delta.days
+    
+    @property
+    def esta_vencida(self):
+        """Verifica si está vencida"""
+        return self.estado == 'vencida' or (
+            self.estado not in ['completada', 'cancelada'] and 
+            self.fecha_limite < timezone.now().date()
+        )
