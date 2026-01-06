@@ -11,12 +11,13 @@ from .serializers import (
     AsignacionSerializer,
     AsignacionListSerializer,
     AsignacionEvaluacionCompletaSerializer,
+    AsignacionEvaluacionCompletaSerializer,
     AsignacionDimensionSerializer,
     ReasignarSerializer,
     ActualizarProgresoSerializer,
     RevisarAsignacionSerializer
 )
-from apps.encuestas.models import Encuesta, Dimension
+from apps.encuestas.models import Encuesta, Dimension, EvaluacionEmpresa  
 from apps.empresas.models import Empresa
 from django.utils import timezone
 from apps.usuarios.models import Usuario
@@ -25,7 +26,7 @@ from apps.core.mixins import ResponseMixin
 
 # Importar servicio de notificaciones
 from apps.notificaciones.services import NotificacionAsignacionService
-
+from apps.respuestas.services import CalculoNivelService
 
 class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
@@ -71,6 +72,7 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
         """Filtrar asignaciones según rol"""
         user = self.request.user
         queryset = Asignacion.objects.select_related(
+            'evaluacion_empresa',
             'encuesta', 'dimension', 'usuario_asignado', 'empresa', 'asignado_por'
         ).filter(activo=True)
         
@@ -80,7 +82,10 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
         
         # Administrador ve asignaciones de su empresa
         if user.rol == 'administrador' and user.empresa:
-            return queryset.filter(empresa=user.empresa)
+            return queryset.filter(
+                Q(evaluacion_empresa__administrador=user) |  
+                Q(empresa=user.empresa, evaluacion_empresa__isnull=True)  # ⭐ Compatibilidad: Asignaciones antiguas
+            )
         
         # Usuario/Auditor solo ve sus propias asignaciones
         return queryset.filter(usuario_asignado=user)
@@ -139,12 +144,10 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
                 # 🔔 ENVIAR NOTIFICACIÓN
                 NotificacionAsignacionService.notificar_asignacion_evaluacion(asignacion)
                 
-                return self.success_response(
-                    data=AsignacionSerializer(asignacion).data,
-                    message=f'Evaluación asignada exitosamente a {administrador.nombre_completo}. '
-                            f'Se ha enviado una notificación por email.',
-                    status_code=status.HTTP_201_CREATED
-                )
+            return self.error_response(
+                message='Este endpoint está deprecado. Use /api/evaluaciones-empresa/asignar/ para asignar evaluaciones.',
+                status_code=status.HTTP_410_GONE
+            )
         
         except Exception as e:
             return self.error_response(
@@ -160,41 +163,53 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def asignar_dimension(self, request):
         """
-        Administrador asigna una o varias dimensiones a un Usuario
+        Administrador asigna dimensiones a un Usuario
         POST /api/asignaciones/asignar_dimension/
         
         Body:
         {
-            "encuesta_id": "uuid",
-            "dimension_ids": ["uuid1", "uuid2", "uuid3"],  // ⭐ Lista de IDs
+            "evaluacion_empresa_id": "uuid",  // ⭐ NUEVO - REQUERIDO
+            "dimension_ids": ["uuid1", "uuid2"],
             "usuario_id": 456,
             "fecha_limite": "2024-12-31",
             "observaciones": "Revisar urgente",
             "requiere_revision": true
         }
-        
-        PERMISOS: SuperAdmin o Administrador
         """
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         
         try:
             with transaction.atomic():
-                encuesta = Encuesta.objects.get(id=serializer.validated_data['encuesta_id'])
+                # ⭐ OBTENER EVALUACION EMPRESA
+                evaluacion_empresa = EvaluacionEmpresa.objects.get(
+                    id=serializer.validated_data['evaluacion_empresa_id']
+                )
+                
+                # Validar permisos
+                user = request.user
+                if user.rol == 'administrador':
+                    if evaluacion_empresa.administrador != user:
+                        return self.error_response(
+                            message='Solo puedes asignar dimensiones de tus evaluaciones',
+                            status_code=status.HTTP_403_FORBIDDEN
+                        )
+                
                 dimension_ids = serializer.validated_data['dimension_ids']
                 usuario = Usuario.objects.get(id=serializer.validated_data['usuario_id'])
                 fecha_limite = serializer.validated_data['fecha_limite']
                 observaciones = serializer.validated_data.get('observaciones', '')
                 requiere_revision = serializer.validated_data.get('requiere_revision', False)
                 
-                # ⭐ CREAR ASIGNACIÓN POR CADA DIMENSIÓN
                 asignaciones_creadas = []
                 
                 for dimension_id in dimension_ids:
                     dimension = Dimension.objects.get(id=dimension_id)
                     
+                    # ⭐ CREAR CON evaluacion_empresa
                     asignacion = Asignacion.objects.create(
-                        encuesta=encuesta,
+                        evaluacion_empresa=evaluacion_empresa,  # ⭐ NUEVO
+                        encuesta=evaluacion_empresa.encuesta,
                         dimension=dimension,
                         usuario_asignado=usuario,
                         empresa=usuario.empresa,
@@ -209,23 +224,32 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
                     )
                     
                     asignaciones_creadas.append(asignacion)
-                    
-                    # 🔔 ENVIAR NOTIFICACIÓN POR CADA DIMENSIÓN
                     NotificacionAsignacionService.notificar_asignacion_dimension(asignacion)
                 
-                # Preparar respuesta
+                # ⭐ ACTUALIZAR PROGRESO DE LA EVALUACIÓN
+                evaluacion_empresa.actualizar_progreso()
+                
                 mensaje_extra = ' Estas asignaciones requerirán tu revisión.' if requiere_revision else ''
                 
                 return self.success_response(
                     data={
                         'asignaciones': [AsignacionSerializer(a).data for a in asignaciones_creadas],
-                        'total_asignadas': len(asignaciones_creadas)
+                        'total_asignadas': len(asignaciones_creadas),
+                        'evaluacion': {  # ⭐ NUEVO
+                            'id': str(evaluacion_empresa.id),
+                            'nombre': evaluacion_empresa.encuesta.nombre,
+                            'porcentaje_avance': float(evaluacion_empresa.porcentaje_avance)
+                        }
                     },
-                    message=f'{len(asignaciones_creadas)} dimensión(es) asignada(s) exitosamente a {usuario.nombre_completo}. '
-                            f'Se han enviado las notificaciones por email.{mensaje_extra}',
+                    message=f'{len(asignaciones_creadas)} dimensión(es) asignada(s) exitosamente a {usuario.nombre_completo}.{mensaje_extra}',
                     status_code=status.HTTP_201_CREATED
                 )
         
+        except EvaluacionEmpresa.DoesNotExist:
+            return self.error_response(
+                message='Evaluación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
         except Exception as e:
             return self.error_response(
                 message='Error al asignar dimensiones',
@@ -237,72 +261,72 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def dimensiones_disponibles(self, request):
         """
-        Obtener dimensiones disponibles para asignar a un usuario
-        GET /api/asignaciones/dimensiones_disponibles/?encuesta_id=xxx&empresa_id=1
-        
-        ⭐ CAMBIO: Retorna dimensiones NO asignadas a NINGÚN usuario de la empresa
+        Obtener dimensiones disponibles para asignar
+        GET /api/asignaciones/dimensiones_disponibles/?evaluacion_empresa_id=xxx
         """
-        encuesta_id = request.query_params.get('encuesta_id')
-        empresa_id = request.query_params.get('empresa_id')
+        evaluacion_empresa_id = request.query_params.get('evaluacion_empresa_id')
         
-        if not encuesta_id or not empresa_id:
+        if not evaluacion_empresa_id:
             return self.error_response(
-                message='Debes proporcionar encuesta_id y empresa_id',
+                message='Debes proporcionar evaluacion_empresa_id',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
         try:
-            empresa = Empresa.objects.get(id=empresa_id)
+            evaluacion_empresa = EvaluacionEmpresa.objects.get(id=evaluacion_empresa_id)
             
-            # Obtener todas las dimensiones activas de la encuesta
+            # Validar permisos
+            user = request.user
+            if user.rol == 'administrador':
+                if evaluacion_empresa.administrador != user:
+                    return self.error_response(
+                        message='No tienes acceso a esta evaluación',
+                        status_code=status.HTTP_403_FORBIDDEN
+                    )
+            
+            # Dimensiones de la encuesta
             dimensiones_encuesta = Dimension.objects.filter(
-                encuesta_id=encuesta_id,
+                encuesta=evaluacion_empresa.encuesta,
                 activo=True
             ).order_by('orden')
             
-            # ⭐ CAMBIO CLAVE: Obtener dimensiones ya asignadas a CUALQUIER usuario de la empresa
+            # ⭐ Dimensiones ya asignadas en ESTA evaluación específica
             dimensiones_asignadas = Asignacion.objects.filter(
-                encuesta_id=encuesta_id,
-                empresa=empresa,  # ⭐ Filtrar por empresa, no por usuario
+                evaluacion_empresa=evaluacion_empresa,  # ⭐ CAMBIO CLAVE
                 activo=True,
-                dimension__isnull=False  # Solo asignaciones de dimensiones específicas
+                dimension__isnull=False
             ).values_list('dimension_id', flat=True)
             
-            # Filtrar dimensiones disponibles (las que NO están asignadas a nadie)
+            # Dimensiones disponibles
             dimensiones_disponibles = dimensiones_encuesta.exclude(
                 id__in=dimensiones_asignadas
             )
             
-            # Serializar
             from apps.encuestas.serializers import DimensionListSerializer
             
             return Response({
+                'evaluacion': {  # ⭐ NUEVO
+                    'id': str(evaluacion_empresa.id),
+                    'nombre': evaluacion_empresa.encuesta.nombre,
+                    'empresa': evaluacion_empresa.empresa.nombre,
+                },
                 'total_dimensiones': dimensiones_encuesta.count(),
                 'dimensiones_asignadas': len(dimensiones_asignadas),
                 'dimensiones_disponibles': dimensiones_disponibles.count(),
                 'dimensiones': DimensionListSerializer(dimensiones_disponibles, many=True).data,
-                'detalle_asignaciones': self._get_detalle_asignaciones(empresa, encuesta_id)  # ⭐ Info extra
+                'detalle_asignaciones': self._get_detalle_asignaciones(evaluacion_empresa)
             })
         
-        except Empresa.DoesNotExist:
+        except EvaluacionEmpresa.DoesNotExist:
             return self.error_response(
-                message='Empresa no encontrada',
+                message='Evaluación no encontrada',
                 status_code=status.HTTP_404_NOT_FOUND
             )
-        except Exception as e:
-            return self.error_response(
-                message='Error al obtener dimensiones disponibles',
-                errors=str(e),
-                status_code=status.HTTP_400_BAD_REQUEST
-            )
 
-    def _get_detalle_asignaciones(self, empresa, encuesta_id):
-        """
-        ⭐ NUEVO: Retorna detalle de quién tiene asignada cada dimensión
-        """
+    def _get_detalle_asignaciones(self, evaluacion_empresa):  # ✅ MANTENER ESTA
+        """Detalle de quién tiene asignada cada dimensión"""
         asignaciones = Asignacion.objects.filter(
-            encuesta_id=encuesta_id,
-            empresa=empresa,
+            evaluacion_empresa=evaluacion_empresa,
             activo=True,
             dimension__isnull=False
         ).select_related('dimension', 'usuario_asignado')
@@ -320,6 +344,7 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
             })
         
         return detalle
+
     # =========================================================================
     # MIS ASIGNACIONES
     # =========================================================================
@@ -479,40 +504,26 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
         """
         Aprobar o rechazar una asignación que requiere revisión
         POST /api/asignaciones/{id}/revisar/
-        
-        Body:
-        {
-            "accion": "aprobar" | "rechazar",
-            "comentarios": "Observaciones del revisor"
-        }
-        
-        PERMISOS: SuperAdmin o Administrador de la empresa
         """
-        asignacion = self.get_object()
         
-        # ⭐ DEBUG
-        print(f"🔍 ANTES - Asignación ID: {asignacion.id}")
-        print(f"   Estado actual: {asignacion.estado}")
-        print(f"   Requiere revisión: {asignacion.requiere_revision}")
+        asignacion = self.get_object()
         
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        # Validar que la asignación requiera revisión
+        # Validaciones
         if not asignacion.requiere_revision:
             return self.error_response(
                 message='Esta asignación no requiere revisión',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validar que esté en estado pendiente_revision
         if asignacion.estado != 'pendiente_revision':
             return self.error_response(
                 message=f'La asignación debe estar en estado "Pendiente de Revisión". Estado actual: {asignacion.get_estado_display()}',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validar permisos: Admin solo puede revisar asignaciones de su empresa
         if request.user.rol == 'administrador':
             if asignacion.empresa != request.user.empresa:
                 return self.error_response(
@@ -525,37 +536,73 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
                 accion = serializer.validated_data['accion']
                 comentarios = serializer.validated_data.get('comentarios', '')
                 
-                asignacion.revisado_por = request.user
-                asignacion.fecha_revision = timezone.now()
-                asignacion.comentarios_revision = comentarios
-                
                 if accion == 'aprobar':
+                    # ═══════════════════════════════════════════════════
+                    # APROBAR: Completar y CALCULAR GAP
+                    # ═══════════════════════════════════════════════════
                     asignacion.estado = 'completado'
                     asignacion.fecha_completado = timezone.now()
-                    mensaje = f'Asignación aprobada exitosamente'
+                    asignacion.revisado_por = request.user
+                    asignacion.fecha_revision = timezone.now()
+                    asignacion.comentarios_revision = comentarios
+                    asignacion.save()
                     
-                    # 🔔 Notificar al usuario que fue aprobada
+                    mensaje = 'Asignación aprobada exitosamente'
+                    
+                    print(f"✅ Asignación {asignacion.id} aprobada por {request.user}")
+                    print(f"🔧 Calculando GAP...")
+                    
+                    try:
+                        # ⭐ CALCULAR GAP AL APROBAR
+                        calculo_gap = CalculoNivelService.calcular_gap_asignacion(asignacion)
+                        
+                        print(f"✅ GAP calculado exitosamente:")
+                        print(f"   📊 Nivel Deseado: {calculo_gap.nivel_deseado}")
+                        print(f"   📊 Nivel Actual: {calculo_gap.nivel_actual:.2f}")
+                        print(f"   📊 GAP: {calculo_gap.gap:.2f}")
+                        print(f"   📊 Clasificación: {calculo_gap.get_clasificacion_gap_display()}")
+                        
+                        mensaje += f'. GAP calculado: {calculo_gap.gap:.1f} ({calculo_gap.get_clasificacion_gap_display()})'
+                    
+                    except Exception as e:
+                        print(f"⚠️  Error al calcular GAP: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        
+                        mensaje += ' (Error al calcular GAP)'
+                    
+                    # Notificar al usuario
+                    from apps.notificaciones.services import NotificacionAsignacionService
                     NotificacionAsignacionService.notificar_revision_aprobada(asignacion)
-                    
+                
                 else:  # rechazar
+                    # ═══════════════════════════════════════════════════
+                    # RECHAZAR: Volver a estado inicial
+                    # ═══════════════════════════════════════════════════
                     asignacion.estado = 'rechazado'
-                    asignacion.preguntas_respondidas = 0  # Resetear para que vuelva a responder
+                    asignacion.preguntas_respondidas = 0
                     asignacion.porcentaje_avance = 0
-                    mensaje = f'Asignación rechazada. El usuario deberá completarla nuevamente.'
+                    asignacion.revisado_por = request.user
+                    asignacion.fecha_revision = timezone.now()
+                    asignacion.comentarios_revision = comentarios
+                    asignacion.save()
                     
-                    # 🔔 Notificar al usuario que fue rechazada
+                    mensaje = 'Asignación rechazada. El usuario deberá completarla nuevamente.'
+                    
+                    print(f"❌ Asignación {asignacion.id} rechazada por {request.user}")
+                    print(f"❌ GAP NO calculado (asignación rechazada)")
+                    
+                    # Desactivar GAP si existía (por si las moscas)
+                    CalculoNivel.objects.filter(asignacion=asignacion).update(activo=False)
+                    
+                    # Notificar al usuario
+                    from apps.notificaciones.services import NotificacionAsignacionService
                     NotificacionAsignacionService.notificar_revision_rechazada(asignacion)
                 
-                asignacion.save()
-                
-                # ⭐ DEBUG
-                print(f"✅ DESPUÉS - Asignación ID: {asignacion.id}")
-                print(f"   Nuevo estado: {asignacion.estado}")
-                print(f"   Acción: {accion}")
-                
-                # ⭐ VERIFICAR EN BASE DE DATOS
-                asignacion.refresh_from_db()
-                print(f"🔄 VERIFICACIÓN DB - Estado en DB: {asignacion.estado}")
+                # Actualizar progreso de la evaluación
+                if asignacion.evaluacion_empresa:
+                    asignacion.evaluacion_empresa.actualizar_progreso()
+                    print(f"📊 Progreso de evaluación actualizado")
                 
                 return self.success_response(
                     data=AsignacionSerializer(asignacion).data,
@@ -564,6 +611,8 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
         
         except Exception as e:
             print(f"❌ ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return self.error_response(
                 message='Error al procesar la revisión',
                 errors=str(e),

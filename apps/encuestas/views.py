@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.http import HttpResponse
 from django.db import transaction
-
+from django.utils import timezone
 from apps.asignaciones.models import Asignacion
 
 from .models import (
@@ -379,9 +379,12 @@ class DimensionViewSet(ResponseMixin, viewsets.ModelViewSet):
         queryset = Dimension.objects.select_related('encuesta').prefetch_related('preguntas').all()
         
         # Filtrar por encuesta si se proporciona
-        encuesta_id = self.request.query_params.get('encuesta_id')
+        encuesta_id = self.request.query_params.get('encuesta')
         if encuesta_id:
-            queryset = queryset.filter(encuesta_id=encuesta_id)
+            queryset = queryset.filter(encuesta_id=encuesta_id, activo=True)
+        
+        # Ordenar
+        queryset = queryset.order_by('orden')
         
         if user.rol == 'superadmin':
             return queryset
@@ -390,12 +393,30 @@ class DimensionViewSet(ResponseMixin, viewsets.ModelViewSet):
             if not user.empresa:
                 return queryset.none()
             
+            # ⭐ CAMBIO: Incluir encuestas de EvaluacionEmpresa asignadas al admin
             try:
                 from apps.asignaciones.models import Asignacion
-                encuestas_ids = Asignacion.objects.filter(
+                from apps.encuestas.models import EvaluacionEmpresa
+                
+                # Encuestas desde asignaciones
+                encuestas_asignaciones = Asignacion.objects.filter(
                     empresa=user.empresa
                 ).values_list('encuesta_id', flat=True).distinct()
-                return queryset.filter(encuesta_id__in=encuestas_ids)
+                
+                # ⭐ NUEVO: Encuestas desde evaluaciones asignadas al admin
+                encuestas_evaluaciones = EvaluacionEmpresa.objects.filter(
+                    administrador=user,
+                    activo=True
+                ).values_list('encuesta_id', flat=True).distinct()
+                
+                # Combinar ambas
+                encuestas_ids = set(encuestas_asignaciones) | set(encuestas_evaluaciones)
+                
+                if encuestas_ids:
+                    return queryset.filter(encuesta_id__in=encuestas_ids)
+                else:
+                    return queryset.filter(encuesta__activo=True)
+                    
             except ImportError:
                 return queryset.filter(encuesta__activo=True)
         
@@ -702,17 +723,25 @@ class NivelReferenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
 # =============================================================================
 
 class ConfigNivelDeseadoViewSet(ResponseMixin, viewsets.ModelViewSet):
-    """ViewSet para configuración de niveles deseados - Ya implementado"""
-    queryset = ConfigNivelDeseado.objects.select_related('dimension', 'empresa', 'configurado_por').all()
+    """ViewSet para configuración de niveles deseados por evaluación"""
+    queryset = ConfigNivelDeseado.objects.select_related(
+        'dimension', 'empresa', 'evaluacion_empresa', 'configurado_por'
+    ).all()
     serializer_class = ConfigNivelDeseadoSerializer
     permission_classes = [IsAuthenticated]
     
     def get_queryset(self):
         user = self.request.user
-        queryset = ConfigNivelDeseado.objects.select_related('dimension', 'empresa', 'configurado_por').all()
+        queryset = ConfigNivelDeseado.objects.select_related(
+            'dimension', 'empresa', 'evaluacion_empresa', 'configurado_por'
+        ).all()
         
         if user.rol == 'superadmin':
             return queryset
+        
+        # ⭐ CAMBIO: Filtrar por evaluaciones donde el usuario es administrador
+        if user.rol == 'administrador':
+            return queryset.filter(evaluacion_empresa__administrador=user)
         
         if user.empresa:
             return queryset.filter(empresa=user.empresa)
@@ -724,35 +753,444 @@ class ConfigNivelDeseadoViewSet(ResponseMixin, viewsets.ModelViewSet):
             return [IsAuthenticated(), EsAdminOSuperAdmin()]
         return [IsAuthenticated(), EsAuditor()]
     
+    # ⭐ NUEVO: Endpoint actualizado para trabajar con evaluacion_empresa
     @action(detail=False, methods=['get'])
-    def por_dimension(self, request):
-        """Obtener configuración por dimensión y empresa"""
-        dimension_id = request.query_params.get('dimension_id')
-        empresa_id = request.query_params.get('empresa_id')
+    def por_evaluacion(self, request):  # ⭐ VERIFICAR QUE EXISTA
+        """
+        Obtener configuraciones de niveles por evaluación
+        GET /api/encuestas/niveles-deseados/por_evaluacion/?evaluacion_empresa_id=xxx
+        """
+        evaluacion_empresa_id = request.query_params.get('evaluacion_empresa_id')
         
-        if not dimension_id or not empresa_id:
+        if not evaluacion_empresa_id:
             return self.error_response(
-                message='Parámetros dimension_id y empresa_id son requeridos',
+                message='Parámetro evaluacion_empresa_id es requerido',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
         user = request.user
-        if user.rol != 'superadmin':
-            if not user.empresa or str(user.empresa.id) != empresa_id:
-                return self.error_response(
-                    message='No tienes permiso para consultar esta empresa',
-                    status_code=status.HTTP_403_FORBIDDEN
-                )
         
+        # Validar acceso
+        try:
+            from .models import EvaluacionEmpresa
+            evaluacion = EvaluacionEmpresa.objects.get(id=evaluacion_empresa_id)
+            
+            if user.rol != 'superadmin':
+                if user.rol == 'administrador' and evaluacion.administrador != user:
+                    return self.error_response(
+                        message='No tienes permiso para consultar esta evaluación',
+                        status_code=status.HTTP_403_FORBIDDEN
+                    )
+        
+        except EvaluacionEmpresa.DoesNotExist:
+            return self.error_response(
+                message='Evaluación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Obtener configuraciones
+        configs = ConfigNivelDeseado.objects.filter(
+            evaluacion_empresa_id=evaluacion_empresa_id,
+            activo=True
+        ).select_related('dimension')
+        
+        serializer = self.get_serializer(configs, many=True)
+        
+        return Response({
+            'evaluacion_empresa_id': evaluacion_empresa_id,
+            'total_configuraciones': configs.count(),
+            'configuraciones': serializer.data
+        })
+    # ⭐ ACTUALIZAR: Endpoint por dimensión
+    @action(detail=False, methods=['get'])
+    def por_dimension(self, request):
+        """
+        Obtener configuración por dimensión y evaluación
+        GET /api/niveles-deseados/por_dimension/?evaluacion_empresa_id=xxx&dimension_id=yyy
+        """
+        evaluacion_empresa_id = request.query_params.get('evaluacion_empresa_id')
+        dimension_id = request.query_params.get('dimension_id')
+        
+        # ⭐ CAMBIO: Ahora requiere evaluacion_empresa_id
+        if not evaluacion_empresa_id or not dimension_id:
+            return self.error_response(
+                message='Parámetros evaluacion_empresa_id y dimension_id son requeridos',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        user = request.user
+        
+        # Validar acceso
+        try:
+            from .models import EvaluacionEmpresa
+            evaluacion = EvaluacionEmpresa.objects.get(id=evaluacion_empresa_id)
+            
+            if user.rol != 'superadmin':
+                if user.rol == 'administrador' and evaluacion.administrador != user:
+                    return self.error_response(
+                        message='No tienes permiso para consultar esta evaluación',
+                        status_code=status.HTTP_403_FORBIDDEN
+                    )
+                elif user.empresa and evaluacion.empresa != user.empresa:
+                    return self.error_response(
+                        message='No tienes permiso para consultar esta evaluación',
+                        status_code=status.HTTP_403_FORBIDDEN
+                    )
+        
+        except EvaluacionEmpresa.DoesNotExist:
+            return self.error_response(
+                message='Evaluación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Buscar configuración
         try:
             config = ConfigNivelDeseado.objects.get(
+                evaluacion_empresa_id=evaluacion_empresa_id,
                 dimension_id=dimension_id,
-                empresa_id=empresa_id
+                activo=True
             )
             serializer = self.get_serializer(config)
             return Response(serializer.data)
+        
         except ConfigNivelDeseado.DoesNotExist:
             return Response({
-                'mensaje': 'No existe configuración para esta dimensión y empresa',
-                'nivel_deseado': None
+                'mensaje': 'No existe configuración para esta dimensión en esta evaluación',
+                'nivel_deseado': None,
+                'evaluacion_empresa_id': evaluacion_empresa_id,
+                'dimension_id': dimension_id
             }, status=status.HTTP_200_OK)
+    
+    # ⭐ NUEVO: Configurar múltiples dimensiones a la vez
+    @action(detail=False, methods=['post'])
+    def configurar_multiple(self, request):
+        """
+        Configurar niveles deseados para múltiples dimensiones
+        POST /api/niveles-deseados/configurar_multiple/
+        {
+            "evaluacion_empresa_id": "uuid",
+            "configuraciones": [
+                {"dimension_id": "uuid1", "nivel_deseado": 3, "motivo_cambio": "..."},
+                {"dimension_id": "uuid2", "nivel_deseado": 4, "motivo_cambio": "..."}
+            ]
+        }
+        """
+        evaluacion_empresa_id = request.data.get('evaluacion_empresa_id')
+        configuraciones = request.data.get('configuraciones', [])
+        
+        if not evaluacion_empresa_id:
+            return self.error_response(
+                message='evaluacion_empresa_id es requerido',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not configuraciones or not isinstance(configuraciones, list):
+            return self.error_response(
+                message='configuraciones debe ser una lista',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        user = request.user
+        
+        # Validar acceso
+        try:
+            from .models import EvaluacionEmpresa
+            evaluacion = EvaluacionEmpresa.objects.get(id=evaluacion_empresa_id)
+            
+            if user.rol != 'superadmin':
+                if user.rol == 'administrador' and evaluacion.administrador != user:
+                    return self.error_response(
+                        message='No tienes permiso para configurar esta evaluación',
+                        status_code=status.HTTP_403_FORBIDDEN
+                    )
+                elif user.empresa and evaluacion.empresa != user.empresa:
+                    return self.error_response(
+                        message='No tienes permiso para configurar esta evaluación',
+                        status_code=status.HTTP_403_FORBIDDEN
+                    )
+        
+        except EvaluacionEmpresa.DoesNotExist:
+            return self.error_response(
+                message='Evaluación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Crear/Actualizar configuraciones
+        from django.db import transaction
+        
+        resultados = []
+        errores = []
+        
+        with transaction.atomic():
+            for idx, config_data in enumerate(configuraciones):
+                dimension_id = config_data.get('dimension_id')
+                nivel_deseado = config_data.get('nivel_deseado')
+                motivo_cambio = config_data.get('motivo_cambio', '')
+                
+                if not dimension_id or not nivel_deseado:
+                    errores.append({
+                        'index': idx,
+                        'error': 'dimension_id y nivel_deseado son requeridos'
+                    })
+                    continue
+                
+                try:
+                    # Actualizar o crear
+                    config, created = ConfigNivelDeseado.objects.update_or_create(
+                        evaluacion_empresa_id=evaluacion_empresa_id,
+                        dimension_id=dimension_id,
+                        defaults={
+                            'empresa': evaluacion.empresa,
+                            'nivel_deseado': nivel_deseado,
+                            'configurado_por': user,
+                            'motivo_cambio': motivo_cambio,
+                            'activo': True
+                        }
+                    )
+                    
+                    resultados.append({
+                        'dimension_id': str(dimension_id),
+                        'nivel_deseado': nivel_deseado,
+                        'accion': 'creado' if created else 'actualizado'
+                    })
+                
+                except Exception as e:
+                    errores.append({
+                        'index': idx,
+                        'dimension_id': str(dimension_id),
+                        'error': str(e)
+                    })
+        
+        return Response({
+            'total_procesados': len(configuraciones),
+            'exitosos': len(resultados),
+            'errores': len(errores),
+            'resultados': resultados,
+            'errores_detalle': errores
+        }, status=status.HTTP_200_OK if not errores else status.HTTP_207_MULTI_STATUS)
+            
+
+# =============================================================================
+# VIEWSET PARA EVALUACIONES EMPRESA
+# =============================================================================
+
+class EvaluacionEmpresaViewSet(ResponseMixin, viewsets.ModelViewSet):
+    """
+    ViewSet para gestión de evaluaciones asignadas a empresas
+    
+    ENDPOINTS:
+    - GET    /api/evaluaciones-empresa/                    → Listar (SuperAdmin: todas, Admin: propias)
+    - POST   /api/evaluaciones-empresa/asignar/           → Asignar evaluación (SuperAdmin)
+    - GET    /api/evaluaciones-empresa/{id}/              → Detalle
+    - PATCH  /api/evaluaciones-empresa/{id}/              → Actualizar
+    - GET    /api/evaluaciones-empresa/mis_evaluaciones/  → Evaluaciones del admin
+    - GET    /api/evaluaciones-empresa/{id}/progreso/     → Progreso detallado
+    - POST   /api/evaluaciones-empresa/{id}/cancelar/     → Cancelar evaluación
+    - GET    /api/evaluaciones-empresa/estadisticas/      → Estadísticas
+    """
+    from .models import EvaluacionEmpresa
+    from .serializers import EvaluacionEmpresaSerializer, EvaluacionEmpresaListSerializer, AsignarEvaluacionSerializer
+    
+    queryset = EvaluacionEmpresa.objects.select_related(
+        'empresa', 'encuesta', 'administrador', 'asignado_por'
+    ).all()
+    permission_classes = [IsAuthenticated]
+    http_method_names = ['get', 'post', 'patch']
+    
+    def get_serializer_class(self):
+        if self.action == 'list' or self.action == 'mis_evaluaciones':
+            from .serializers import EvaluacionEmpresaListSerializer  # ⭐ IMPORTAR
+            return EvaluacionEmpresaListSerializer
+        if self.action == 'asignar':
+            from .serializers import AsignarEvaluacionSerializer
+            return AsignarEvaluacionSerializer
+        from .serializers import EvaluacionEmpresaSerializer
+        return EvaluacionEmpresaSerializer
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = self.EvaluacionEmpresa.objects.select_related(
+            'empresa', 'encuesta', 'administrador', 'asignado_por'
+        ).filter(activo=True)
+        
+        if user.rol == 'superadmin':
+            return queryset
+        
+        if user.rol == 'administrador' and user.empresa:
+            return queryset.filter(administrador=user)
+        
+        return queryset.none()
+    
+    def get_permissions(self):
+        if self.action in ['asignar', 'cancelar']:
+            return [IsAuthenticated(), EsSuperAdmin()]
+        return [IsAuthenticated()]
+    
+    @action(detail=False, methods=['post'])
+    def asignar(self, request):
+        """Asignar evaluación a empresa (SuperAdmin)"""
+        serializer = self.get_serializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            with transaction.atomic():
+                
+                # ⭐ USAR DIRECTAMENTE (ya están importados arriba)
+                from apps.empresas.models import Empresa
+                from apps.usuarios.models import Usuario
+                from .models import Encuesta, EvaluacionEmpresa
+                
+                encuesta = Encuesta.objects.get(id=serializer.validated_data['encuesta_id'])
+                empresa = Empresa.objects.get(id=serializer.validated_data['empresa_id'])
+                administrador = Usuario.objects.get(id=serializer.validated_data['administrador_id'])
+                
+                evaluacion = EvaluacionEmpresa.objects.create(
+                    encuesta=encuesta,
+                    empresa=empresa,
+                    administrador=administrador,
+                    asignado_por=request.user,
+                    fecha_limite=serializer.validated_data['fecha_limite'],
+                    observaciones=serializer.validated_data.get('observaciones', ''),
+                    estado='activa',
+                    total_dimensiones=encuesta.total_dimensiones
+                )
+                
+                from .serializers import EvaluacionEmpresaSerializer  # ⭐ IMPORTAR AQUÍ
+                
+                return self.success_response(
+                    data=EvaluacionEmpresaSerializer(evaluacion).data,
+                    message=f'Evaluación asignada exitosamente a {empresa.nombre}',
+                    status_code=status.HTTP_201_CREATED
+                )
+        
+        except Exception as e:
+            return self.error_response(
+                message='Error al asignar evaluación',
+                errors=str(e),
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=False, methods=['get'])
+    def mis_evaluaciones(self, request):
+        """Ver evaluaciones del administrador"""
+        estado = request.query_params.get('estado')
+        
+        queryset = self.get_queryset()
+        if estado:
+            queryset = queryset.filter(estado=estado)
+        
+        queryset = queryset.order_by('-fecha_asignacion')
+        serializer = self.get_serializer(queryset, many=True)
+        
+        return Response({
+            'count': queryset.count(),
+            'results': serializer.data
+        })
+    
+    @action(detail=True, methods=['get'])
+    def progreso(self, request, pk=None):
+        """Ver progreso detallado de evaluación"""
+        evaluacion = self.get_object()
+        
+        from apps.asignaciones.models import Asignacion
+        
+        asignaciones = Asignacion.objects.filter(
+            evaluacion_empresa=evaluacion,
+            activo=True
+        ).select_related('dimension', 'usuario_asignado')
+        
+        dimensiones_data = {}
+        for asignacion in asignaciones:
+            dim_id = str(asignacion.dimension.id)
+            if dim_id not in dimensiones_data:
+                dimensiones_data[dim_id] = {
+                    'dimension': {
+                        'id': dim_id,
+                        'codigo': asignacion.dimension.codigo,
+                        'nombre': asignacion.dimension.nombre
+                    },
+                    'asignaciones': [],
+                    'total_asignaciones': 0,
+                    'completadas': 0,
+                    'en_progreso': 0,
+                    'pendientes': 0
+                }
+            
+            dimensiones_data[dim_id]['asignaciones'].append({
+                'id': str(asignacion.id),
+                'usuario': asignacion.usuario_asignado.nombre_completo,
+                'estado': asignacion.estado,
+                'porcentaje_avance': float(asignacion.porcentaje_avance),
+                'fecha_limite': asignacion.fecha_limite.isoformat()
+            })
+            
+            dimensiones_data[dim_id]['total_asignaciones'] += 1
+            if asignacion.estado == 'completado':
+                dimensiones_data[dim_id]['completadas'] += 1
+            elif asignacion.estado == 'en_progreso':
+                dimensiones_data[dim_id]['en_progreso'] += 1
+            elif asignacion.estado == 'pendiente':
+                dimensiones_data[dim_id]['pendientes'] += 1
+        
+        return Response({
+            'evaluacion': {
+                'id': str(evaluacion.id),
+                'encuesta': evaluacion.encuesta.nombre,
+                'empresa': evaluacion.empresa.nombre,
+                'estado': evaluacion.estado,
+                'porcentaje_avance': float(evaluacion.porcentaje_avance),
+                'total_dimensiones': evaluacion.total_dimensiones,
+                'dimensiones_asignadas': evaluacion.dimensiones_asignadas,
+                'dimensiones_completadas': evaluacion.dimensiones_completadas
+            },
+            'dimensiones': list(dimensiones_data.values())
+        })
+    
+    @action(detail=True, methods=['post'])
+    def cancelar(self, request, pk=None):
+        """Cancelar evaluación"""
+        evaluacion = self.get_object()
+        motivo = request.data.get('motivo', '')
+        
+        evaluacion.estado = 'cancelada'
+        evaluacion.observaciones += f"\n[CANCELADA] {motivo}"
+        evaluacion.save()
+        
+        return self.success_response(
+            data=self.EvaluacionEmpresaSerializer(evaluacion).data,
+            message='Evaluación cancelada'
+        )
+    
+    @action(detail=False, methods=['get'])
+    def estadisticas(self, request):
+        """Estadísticas de evaluaciones"""
+        user = request.user
+        
+        if user.rol == 'superadmin':
+            queryset = self.EvaluacionEmpresa.objects.filter(activo=True)
+        elif user.rol == 'administrador':
+            queryset = self.EvaluacionEmpresa.objects.filter(
+                administrador=user,
+                activo=True
+            )
+        else:
+            queryset = self.EvaluacionEmpresa.objects.none()
+        
+        total = queryset.count()
+        activas = queryset.filter(estado='activa').count()
+        en_progreso = queryset.filter(estado='en_progreso').count()
+        completadas = queryset.filter(estado='completada').count()
+        vencidas = queryset.filter(estado='vencida').count()
+        canceladas = queryset.filter(estado='cancelada').count()
+        
+        return Response({
+            'total_evaluaciones': total,
+            'por_estado': {
+                'activas': activas,
+                'en_progreso': en_progreso,
+                'completadas': completadas,
+                'vencidas': vencidas,
+                'canceladas': canceladas
+            },
+            'porcentaje_completado': round((completadas / total * 100) if total > 0 else 0, 2)
+        })
