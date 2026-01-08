@@ -386,3 +386,48 @@ class NotificacionAsignacionService:
             },
             prioridad='alta'
         )
+        
+    @staticmethod
+    def notificar_asignacion_evaluacion_empresa(evaluacion, asignado_por):
+        """
+        Notifica al administrador cuando se le asigna una EvaluacionEmpresa
+        
+        Args:
+            evaluacion: Objeto EvaluacionEmpresa
+            asignado_por: Usuario que asignó (SuperAdmin)
+        """
+        usuario = evaluacion.administrador
+        encuesta = evaluacion.encuesta
+        empresa = evaluacion.empresa
+        
+        titulo = f"Nueva evaluación asignada: {encuesta.nombre}"
+        mensaje = (
+            f"Se te ha asignado la evaluación '{encuesta.nombre}' para la empresa {empresa.nombre} "
+            f"por {asignado_por.nombre_completo}. "
+            f"Fecha límite: {evaluacion.fecha_limite.strftime('%d/%m/%Y')}. "
+            f"Total de dimensiones: {evaluacion.total_dimensiones}."
+        )
+        
+        url_accion = f"/evaluaciones/{evaluacion.id}/detalle"
+        
+        datos_adicionales = {
+            'evaluacion_empresa_id': str(evaluacion.id),
+            'encuesta_id': str(encuesta.id),
+            'empresa_id': str(empresa.id),
+            'tipo_asignacion': 'evaluacion_empresa',
+            'total_dimensiones': evaluacion.total_dimensiones,
+            'fecha_limite': evaluacion.fecha_limite.isoformat()
+        }
+        
+        NotificacionService.crear_notificacion(
+            usuario=usuario,
+            tipo='asignacion_evaluacion',
+            titulo=titulo,
+            mensaje=mensaje,
+            prioridad='alta',
+            url_accion=url_accion,
+            datos_adicionales=datos_adicionales,
+            enviar_email=True
+        )
+        
+        logger.info(f"✅ Notificación de evaluación enviada a {usuario.email}")
