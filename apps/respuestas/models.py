@@ -101,7 +101,7 @@ class Respuesta(BaseModel):
         blank=True,
         default='',
         verbose_name='Justificación del Nivel de Madurez',
-        help_text='Explicación de por qué se considera ese nivel de madurez'
+        help_text='Explicación de por qué se considera ese nivel de madurez (OPCIONAL)'
     )
     
     comentarios_adicionales = models.TextField(
@@ -192,13 +192,6 @@ class Respuesta(BaseModel):
             if self.nivel_madurez != 0:
                 raise ValidationError({
                     'nivel_madurez': 'El nivel de madurez debe ser 0 para "No Cumple" o "No Aplica"'
-                })
-        
-        # ⭐ VALIDACIÓN 3: Si tiene nivel de madurez > 0, requiere justificación de madurez
-        if self.nivel_madurez > 0:
-            if not self.justificacion_madurez or len(self.justificacion_madurez.strip()) < 10:
-                raise ValidationError({
-                    'justificacion_madurez': 'Debes justificar por qué consideras ese nivel de madurez (mínimo 10 caracteres)'
                 })
         
         # ⭐ VALIDACIÓN 4: Para SI_CUMPLE o CUMPLE_PARCIAL, nivel de madurez debe ser > 0
