@@ -127,6 +127,31 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
             return RespuestaModificarAdminSerializer
         return RespuestaDetailSerializer
     
+    def create(self, request, *args, **kwargs):
+        """
+        Crear nueva respuesta
+        POST /api/respuestas/
+        
+        ⭐ SOBRESCRITO para devolver el objeto completo con todos los campos
+        """
+        # Validar datos de entrada
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Crear la respuesta
+        respuesta = serializer.save(
+            respondido_por=request.user  # ⭐ SOLO respondido_por, NO creado_por
+        )
+        
+        # ⭐ IMPORTANTE: Devolver el objeto COMPLETO con RespuestaDetailSerializer
+        output_serializer = RespuestaDetailSerializer(respuesta)
+        
+        return self.success_response(
+            data=output_serializer.data,
+            message='Respuesta creada exitosamente',
+            status_code=status.HTTP_201_CREATED
+        )
+    
     def perform_update(self, serializer):
         """Actualizar respuesta (solo en borrador)"""
         instance = self.get_object()
