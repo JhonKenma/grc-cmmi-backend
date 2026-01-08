@@ -1034,8 +1034,6 @@ class EvaluacionEmpresaViewSet(ResponseMixin, viewsets.ModelViewSet):
         
         try:
             with transaction.atomic():
-                
-                # ⭐ USAR DIRECTAMENTE (ya están importados arriba)
                 from apps.empresas.models import Empresa
                 from apps.usuarios.models import Usuario
                 from .models import Encuesta, EvaluacionEmpresa
@@ -1055,7 +1053,22 @@ class EvaluacionEmpresaViewSet(ResponseMixin, viewsets.ModelViewSet):
                     total_dimensiones=encuesta.total_dimensiones
                 )
                 
-                from .serializers import EvaluacionEmpresaSerializer  # ⭐ IMPORTAR AQUÍ
+                # ⭐ NOTIFICACIÓN
+                from apps.notificaciones.services import NotificacionAsignacionService
+                
+                try:
+                    NotificacionAsignacionService.notificar_asignacion_evaluacion_empresa(
+                        evaluacion=evaluacion,
+                        asignado_por=request.user
+                    )
+                    print(f"✅ Notificación enviada a {administrador.email}")
+                except Exception as e:
+                    print(f"⚠️ Error al enviar notificación: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # No fallar toda la operación si falla la notificación
+                
+                from .serializers import EvaluacionEmpresaSerializer
                 
                 return self.success_response(
                     data=EvaluacionEmpresaSerializer(evaluacion).data,
@@ -1064,6 +1077,8 @@ class EvaluacionEmpresaViewSet(ResponseMixin, viewsets.ModelViewSet):
                 )
         
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return self.error_response(
                 message='Error al asignar evaluación',
                 errors=str(e),
