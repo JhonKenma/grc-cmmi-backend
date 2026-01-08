@@ -56,4 +56,4 @@ celerybeat.pid
 
 # Logs
 logs/
-*.log
+*.logapps/respuestas/create.txt
