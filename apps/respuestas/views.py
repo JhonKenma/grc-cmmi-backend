@@ -184,15 +184,112 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
                 status_code=status.HTTP_403_FORBIDDEN
             )
         
-        serializer = self.get_serializer(respuesta, data={})
-        serializer.is_valid(raise_exception=True)
-        respuesta_actualizada = serializer.save()
+        try:
+            with transaction.atomic():
+                # Marcar respuesta como enviada
+                serializer = self.get_serializer(respuesta, data={})
+                serializer.is_valid(raise_exception=True)
+                respuesta_actualizada = serializer.save()
+                
+                # Obtener la asignación
+                asignacion = respuesta_actualizada.asignacion
+                
+                # Actualizar progreso de la asignación
+                asignacion.actualizar_progreso()
+                
+                mensaje = 'Respuesta enviada exitosamente'
+                gap_info = None
+                asignacion_completada = False
+                
+                # ⭐ VERIFICAR SI ES LA ÚLTIMA RESPUESTA (100% completado)
+                if asignacion.porcentaje_avance >= 100:
+                    print(f"🎯 Asignación {asignacion.id} alcanzó 100% de progreso")
+                    asignacion_completada = True
+                    
+                    if asignacion.requiere_revision:
+                        # ═══════════════════════════════════════════════
+                        # CASO 1: REQUIERE REVISIÓN → NO CALCULAR GAP
+                        # ═══════════════════════════════════════════════
+                        asignacion.estado = 'pendiente_revision'
+                        asignacion.fecha_envio_revision = timezone.now()
+                        asignacion.save()
+                        
+                        mensaje = 'Respuesta enviada. ¡Has completado todas las preguntas! Tu evaluación será revisada por el administrador.'
+                        
+                        print(f"⏸️  Asignación enviada a revisión")
+                        print(f"⏸️  GAP NO calculado (se calculará al aprobar)")
+                    
+                    else:
+                        # ═══════════════════════════════════════════════
+                        # CASO 2: NO REQUIERE REVISIÓN → CALCULAR GAP
+                        # ═══════════════════════════════════════════════
+                        asignacion.estado = 'completado'
+                        asignacion.fecha_completado = timezone.now()
+                        asignacion.save()
+                        
+                        print(f"✅ Asignación completada automáticamente")
+                        print(f"🔧 Calculando GAP...")
+                        
+                        try:
+                            # ⭐ CALCULAR GAP AUTOMÁTICAMENTE
+                            calculo_gap = CalculoNivelService.calcular_gap_asignacion(asignacion)
+                            
+                            print(f"✅ GAP calculado exitosamente:")
+                            print(f"   📊 Nivel Deseado: {calculo_gap.nivel_deseado}")
+                            print(f"   📊 Nivel Actual: {calculo_gap.nivel_actual:.2f}")
+                            print(f"   📊 GAP: {calculo_gap.gap:.2f}")
+                            print(f"   📊 Clasificación: {calculo_gap.get_clasificacion_gap_display()}")
+                            
+                            gap_info = {
+                                'nivel_deseado': float(calculo_gap.nivel_deseado),
+                                'nivel_actual': float(calculo_gap.nivel_actual),
+                                'gap': float(calculo_gap.gap),
+                                'clasificacion': calculo_gap.get_clasificacion_gap_display(),
+                                'clasificacion_gap': calculo_gap.clasificacion_gap,
+                                'porcentaje_cumplimiento': float(calculo_gap.porcentaje_cumplimiento),
+                            }
+                            
+                            mensaje = f'¡Felicidades! Has completado la evaluación. GAP calculado: {calculo_gap.gap:.1f} ({calculo_gap.get_clasificacion_gap_display()})'
+                        
+                        except Exception as e:
+                            print(f"⚠️  Error al calcular GAP: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            
+                            mensaje = '¡Felicidades! Has completado la evaluación (GAP se calculará después)'
+                    
+                    # Actualizar progreso de la evaluación
+                    if asignacion.evaluacion_empresa:
+                        asignacion.evaluacion_empresa.actualizar_progreso()
+                
+                else:
+                    # Aún falta responder preguntas
+                    preguntas_restantes = asignacion.total_preguntas - asignacion.preguntas_respondidas
+                    mensaje = f'Respuesta enviada. Te faltan {preguntas_restantes} preguntas ({asignacion.porcentaje_avance:.0f}% completado)'
+                
+                # Respuesta
+                from apps.asignaciones.serializers import AsignacionSerializer
+                
+                return self.success_response(
+                    data={
+                        'respuesta': RespuestaDetailSerializer(respuesta_actualizada).data,
+                        'asignacion': AsignacionSerializer(asignacion).data,
+                        'asignacion_completada': asignacion_completada,
+                        'gap_calculado': gap_info,
+                    },
+                    message=mensaje,
+                    status_code=status.HTTP_200_OK
+                )
         
-        return self.success_response(
-            data=RespuestaDetailSerializer(respuesta_actualizada).data,
-            message='Respuesta enviada exitosamente',
-            status_code=status.HTTP_200_OK
-        )
+        except Exception as e:
+            print(f"❌ Error al enviar respuesta: {e}")
+            import traceback
+            traceback.print_exc()
+            return self.error_response(
+                message='Error al enviar respuesta',
+                errors=str(e),
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
     @action(detail=True, methods=['post'])
     def modificar_admin(self, request, pk=None):
