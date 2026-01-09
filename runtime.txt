@@ -1,0 +1,2 @@
+# runtime.txt - EN LA RAÍZ DEL BACKEND
+python-3.11.0
