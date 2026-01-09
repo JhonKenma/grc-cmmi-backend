@@ -504,26 +504,14 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
         """
         Aprobar o rechazar una asignación que requiere revisión
         POST /api/asignaciones/{id}/revisar/
-        
-        Body:
-        {
-            "accion": "aprobar" | "rechazar",
-            "comentarios": "Observaciones del revisor"
-        }
-        
-        PERMISOS: SuperAdmin o Administrador de la empresa
         """
-        asignacion = self.get_object()
         
-        # ⭐ DEBUG
-        print(f"🔍 ANTES - Asignación ID: {asignacion.id}")
-        print(f"   Estado actual: {asignacion.estado}")
-        print(f"   Requiere revisión: {asignacion.requiere_revision}")
+        asignacion = self.get_object()
         
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        # Validar que la asignación requiera revisión
+        # Validaciones
         if not asignacion.requiere_revision:
             return self.error_response(
                 message='Esta asignación no requiere revisión',
@@ -548,37 +536,73 @@ class AsignacionViewSet(ResponseMixin, viewsets.ModelViewSet):
                 accion = serializer.validated_data['accion']
                 comentarios = serializer.validated_data.get('comentarios', '')
                 
-                asignacion.revisado_por = request.user
-                asignacion.fecha_revision = timezone.now()
-                asignacion.comentarios_revision = comentarios
-                
                 if accion == 'aprobar':
+                    # ═══════════════════════════════════════════════════
+                    # APROBAR: Completar y CALCULAR GAP
+                    # ═══════════════════════════════════════════════════
                     asignacion.estado = 'completado'
                     asignacion.fecha_completado = timezone.now()
-                    mensaje = f'Asignación aprobada exitosamente'
+                    asignacion.revisado_por = request.user
+                    asignacion.fecha_revision = timezone.now()
+                    asignacion.comentarios_revision = comentarios
+                    asignacion.save()
                     
-                    # 🔔 Notificar al usuario que fue aprobada
+                    mensaje = 'Asignación aprobada exitosamente'
+                    
+                    print(f"✅ Asignación {asignacion.id} aprobada por {request.user}")
+                    print(f"🔧 Calculando GAP...")
+                    
+                    try:
+                        # ⭐ CALCULAR GAP AL APROBAR
+                        calculo_gap = CalculoNivelService.calcular_gap_asignacion(asignacion)
+                        
+                        print(f"✅ GAP calculado exitosamente:")
+                        print(f"   📊 Nivel Deseado: {calculo_gap.nivel_deseado}")
+                        print(f"   📊 Nivel Actual: {calculo_gap.nivel_actual:.2f}")
+                        print(f"   📊 GAP: {calculo_gap.gap:.2f}")
+                        print(f"   📊 Clasificación: {calculo_gap.get_clasificacion_gap_display()}")
+                        
+                        mensaje += f'. GAP calculado: {calculo_gap.gap:.1f} ({calculo_gap.get_clasificacion_gap_display()})'
+                    
+                    except Exception as e:
+                        print(f"⚠️  Error al calcular GAP: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        
+                        mensaje += ' (Error al calcular GAP)'
+                    
+                    # Notificar al usuario
+                    from apps.notificaciones.services import NotificacionAsignacionService
                     NotificacionAsignacionService.notificar_revision_aprobada(asignacion)
                 
                 else:  # rechazar
+                    # ═══════════════════════════════════════════════════
+                    # RECHAZAR: Volver a estado inicial
+                    # ═══════════════════════════════════════════════════
                     asignacion.estado = 'rechazado'
-                    asignacion.preguntas_respondidas = 0  # Resetear para que vuelva a responder
+                    asignacion.preguntas_respondidas = 0
                     asignacion.porcentaje_avance = 0
-                    mensaje = f'Asignación rechazada. El usuario deberá completarla nuevamente.'
+                    asignacion.revisado_por = request.user
+                    asignacion.fecha_revision = timezone.now()
+                    asignacion.comentarios_revision = comentarios
+                    asignacion.save()
                     
-                    # 🔔 Notificar al usuario que fue rechazada
+                    mensaje = 'Asignación rechazada. El usuario deberá completarla nuevamente.'
+                    
+                    print(f"❌ Asignación {asignacion.id} rechazada por {request.user}")
+                    print(f"❌ GAP NO calculado (asignación rechazada)")
+                    
+                    # Desactivar GAP si existía (por si las moscas)
+                    CalculoNivel.objects.filter(asignacion=asignacion).update(activo=False)
+                    
+                    # Notificar al usuario
+                    from apps.notificaciones.services import NotificacionAsignacionService
                     NotificacionAsignacionService.notificar_revision_rechazada(asignacion)
                 
-                asignacion.save()
-                
-                # ⭐ DEBUG
-                print(f"✅ DESPUÉS - Asignación ID: {asignacion.id}")
-                print(f"   Nuevo estado: {asignacion.estado}")
-                print(f"   Acción: {accion}")
-                
-                # ⭐ VERIFICAR EN BASE DE DATOS
-                asignacion.refresh_from_db()
-                print(f"🔄 VERIFICACIÓN DB - Estado en DB: {asignacion.estado}")
+                # Actualizar progreso de la evaluación
+                if asignacion.evaluacion_empresa:
+                    asignacion.evaluacion_empresa.actualizar_progreso()
+                    print(f"📊 Progreso de evaluación actualizado")
                 
                 return self.success_response(
                     data=AsignacionSerializer(asignacion).data,
