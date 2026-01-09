@@ -1,5 +1,6 @@
-# build.sh - EN LA RAÍZ DEL BACKEND
 #!/usr/bin/env bash
+# build.sh - VERSIÓN FINAL
+
 set -o errexit
 
 echo "🔧 Instalando dependencias..."
@@ -11,4 +12,7 @@ python manage.py collectstatic --no-input
 echo "🗄️ Ejecutando migraciones..."
 python manage.py migrate
 
-echo "✅ Build completado"
+echo "👤 Creando superusuario (si no existe)..."
+python manage.py crear_superadmin --no-input
+
+echo "✅ Build completado exitosamente"
