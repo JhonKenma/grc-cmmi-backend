@@ -205,7 +205,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     # ⭐ Agregar tu frontend de Render después del deploy
-    # "https://tu-frontend.onrender.com",
+    "https://grc-cmmi-frontend.onrender.com",
 ]
 
 CORS_ALLOW_HEADERS = [
@@ -227,7 +227,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     # ⭐ Agregar tu frontend de Render después del deploy
-    # "https://tu-frontend.onrender.com",
+    "https://grc-cmmi-frontend.onrender.com",
 ]
 
 # ═══════════════════════════════════════════════════════
