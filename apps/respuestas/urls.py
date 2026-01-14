@@ -8,7 +8,7 @@ from .views import (
     EvidenciaViewSet,
     HistorialRespuestaViewSet,
     CalculoNivelViewSet,
-    IniciativaViewSet,
+    #IniciativaViewSet,
 )
 
 # Crear el router
@@ -20,7 +20,7 @@ router.register(r'respuestas', RespuestaViewSet, basename='respuesta')
 router.register(r'evidencias', EvidenciaViewSet, basename='evidencia')
 router.register(r'historial-respuestas', HistorialRespuestaViewSet, basename='historial-respuesta')
 router.register(r'calculos-nivel', CalculoNivelViewSet, basename='calculo-nivel')
-router.register(r'iniciativas', IniciativaViewSet, basename='iniciativa')
+#router.register(r'iniciativas', IniciativaViewSet, basename='iniciativa')
 
 # URLs
 urlpatterns = [
