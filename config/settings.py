@@ -5,6 +5,7 @@ from decouple import config
 from datetime import timedelta
 import os
 import dj_database_url  # ⭐ AGREGAR
+from supabase import create_client, Client
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -242,12 +243,22 @@ LOGGING = {
             'class': 'logging.StreamHandler',
         },
     },
-    'root': {
-        'handlers': ['console'],
-        'level': 'INFO' if not DEBUG else 'DEBUG',
+    'loggers': {
+        # Esto silencia los detalles excesivos de la conexión de red
+        'httpx': {
+            'handlers': ['console'],
+            'level': 'WARNING', # Solo muestra advertencias o errores
+        },
+        'httpcore': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+        },
+        'supabase': {
+            'handlers': ['console'],
+            'level': 'INFO', # O WARNING si quieres aún menos texto
+        },
     },
 }
-
 # ═══════════════════════════════════════════════════════
 # EMAIL CONFIGURATION
 # ═══════════════════════════════════════════════════════
@@ -285,6 +296,28 @@ EMAIL_TIMEOUT = 10
 # CELERY_TASK_TIME_LIMIT = 30 * 60
 # CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
+# ============================================
+# SUPABASE STORAGE CONFIGURATION
+# ============================================
+
+# 1. Definir credenciales
+SUPABASE_URL = config('SUPABASE_URL', default='')
+SUPABASE_KEY = config('SUPABASE_KEY', default='')
+SUPABASE_BUCKET = 'evidencias'
+
+# 2. Inicializar la variable nula primero
+supabase = None 
+
+# 3. Intentar asignarle el cliente
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase inyectado en settings correctamente")
+    except Exception as e:
+        print(f"❌ Error crítico en settings: {e}")
+        
+        
 # ═══════════════════════════════════════════════════════
 # CONFIGURACIÓN DE SEGURIDAD PARA PRODUCCIÓN
 # ═══════════════════════════════════════════════════════
