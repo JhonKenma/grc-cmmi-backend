@@ -1,5 +1,6 @@
 # apps/respuestas/serializers.py
 
+import os
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
@@ -10,7 +11,7 @@ from .models import (
     HistorialRespuesta,
     Evidencia,
     CalculoNivel,
-    Iniciativa
+    #Iniciativa
 )
 from apps.encuestas.models import Pregunta, Dimension
 from apps.asignaciones.models import Asignacion
@@ -46,14 +47,18 @@ class TipoDocumentoListSerializer(serializers.ModelSerializer):
 # ============================================
 
 class EvidenciaSerializer(serializers.ModelSerializer):
-    """Serializer completo para evidencias"""
+    """
+    Serializer completo para evidencias
+    Incluye URL firmada temporal de Supabase
+    """
     
     subido_por_nombre = serializers.CharField(
         source='subido_por.nombre_completo', 
         read_only=True
     )
-    url_archivo = serializers.SerializerMethodField()
+    url_archivo = serializers.SerializerMethodField()  # ⭐ URL firmada de Supabase
     tamanio_mb = serializers.SerializerMethodField()
+    extension = serializers.SerializerMethodField()
     tipo_documento_display = serializers.CharField(
         source='get_tipo_documento_enum_display',
         read_only=True
@@ -62,32 +67,55 @@ class EvidenciaSerializer(serializers.ModelSerializer):
     class Meta:
         model = Evidencia
         fields = [
-            'id', 'respuesta',
-            'codigo_documento',  # ⭐ NUEVO
-            'tipo_documento_enum', 'tipo_documento_display',
-            'titulo_documento', 'objetivo_documento', 
-            'fecha_ultima_actualizacion', 'nombre_archivo_original',
-            'archivo', 'tamanio_bytes', 'tamanio_mb', 'url_archivo',
-            'subido_por', 'subido_por_nombre',
-            'fecha_creacion', 'activo'
+            'id', 
+            'respuesta',
+            # Metadatos del documento
+            'codigo_documento',
+            'tipo_documento_enum', 
+            'tipo_documento_display',
+            'titulo_documento', 
+            'objetivo_documento', 
+            'fecha_ultima_actualizacion',
+            # Datos del archivo
+            'nombre_archivo_original',
+            'archivo',  # ⭐ Ruta en Supabase (CharField)
+            'url_archivo',  # ⭐ URL firmada temporal
+            'extension',
+            'tamanio_bytes', 
+            'tamanio_mb',
+            #'tipo_mime',  # ⭐ NUEVO
+            # Auditoría
+            'subido_por', 
+            'subido_por_nombre',
+            'fecha_creacion', 
+            'activo'
         ]
         read_only_fields = [
-            'id', 'nombre_archivo_original', 'tamanio_bytes', 
-            'url_archivo', 'tamanio_mb', 'fecha_creacion'
+            'id', 
+            'nombre_archivo_original', 
+            'tamanio_bytes',
+            #'tipo_mime',
+            'url_archivo', 
+            'tamanio_mb',
+            'extension',
+            'fecha_creacion',
+            'archivo'  # ⭐ No editable directamente
         ]
     
     def get_url_archivo(self, obj):
-        """Retorna URL del archivo"""
-        if obj.archivo:
-            request = self.context.get('request')
-            if request:
-                return request.build_absolute_uri(obj.archivo.url)
-            return obj.archivo.url
-        return None
+        """
+        ⭐ OBTENER URL FIRMADA TEMPORAL DE SUPABASE
+        Válida por 1 hora
+        """
+        return obj.url_archivo  # Usa la property del modelo
     
     def get_tamanio_mb(self, obj):
         """Retorna tamaño en MB"""
         return obj.tamanio_mb
+    
+    def get_extension(self, obj):
+        """Retorna extensión del archivo"""
+        return obj.extension_archivo
     
     def validate(self, attrs):
         """Validaciones"""
@@ -95,7 +123,7 @@ class EvidenciaSerializer(serializers.ModelSerializer):
         
         # Validar máximo 3 evidencias
         if respuesta and not self.instance:
-            if respuesta.evidencias.count() >= 3:
+            if respuesta.evidencias.filter(activo=True).count() >= 3:
                 raise serializers.ValidationError({
                     'respuesta': 'Solo se permiten máximo 3 archivos de evidencia por respuesta'
                 })
@@ -103,21 +131,34 @@ class EvidenciaSerializer(serializers.ModelSerializer):
         return attrs
 
 
-
-class EvidenciaCreateSerializer(serializers.ModelSerializer):
-    """Serializer para crear evidencias con archivo"""
+class EvidenciaCreateSerializer(serializers.Serializer):
+    """
+    ⭐ SERIALIZER PARA CREAR EVIDENCIAS
+    Maneja la subida de archivos a Supabase
+    """
     
-    class Meta:
-        model = Evidencia
-        fields = [
-            'respuesta',
-            'codigo_documento',  # ⭐ NUEVO
-            'tipo_documento_enum', 
-            'titulo_documento',
-            'objetivo_documento', 
-            'fecha_ultima_actualizacion', 
-            'archivo'
-        ]
+    # Campos requeridos
+    respuesta_id = serializers.UUIDField(required=True)
+    archivo = serializers.FileField(required=True)
+    
+    # Metadatos del documento
+    codigo_documento = serializers.CharField(
+        max_length=50,
+        required=True,
+        help_text='Código único del documento (ej: POL-SEG-001)'
+    )
+    tipo_documento_enum = serializers.ChoiceField(
+        choices=Evidencia.TIPOS_DOCUMENTO_CHOICES,
+        default='otro'
+    )
+    titulo_documento = serializers.CharField(
+        max_length=60,
+        default='Documento sin título'
+    )
+    objetivo_documento = serializers.CharField(
+        max_length=180,
+        default='Sin objetivo especificado'
+    )
     
     def validate_codigo_documento(self, value):
         """Validar código de documento"""
@@ -128,8 +169,10 @@ class EvidenciaCreateSerializer(serializers.ModelSerializer):
         return value.strip().upper()
     
     def validate_archivo(self, value):
-        """Validar archivo"""
-        import os
+        """
+        ⭐ VALIDAR ARCHIVO ANTES DE SUBIRLO
+        """
+        # Validar extensión
         ext = os.path.splitext(value.name)[1].lower()
         if ext not in Evidencia.EXTENSIONES_PERMITIDAS:
             raise serializers.ValidationError(
@@ -137,28 +180,41 @@ class EvidenciaCreateSerializer(serializers.ModelSerializer):
             )
         
         # Validar tamaño (10MB)
-        if value.size > 10 * 1024 * 1024:
-            raise serializers.ValidationError('El archivo no puede superar los 10MB')
+        MAX_SIZE = 10 * 1024 * 1024
+        if value.size > MAX_SIZE:
+            raise serializers.ValidationError(
+                f'El archivo no puede superar los 10MB. Tamaño actual: {round(value.size / (1024 * 1024), 2)}MB'
+            )
         
         return value
     
-    def create(self, validated_data):
-        """Crear evidencia con auditoría"""
-        request = self.context.get('request')
-        if request and request.user:
-            validated_data['subido_por'] = request.user
+    def validate(self, attrs):
+        """Validaciones adicionales"""
+        # Validar que titulo_documento no esté vacío
+        titulo = attrs.get('titulo_documento', '').strip()
+        if not titulo or titulo == 'Documento sin título':
+            raise serializers.ValidationError({
+                'titulo_documento': 'Debes proporcionar un título descriptivo para el documento'
+            })
         
-        return super().create(validated_data)
+        return attrs
 
 class VerificarCodigoDocumentoSerializer(serializers.Serializer):
-    """Serializer para verificar si un código de documento ya existe"""
-    
-    codigo_documento = serializers.CharField(required=True)
+    """
+    Serializer para verificar si un código de documento existe
+    """
+    codigo_documento = serializers.CharField(
+        max_length=50,
+        required=True,
+        help_text='Código del documento a verificar'
+    )
     
     def validate_codigo_documento(self, value):
+        """Limpiar y validar código"""
+        if not value or len(value.strip()) == 0:
+            raise serializers.ValidationError('El código de documento es obligatorio')
+        
         return value.strip().upper()
-
-
 # ============================================
 # SERIALIZERS DE HISTORIAL
 # ============================================
@@ -663,86 +719,3 @@ class CalculoNivelSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'calculado_at']
 
-
-# ============================================
-# SERIALIZERS DE INICIATIVAS
-# ============================================
-
-class IniciativaListSerializer(serializers.ModelSerializer):
-    """Serializer simplificado para listados"""
-    
-    dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True)
-    empresa_nombre = serializers.CharField(source='empresa.nombre', read_only=True)
-    responsable_nombre = serializers.CharField(
-        source='responsable.nombre_completo',
-        read_only=True
-    )
-    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
-    prioridad_display = serializers.CharField(source='get_prioridad_display', read_only=True)
-    dias_restantes = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = Iniciativa
-        fields = [
-            'id', 'titulo', 'dimension', 'dimension_nombre',
-            'empresa', 'empresa_nombre', 'responsable', 'responsable_nombre',
-            'estado', 'estado_display', 'prioridad', 'prioridad_display',
-            'fecha_inicio_estimada', 'fecha_termino_estimada',
-            'porcentaje_avance', 'dias_restantes'
-        ]
-    
-    def get_dias_restantes(self, obj):
-        return obj.dias_restantes
-
-
-class IniciativaDetailSerializer(serializers.ModelSerializer):
-    """Serializer detallado de iniciativas"""
-    
-    calculo_nivel = CalculoNivelSerializer(read_only=True)
-    dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True)
-    empresa_nombre = serializers.CharField(source='empresa.nombre', read_only=True)
-    responsable_nombre = serializers.CharField(
-        source='responsable.nombre_completo',
-        read_only=True
-    )
-    asignado_por_nombre = serializers.CharField(
-        source='asignado_por.nombre_completo',
-        read_only=True
-    )
-    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
-    prioridad_display = serializers.CharField(source='get_prioridad_display', read_only=True)
-    dias_restantes = serializers.SerializerMethodField()
-    requiere_alerta = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = Iniciativa
-        fields = '__all__'
-    
-    def get_dias_restantes(self, obj):
-        return obj.dias_restantes
-    
-    def get_requiere_alerta(self, obj):
-        return obj.requiere_alerta
-
-
-class IniciativaCreateSerializer(serializers.ModelSerializer):
-    """Serializer para crear iniciativas"""
-    
-    class Meta:
-        model = Iniciativa
-        fields = [
-            'calculo_nivel', 'dimension', 'empresa',
-            'titulo', 'descripcion', 'objetivo',
-            'prioridad', 'responsable',
-            'fecha_inicio_estimada', 'fecha_termino_estimada',
-            'presupuesto_estimado', 'moneda', 'dias_alerta_previo'
-        ]
-    
-    def create(self, validated_data):
-        """Crear iniciativa con auditoría"""
-        request = self.context.get('request')
-        
-        if request and request.user:
-            validated_data['asignado_por'] = request.user
-        
-        return super().create(validated_data)
