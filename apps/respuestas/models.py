@@ -1,7 +1,8 @@
-# apps/respuestas/models.py - CON CÓDIGO DE DOCUMENTO
+# apps/respuestas/models.py
 
 from django.db import models
 from apps.core.models import BaseModel
+from apps.core.services.storage_service import StorageService
 from apps.asignaciones.models import Asignacion
 from apps.encuestas.models import Pregunta, Dimension
 from django.core.exceptions import ValidationError
@@ -362,15 +363,14 @@ class HistorialRespuesta(models.Model):
     def __str__(self):
         return f"{self.tipo_cambio} por {self.usuario} - {self.timestamp}"
 
-
 def evidencia_upload_path(instance, filename):
     """
-    Genera ruta para guardar evidencias
+    Función legacy para migraciones antiguas
+    NO SE USA - Solo existe para compatibilidad con migraciones
     """
     ext = os.path.splitext(filename)[1]
     nuevo_nombre = f"{uuid.uuid4()}{ext}"
     return f"evidencias/{instance.respuesta.asignacion.empresa_id}/{instance.respuesta.asignacion_id}/{nuevo_nombre}"
-
 
 class Evidencia(BaseModel):
     """
@@ -440,10 +440,13 @@ class Evidencia(BaseModel):
         blank=True,
         default=''
     )
-    archivo = models.FileField(
-        upload_to=evidencia_upload_path,
-        verbose_name='Archivo'
+    # COFIGURACIÓN DEL CAMPO archivo PARA UPLOAD A SUPABASE
+    archivo = models.CharField(
+        max_length=500,
+        verbose_name='Ruta del Archivo en Supabase',
+        help_text='Ruta del archivo en Supabase Storage (ej: evidencias/empresa_123/archivo.pdf)'
     )
+        
     tamanio_bytes = models.BigIntegerField(
         default=0,
         verbose_name='Tamaño en Bytes'
@@ -474,7 +477,7 @@ class Evidencia(BaseModel):
     
     def __str__(self):
         return f"{self.codigo_documento} - {self.titulo_documento}"
-    
+
     def clean(self):
         """Validaciones"""
         # Máximo 3 evidencias por respuesta
@@ -483,48 +486,56 @@ class Evidencia(BaseModel):
                 raise ValidationError({
                     'respuesta': 'Solo se permiten máximo 3 archivos por respuesta'
                 })
-        
-        # Validar archivo
-        if self.archivo:
-            ext = os.path.splitext(self.nombre_archivo_original or self.archivo.name)[1].lower()
-            if ext not in self.EXTENSIONES_PERMITIDAS:
-                raise ValidationError({
-                    'archivo': f'Extensión no permitida. Válidas: {", ".join(self.EXTENSIONES_PERMITIDAS)}'
-                })
-            
-            if self.archivo.size > 10 * 1024 * 1024:
-                raise ValidationError({
-                    'archivo': 'El archivo no puede superar los 10MB'
-                })
     
     def save(self, *args, **kwargs):
-        if self.archivo:
-            if not self.nombre_archivo_original:
-                self.nombre_archivo_original = self.archivo.name
-            self.tamanio_bytes = self.archivo.size
-        
         self.full_clean()
         super().save(*args, **kwargs)
     
     @property
     def url_archivo(self):
+        """
+        ⭐ OBTENER URL FIRMADA TEMPORAL DEL ARCHIVO
+        """
         if self.archivo:
-            return self.archivo.url
+            from apps.core.services.storage_service import StorageService
+            storage = StorageService()
+            return storage.get_file_url(self.archivo, expires_in=3600)  # 1 hora
         return None
     
     @property
     def tamanio_mb(self):
+        """Tamaño en MB"""
         return round(self.tamanio_bytes / (1024 * 1024), 2)
+    
+    @property
+    def extension_archivo(self):
+        """Obtener extensión del archivo"""
+        if self.nombre_archivo_original:
+            return os.path.splitext(self.nombre_archivo_original)[1].lower()
+        return ''
+    
+    def delete(self, *args, **kwargs):
+        """
+        ⭐ ELIMINAR ARCHIVO DE SUPABASE ANTES DE ELIMINAR REGISTRO
+        """
+        if self.archivo:
+            from apps.core.services.storage_service import StorageService
+            storage = StorageService()
+            result = storage.delete_file(self.archivo)
+            if not result['success']:
+                print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase: {result.get('error')}")
+        
+        super().delete(*args, **kwargs)
     
     @classmethod
     def buscar_por_codigo(cls, codigo_documento, empresa):
         """
-        ⭐ MÉTODO DE BÚSQUEDA: Buscar evidencias existentes por código en la empresa
+        Buscar evidencias existentes por código en la empresa
         Retorna todas las evidencias con ese código para alertar al usuario
         """
         return cls.objects.filter(
-            codigo_documento__iexact=codigo_documento,  # Case-insensitive
-            respuesta__asignacion__empresa=empresa,  # ✅ En el queryset SÍ funciona
+            codigo_documento__iexact=codigo_documento,
+            respuesta__asignacion__empresa=empresa,
             activo=True
         ).select_related(
             'respuesta',
@@ -533,6 +544,18 @@ class Evidencia(BaseModel):
             'respuesta__asignacion',
             'subido_por'
         ).order_by('-fecha_creacion')
+        
+    @staticmethod
+    def validar_extension(filename):
+        """Validar que la extensión sea permitida"""
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in Evidencia.EXTENSIONES_PERMITIDAS
+    
+    @staticmethod
+    def validar_tamanio(file_size):
+        """Validar tamaño máximo (10MB)"""
+        MAX_SIZE = 10 * 1024 * 1024  # 10MB
+        return file_size <= MAX_SIZE
 
 class CalculoNivel(BaseModel):
     """
@@ -820,3 +843,5 @@ class Iniciativa(BaseModel):
         if dias_restantes is not None and dias_restantes <= self.dias_alerta_previo:
             return True
         return False
+    
+    
