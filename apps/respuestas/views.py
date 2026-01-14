@@ -4,20 +4,23 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.db.models import Q, Count
 from django.utils import timezone
+from apps.core.services.storage_service import StorageService
 from apps.respuestas.services import CalculoNivelService 
 
 from apps.asignaciones.models import Asignacion
 from apps.core.mixins import ResponseMixin
+
 from .models import (
     TipoDocumento,
     Respuesta,
     HistorialRespuesta,
     Evidencia,
     CalculoNivel,
-    Iniciativa
+    #Iniciativa
 )
 from .serializers import (
     TipoDocumentoSerializer,
@@ -32,9 +35,9 @@ from .serializers import (
     EvidenciaCreateSerializer,
     HistorialRespuestaSerializer,
     CalculoNivelSerializer,
-    IniciativaListSerializer,
-    IniciativaDetailSerializer,
-    IniciativaCreateSerializer,
+    #IniciativaListSerializer,
+    #IniciativaDetailSerializer,
+    #IniciativaCreateSerializer,
     VerificarCodigoDocumentoSerializer,
 )
 
@@ -376,16 +379,17 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
 
 class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
-    ViewSet para gestionar evidencias
+    ViewSet para gestionar evidencias con Supabase Storage
     
     Endpoints:
     - GET /api/evidencias/ - Listar evidencias
     - GET /api/evidencias/{id}/ - Detalle de evidencia
-    - POST /api/evidencias/ - Subir evidencia
+    - POST /api/evidencias/ - Subir evidencia a Supabase
     - DELETE /api/evidencias/{id}/ - Eliminar evidencia
-    - POST /api/evidencias/verificar_codigo/ - ⭐ Verificar código duplicado
+    - POST /api/evidencias/verificar_codigo/ - Verificar código duplicado
     """
     permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]  # ⭐ Para archivos
     
     def get_queryset(self):
         user = self.request.user
@@ -418,37 +422,167 @@ class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
             return VerificarCodigoDocumentoSerializer
         return EvidenciaSerializer
     
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return EvidenciaCreateSerializer
+        elif self.action == 'verificar_codigo':
+            return VerificarCodigoDocumentoSerializer
+        return EvidenciaSerializer
+    
+    # ⭐ MODIFICAR: Subir a Supabase
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        """
+        Subir evidencia a Supabase Storage
+        
+        POST /api/evidencias/
+        Body (multipart/form-data):
+        - respuesta_id: UUID
+        - archivo: File
+        - codigo_documento: String
+        - tipo_documento_enum: String (politica, norma, procedimiento, formato_interno, otro)
+        - titulo_documento: String
+        - objetivo_documento: String
+        """
+        # ===== 1. OBTENER Y VALIDAR DATOS =====
+        respuesta_id = request.data.get('respuesta_id')
+        archivo = request.FILES.get('archivo')
+        codigo_documento = request.data.get('codigo_documento', 'SIN-CODIGO')
+        tipo_documento_enum = request.data.get('tipo_documento_enum', 'otro')
+        titulo_documento = request.data.get('titulo_documento', 'Documento sin título')
+        objetivo_documento = request.data.get('objetivo_documento', 'Sin objetivo especificado')
+        
+        # Validar campos requeridos
+        if not respuesta_id:
+            return self.error_response(
+                message='respuesta_id es requerido',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not archivo:
+            return self.error_response(
+                message='archivo es requerido',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ===== 2. VALIDAR EXTENSIÓN =====
+        if not Evidencia.validar_extension(archivo.name):
+            return self.error_response(
+                message=f'Extensión no permitida. Válidas: {", ".join(Evidencia.EXTENSIONES_PERMITIDAS)}',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ===== 3. VALIDAR TAMAÑO (10MB) =====
+        if not Evidencia.validar_tamanio(archivo.size):
+            return self.error_response(
+                message='El archivo no puede superar los 10MB',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ===== 4. VALIDAR QUE LA RESPUESTA EXISTE =====
+        try:
+            respuesta = Respuesta.objects.select_related(
+                'asignacion__empresa',
+                'asignacion__usuario_asignado',
+                'pregunta__dimension'
+            ).get(id=respuesta_id)
+        except Respuesta.DoesNotExist:
+            return self.error_response(
+                message='Respuesta no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # ===== 5. VALIDAR PERMISOS =====
+        if respuesta.respondido_por != request.user:
+            return self.error_response(
+                message='No tienes permiso para subir evidencias a esta respuesta',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        # ===== 6. VALIDAR ESTADO (SOLO EN BORRADOR) =====
+        if respuesta.estado != 'borrador':
+            return self.error_response(
+                message='Solo se pueden agregar evidencias a respuestas en borrador',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ===== 7. VALIDAR MÁXIMO 3 EVIDENCIAS =====
+        if respuesta.evidencias.filter(activo=True).count() >= 3:
+            return self.error_response(
+                message='Solo se permiten máximo 3 archivos por respuesta',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ===== 8. SUBIR A SUPABASE STORAGE =====
+        storage = StorageService()
+        
+        # Organizar en carpetas jerárquicas
+        folder = (
+            f"evidencias/"
+            f"empresa_{respuesta.asignacion.empresa.id}/"
+            f"usuario_{respuesta.asignacion.usuario_asignado.id}/"
+            f"respuesta_{respuesta_id}"
+        )
+        
+        print(f"📤 Subiendo archivo a Supabase: {archivo.name}")
+        print(f"📁 Carpeta destino: {folder}")
+        
+        upload_result = storage.upload_file(
+            file=archivo,
+            folder=folder
+        )
+        
+        if not upload_result['success']:
+            return self.error_response(
+                message=f"Error al subir archivo a Supabase: {upload_result.get('error')}",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        print(f"✅ Archivo subido exitosamente a: {upload_result.get('path')}")
+
+        
+        # ===== 9. CREAR REGISTRO EN BASE DE DATOS =====
+        evidencia = Evidencia.objects.create(
+            respuesta=respuesta,
+            archivo=upload_result.get('path'),  # ⭐ Ruta en Supabase
+            nombre_archivo_original=archivo.name,
+            tamanio_bytes=archivo.size,
+            codigo_documento=codigo_documento,
+            tipo_documento_enum=tipo_documento_enum,
+            titulo_documento=titulo_documento,
+            objetivo_documento=objetivo_documento,
+            subido_por=request.user
+        )
+        
+        # ===== 10. REGISTRAR EN HISTORIAL =====
+        HistorialRespuesta.objects.create(
+            respuesta=respuesta,
+            tipo_cambio='agregado_evidencia',
+            usuario=request.user,
+            motivo=f'Evidencia agregada: {codigo_documento} - {titulo_documento}',
+            ip_address=self._get_client_ip(),
+            user_agent=self._get_user_agent()
+        )
+        
+        print(f"✅ Evidencia creada en BD: {evidencia.id}")
+        
+        # ===== 11. RETORNAR RESPUESTA =====
+        serializer = EvidenciaSerializer(evidencia)
+        return self.success_response(
+            data=serializer.data,
+            message='Evidencia subida exitosamente',
+            status_code=status.HTTP_201_CREATED
+        )
+    
     # ⭐ NUEVO: Endpoint para verificar código duplicado
     @action(detail=False, methods=['post'])
     def verificar_codigo(self, request):
         """
-        Verificar si un código de documento ya existe en la empresa
+        Verificar si un código de documento ya existe
         POST /api/evidencias/verificar_codigo/
-        
-        Body:
+        Body (JSON):
         {
             "codigo_documento": "POL-SEG-001"
-        }
-        
-        Response:
-        {
-            "existe": true,
-            "evidencias_encontradas": [
-                {
-                    "id": "uuid",
-                    "codigo_documento": "POL-SEG-001",
-                    "tipo_documento_display": "Política",
-                    "titulo_documento": "Política de Seguridad",
-                    "pregunta_codigo": "D1-P001",
-                    "pregunta_texto": "...",
-                    "dimension_nombre": "Gestión de Procesos",
-                    "subido_por": "Juan Pérez",
-                    "fecha_creacion": "2024-12-18",
-                    "puede_reutilizar": true
-                }
-            ],
-            "total_encontradas": 2,
-            "mensaje": "Se encontraron 2 documentos con este código"
         }
         """
         serializer = self.get_serializer(data=request.data)
@@ -497,41 +631,70 @@ class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
             'mensaje': f'Se {"encontró" if len(evidencias_data) == 1 else "encontraron"} {len(evidencias_data)} documento{"" if len(evidencias_data) == 1 else "s"} con este código'
         })
     
-    def perform_destroy(self, instance):
-        """Eliminar evidencia (solo en borrador)"""
+    # ⭐ MODIFICAR: Eliminar de Supabase también
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        """
+        Eliminar evidencia de Supabase y BD
+        DELETE /api/evidencias/{id}/
+        """
+        instance = self.get_object()
         respuesta = instance.respuesta
         
+        # ===== VALIDAR ESTADO =====
         if respuesta.estado != 'borrador':
             return self.error_response(
                 message='Solo se pueden eliminar evidencias de respuestas en borrador',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
-        if respuesta.respondido_por != self.request.user:
+        # ===== VALIDAR PERMISOS =====
+        if respuesta.respondido_por != request.user:
             return self.error_response(
                 message='Solo puedes eliminar evidencias de tus propias respuestas',
                 status_code=status.HTTP_403_FORBIDDEN
             )
         
-        # Crear registro de auditoría
+        # ===== ELIMINAR DE SUPABASE =====
+        if instance.archivo:
+            storage = StorageService()
+            print(f"🗑️ Eliminando archivo de Supabase: {instance.archivo}")
+            
+            delete_result = storage.delete_file(instance.archivo)
+            
+            if not delete_result['success']:
+                print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase: {delete_result.get('error')}")
+                # Continuar de todos modos para eliminar el registro
+        
+        # ===== REGISTRAR EN HISTORIAL =====
         HistorialRespuesta.objects.create(
             respuesta=respuesta,
             tipo_cambio='eliminado_evidencia',
-            usuario=self.request.user,
+            usuario=request.user,
             motivo=f'Evidencia eliminada: {instance.codigo_documento} - {instance.titulo_documento}',
             ip_address=self._get_client_ip(),
             user_agent=self._get_user_agent()
         )
         
+        # ===== ELIMINAR DE BD =====
         instance.delete()
+        print(f"✅ Evidencia eliminada: {instance.id}")
+        
+        return self.success_response(
+            message='Evidencia eliminada exitosamente',
+            status_code=status.HTTP_204_NO_CONTENT
+        )
     
+    # ===== MÉTODOS AUXILIARES =====
     def _get_client_ip(self):
+        """Obtener IP del cliente"""
         x_forwarded_for = self.request.META.get('HTTP_X_FORWARDED_FOR')
         if x_forwarded_for:
             return x_forwarded_for.split(',')[0]
         return self.request.META.get('REMOTE_ADDR')
     
     def _get_user_agent(self):
+        """Obtener User Agent del cliente"""
         return self.request.META.get('HTTP_USER_AGENT', '')[:255]
 
 
@@ -661,158 +824,3 @@ class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
 # ============================================
 # VIEWSET: INICIATIVAS
 # ============================================
-
-class IniciativaViewSet(ResponseMixin, viewsets.ModelViewSet):
-    """
-    ViewSet para gestionar iniciativas de remediación
-    
-    Endpoints:
-    - GET /api/iniciativas/ - Listar iniciativas
-    - GET /api/iniciativas/{id}/ - Detalle de iniciativa
-    - POST /api/iniciativas/ - Crear iniciativa
-    - PATCH /api/iniciativas/{id}/ - Actualizar iniciativa
-    - DELETE /api/iniciativas/{id}/ - Eliminar iniciativa
-    - GET /api/iniciativas/mis_iniciativas/ - Iniciativas asignadas a mí
-    - GET /api/iniciativas/por_vencer/ - Iniciativas próximas a vencer
-    - POST /api/iniciativas/{id}/actualizar_progreso/ - Actualizar progreso
-    """
-    permission_classes = [IsAuthenticated]
-    
-    def get_queryset(self):
-        user = self.request.user
-        queryset = Iniciativa.objects.select_related(
-            'calculo_nivel',
-            'dimension',
-            'empresa',
-            'responsable',
-            'asignado_por'
-        )
-        
-        # Permisos por rol
-        if user.rol == 'superadmin':
-            return queryset
-        elif user.rol == 'administrador':
-            return queryset.filter(empresa=user.empresa)
-        else:
-            return queryset.filter(responsable=user)
-        
-        # Filtros opcionales
-        estado = self.request.query_params.get('estado')
-        if estado:
-            queryset = queryset.filter(estado=estado)
-        
-        prioridad = self.request.query_params.get('prioridad')
-        if prioridad:
-            queryset = queryset.filter(prioridad=prioridad)
-        
-        return queryset.order_by('-prioridad', 'fecha_termino_estimada')
-    
-    def get_serializer_class(self):
-        if self.action == 'list':
-            return IniciativaListSerializer
-        elif self.action == 'create':
-            return IniciativaCreateSerializer
-        return IniciativaDetailSerializer
-    
-    @action(detail=False, methods=['get'])
-    def mis_iniciativas(self, request):
-        """
-        Obtener iniciativas asignadas al usuario actual
-        GET /api/iniciativas/mis_iniciativas/
-        """
-        iniciativas = Iniciativa.objects.filter(
-            responsable=request.user,
-            activo=True
-        ).select_related(
-            'dimension',
-            'empresa',
-            'asignado_por'
-        ).order_by('-prioridad', 'fecha_termino_estimada')
-        
-        serializer = IniciativaListSerializer(iniciativas, many=True)
-        
-        return Response({
-            'total': iniciativas.count(),
-            'iniciativas': serializer.data
-        })
-    
-    @action(detail=False, methods=['get'])
-    def por_vencer(self, request):
-        """
-        Obtener iniciativas próximas a vencer (dentro de 7 días)
-        GET /api/iniciativas/por_vencer/
-        """
-        from django.utils import timezone
-        from datetime import timedelta
-        
-        fecha_limite = timezone.now().date() + timedelta(days=7)
-        
-        iniciativas = self.get_queryset().filter(
-            estado__in=['planificada', 'en_progreso'],
-            fecha_termino_estimada__lte=fecha_limite,
-            fecha_termino_estimada__gte=timezone.now().date()
-        ).order_by('fecha_termino_estimada')
-        
-        serializer = IniciativaListSerializer(iniciativas, many=True)
-        
-        return Response({
-            'total': iniciativas.count(),
-            'iniciativas': serializer.data
-        })
-    
-    @action(detail=True, methods=['post'])
-    def actualizar_progreso(self, request, pk=None):
-        """
-        Actualizar progreso de una iniciativa
-        POST /api/iniciativas/{id}/actualizar_progreso/
-        
-        Body:
-        {
-            "porcentaje_avance": 50,
-            "estado": "en_progreso"  # opcional
-        }
-        """
-        iniciativa = self.get_object()
-        
-        # Validar que sea el responsable o administrador
-        if request.user != iniciativa.responsable and request.user.rol not in ['administrador', 'superadmin']:
-            return self.error_response(
-                message='Solo el responsable o un administrador puede actualizar el progreso',
-                status_code=status.HTTP_403_FORBIDDEN
-            )
-        
-        porcentaje = request.data.get('porcentaje_avance')
-        nuevo_estado = request.data.get('estado')
-        
-        if porcentaje is not None:
-            try:
-                porcentaje = float(porcentaje)
-                if porcentaje < 0 or porcentaje > 100:
-                    return self.error_response(
-                        message='El porcentaje debe estar entre 0 y 100',
-                        status_code=status.HTTP_400_BAD_REQUEST
-                    )
-                iniciativa.porcentaje_avance = porcentaje
-            except ValueError:
-                return self.error_response(
-                    message='Porcentaje inválido',
-                    status_code=status.HTTP_400_BAD_REQUEST
-                )
-        
-        if nuevo_estado and nuevo_estado in dict(Iniciativa.ESTADOS).keys():
-            iniciativa.estado = nuevo_estado
-            
-            # Si se completa, registrar fecha real
-            if nuevo_estado == 'completada':
-                from django.utils import timezone
-                iniciativa.fecha_termino_real = timezone.now().date()
-        
-        iniciativa.save()
-        
-        serializer = IniciativaDetailSerializer(iniciativa)
-        
-        return self.success_response(
-            data=serializer.data,
-            message='Progreso actualizado exitosamente',
-            status_code=status.HTTP_200_OK
-        )
