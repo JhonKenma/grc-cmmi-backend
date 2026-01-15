@@ -1,0 +1,158 @@
+# ============================================
+# VIEWSET: INICIATIVAS
+# ============================================
+
+class IniciativaViewSet(ResponseMixin, viewsets.ModelViewSet):
+    """
+    ViewSet para gestionar iniciativas de remediación
+    
+    Endpoints:
+    - GET /api/iniciativas/ - Listar iniciativas
+    - GET /api/iniciativas/{id}/ - Detalle de iniciativa
+    - POST /api/iniciativas/ - Crear iniciativa
+    - PATCH /api/iniciativas/{id}/ - Actualizar iniciativa
+    - DELETE /api/iniciativas/{id}/ - Eliminar iniciativa
+    - GET /api/iniciativas/mis_iniciativas/ - Iniciativas asignadas a mí
+    - GET /api/iniciativas/por_vencer/ - Iniciativas próximas a vencer
+    - POST /api/iniciativas/{id}/actualizar_progreso/ - Actualizar progreso
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Iniciativa.objects.select_related(
+            'calculo_nivel',
+            'dimension',
+            'empresa',
+            'responsable',
+            'asignado_por'
+        )
+        
+        # Permisos por rol
+        if user.rol == 'superadmin':
+            return queryset
+        elif user.rol == 'administrador':
+            return queryset.filter(empresa=user.empresa)
+        else:
+            return queryset.filter(responsable=user)
+        
+        # Filtros opcionales
+        estado = self.request.query_params.get('estado')
+        if estado:
+            queryset = queryset.filter(estado=estado)
+        
+        prioridad = self.request.query_params.get('prioridad')
+        if prioridad:
+            queryset = queryset.filter(prioridad=prioridad)
+        
+        return queryset.order_by('-prioridad', 'fecha_termino_estimada')
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return IniciativaListSerializer
+        elif self.action == 'create':
+            return IniciativaCreateSerializer
+        return IniciativaDetailSerializer
+    
+    @action(detail=False, methods=['get'])
+    def mis_iniciativas(self, request):
+        """
+        Obtener iniciativas asignadas al usuario actual
+        GET /api/iniciativas/mis_iniciativas/
+        """
+        iniciativas = Iniciativa.objects.filter(
+            responsable=request.user,
+            activo=True
+        ).select_related(
+            'dimension',
+            'empresa',
+            'asignado_por'
+        ).order_by('-prioridad', 'fecha_termino_estimada')
+        
+        serializer = IniciativaListSerializer(iniciativas, many=True)
+        
+        return Response({
+            'total': iniciativas.count(),
+            'iniciativas': serializer.data
+        })
+    
+    @action(detail=False, methods=['get'])
+    def por_vencer(self, request):
+        """
+        Obtener iniciativas próximas a vencer (dentro de 7 días)
+        GET /api/iniciativas/por_vencer/
+        """
+        from django.utils import timezone
+        from datetime import timedelta
+        
+        fecha_limite = timezone.now().date() + timedelta(days=7)
+        
+        iniciativas = self.get_queryset().filter(
+            estado__in=['planificada', 'en_progreso'],
+            fecha_termino_estimada__lte=fecha_limite,
+            fecha_termino_estimada__gte=timezone.now().date()
+        ).order_by('fecha_termino_estimada')
+        
+        serializer = IniciativaListSerializer(iniciativas, many=True)
+        
+        return Response({
+            'total': iniciativas.count(),
+            'iniciativas': serializer.data
+        })
+    
+    @action(detail=True, methods=['post'])
+    def actualizar_progreso(self, request, pk=None):
+        """
+        Actualizar progreso de una iniciativa
+        POST /api/iniciativas/{id}/actualizar_progreso/
+        
+        Body:
+        {
+            "porcentaje_avance": 50,
+            "estado": "en_progreso"  # opcional
+        }
+        """
+        iniciativa = self.get_object()
+        
+        # Validar que sea el responsable o administrador
+        if request.user != iniciativa.responsable and request.user.rol not in ['administrador', 'superadmin']:
+            return self.error_response(
+                message='Solo el responsable o un administrador puede actualizar el progreso',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        porcentaje = request.data.get('porcentaje_avance')
+        nuevo_estado = request.data.get('estado')
+        
+        if porcentaje is not None:
+            try:
+                porcentaje = float(porcentaje)
+                if porcentaje < 0 or porcentaje > 100:
+                    return self.error_response(
+                        message='El porcentaje debe estar entre 0 y 100',
+                        status_code=status.HTTP_400_BAD_REQUEST
+                    )
+                iniciativa.porcentaje_avance = porcentaje
+            except ValueError:
+                return self.error_response(
+                    message='Porcentaje inválido',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+        
+        if nuevo_estado and nuevo_estado in dict(Iniciativa.ESTADOS).keys():
+            iniciativa.estado = nuevo_estado
+            
+            # Si se completa, registrar fecha real
+            if nuevo_estado == 'completada':
+                from django.utils import timezone
+                iniciativa.fecha_termino_real = timezone.now().date()
+        
+        iniciativa.save()
+        
+        serializer = IniciativaDetailSerializer(iniciativa)
+        
+        return self.success_response(
+            data=serializer.data,
+            message='Progreso actualizado exitosamente',
+            status_code=status.HTTP_200_OK
+        )
