@@ -210,9 +210,6 @@ class ReporteViewSet(viewsets.ViewSet):
         """
         Genera reporte completo de GAP para una evaluación específica
         GET /api/reportes/gap_evaluacion/?evaluacion_empresa_id={uuid}
-        
-        Query params:
-        - evaluacion_empresa_id (required): UUID de la evaluación
         """
         from apps.encuestas.models import EvaluacionEmpresa
         
@@ -274,6 +271,34 @@ class ReporteViewSet(viewsets.ViewSet):
                 'distribucion_respuestas': self._calcular_distribucion_respuestas(calculos),
             }
             
+            # ========================================================
+            # 📤 LOG CRÍTICO - AGREGAR AQUÍ
+            # ========================================================
+            print("\n" + "="*60)
+            print("📤 VERIFICACIÓN FINAL ANTES DE ENVIAR AL FRONTEND:")
+            print("="*60)
+            
+            for dim in reporte['por_dimension']:
+                print(f"\n✅ {dim['dimension']['nombre']}:")
+                print(f"   total_proyectos: {dim.get('total_proyectos', '❌ MISSING')}")
+                print(f"   tiene_proyecto_activo: {dim.get('tiene_proyecto_activo', '❌ MISSING')}")
+                print(f"   proyecto_id: {dim.get('proyecto_id', '❌ MISSING')}")
+                print(f"   total_usuarios: {len(dim.get('usuarios', []))}")
+            
+            print("\n" + "="*60)
+            print("📤 ESTRUCTURA COMPLETA (primer dimension):")
+            import json
+            if reporte['por_dimension']:
+                primer_dim = reporte['por_dimension'][0]
+                print(json.dumps({
+                    'dimension': primer_dim['dimension'],
+                    'total_proyectos': primer_dim.get('total_proyectos', 'MISSING'),
+                    'total_usuarios': len(primer_dim.get('usuarios', [])),
+                    'keys': list(primer_dim.keys())
+                }, indent=2, default=str))
+            print("="*60 + "\n")
+            # ========================================================
+            
             return self.success_response(
                 data=reporte,
                 message='Reporte de evaluación generado exitosamente'
@@ -293,10 +318,47 @@ class ReporteViewSet(viewsets.ViewSet):
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @action(detail=False, methods=['get'], url_path='listar_por_dimension')
+    def listar_por_dimension(self, request):
+        """
+        Listar proyectos por dimensión
+        GET /api/proyectos-remediacion/listar_por_dimension/?dimension_id=xxx
+        """
+        dimension_id = request.query_params.get('dimension_id')
+        
+        if not dimension_id:
+            return Response(
+                {'error': 'dimension_id es requerido'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Obtener todos los calculos de esta dimensión
+        from apps.respuestas.models import CalculoNivel
+        calculos_ids = CalculoNivel.objects.filter(
+            dimension_id=dimension_id,
+            activo=True
+        ).values_list('id', flat=True)
+        
+        # Filtrar proyectos
+        queryset = self.get_queryset().filter(
+            calculo_nivel_id__in=calculos_ids
+        )
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response({
+            'success': True,
+            'data': {
+                'results': serializer.data,
+                'count': queryset.count()
+            }
+        })
+    
     def _agrupar_por_dimension_evaluacion(self, calculos, evaluacion):
-        """Agrupa cálculos por dimensión para una evaluación"""
+        """Agrupa cálculos por dimensión para una evaluación incluyendo usuarios individuales"""
         from apps.encuestas.models import ConfigNivelDeseado
         from django.db.models import Avg, Count
+        from apps.proyectos_remediacion.models import ProyectoCierreBrecha
+        from apps.respuestas.models import Respuesta
         
         dimensiones_ids = calculos.values_list('dimension_id', flat=True).distinct()
         dimensiones = evaluacion.encuesta.dimensiones.filter(id__in=dimensiones_ids, activo=True)
@@ -304,12 +366,42 @@ class ReporteViewSet(viewsets.ViewSet):
         resultado = []
         
         for dimension in dimensiones:
-            calculos_dim = calculos.filter(dimension=dimension)
+            calculos_dim = calculos.filter(dimension=dimension).select_related('usuario', 'asignacion')
             
             if not calculos_dim.exists():
                 continue
             
-            # Nivel deseado configurado
+            # --- ✅ CONTEO CORRECTO: Proyectos de TODOS los usuarios ---
+            # Obtener IDs de todos los cálculos de esta dimensión
+            calculos_ids = list(calculos_dim.values_list('id', flat=True))
+            
+            # Contar proyectos asociados a CUALQUIER cálculo de esta dimensión
+            total_proyectos = ProyectoCierreBrecha.objects.filter(
+                calculo_nivel_id__in=calculos_ids,  # ← TODOS los cálculos
+                activo=True
+            ).count()
+            
+            # Verificar si hay algún proyecto activo
+            proyecto_activo = ProyectoCierreBrecha.objects.filter(
+                calculo_nivel_id__in=calculos_ids,
+                estado__in=['planificado', 'en_ejecucion', 'en_validacion'],
+                activo=True
+            ).first()
+            
+            print(f"🔍 Dimensión {dimension.nombre}:")
+            print(f"  - Total cálculos: {len(calculos_ids)}")
+            print(f"  - Total proyectos: {total_proyectos}")
+            print(f"  - IDs cálculos: {calculos_ids}")
+            
+            # --- ESTADÍSTICAS AGREGADAS ---
+            stats = calculos_dim.aggregate(
+                nivel_actual_avg=Avg('nivel_actual'),
+                gap_avg=Avg('gap'),
+                cumplimiento_avg=Avg('porcentaje_cumplimiento'),
+                total_usuarios=Count('usuario', distinct=True),
+            )
+            
+            # --- NIVEL DESEADO ---
             try:
                 config = ConfigNivelDeseado.objects.get(
                     evaluacion_empresa=evaluacion,
@@ -320,34 +412,40 @@ class ReporteViewSet(viewsets.ViewSet):
             except ConfigNivelDeseado.DoesNotExist:
                 nivel_deseado = 3.0
             
-            stats = calculos_dim.aggregate(
-                nivel_actual_avg=Avg('nivel_actual'),
-                gap_avg=Avg('gap'),
-                cumplimiento_avg=Avg('porcentaje_cumplimiento'),
-                total_usuarios=Count('usuario', distinct=True),
-            )
+            # --- ✅ CONSTRUIR ARRAY DE USUARIOS ---
+            usuarios_data = []
             
-            # Detalle por usuario
-            usuarios_detalle = []
             for calculo in calculos_dim:
-                usuarios_detalle.append({
+                # Obtener respuestas del usuario
+                respuestas = Respuesta.objects.filter(
+                    asignacion=calculo.asignacion,
+                    pregunta__dimension=dimension,
+                    estado__in=['enviado', 'modificado_admin'],
+                    activo=True
+                ).select_related('pregunta')
+                
+                # Contar tipos de respuesta
+                respuestas_resumen = {
+                    'si_cumple': respuestas.filter(respuesta='SI_CUMPLE').count(),
+                    'cumple_parcial': respuestas.filter(respuesta='CUMPLE_PARCIAL').count(),
+                    'no_cumple': respuestas.filter(respuesta='NO_CUMPLE').count(),
+                    'no_aplica': respuestas.filter(respuesta='NO_APLICA').count(),
+                }
+                
+                usuarios_data.append({
                     'usuario_id': calculo.usuario.id,
-                    'usuario_nombre': calculo.usuario.nombre_completo,
+                    'usuario_nombre': calculo.usuario.nombre_completo or calculo.usuario.email,
                     'nivel_actual': float(calculo.nivel_actual),
                     'gap': float(calculo.gap),
                     'clasificacion_gap': calculo.clasificacion_gap,
                     'clasificacion_gap_display': calculo.get_clasificacion_gap_display(),
                     'porcentaje_cumplimiento': float(calculo.porcentaje_cumplimiento),
                     'total_preguntas': calculo.total_preguntas,
-                    'respuestas': {
-                        'si_cumple': calculo.respuestas_si_cumple,
-                        'cumple_parcial': calculo.respuestas_cumple_parcial,
-                        'no_cumple': calculo.respuestas_no_cumple,
-                        'no_aplica': calculo.respuestas_no_aplica,
-                    },
-                    'fecha_completado': calculo.asignacion.fecha_completado,
+                    'calculo_nivel_id': str(calculo.id),  # ← CRÍTICO
+                    'respuestas': respuestas_resumen,
                 })
             
+            # --- ✅ RESULTADO FINAL ---
             resultado.append({
                 'dimension': {
                     'id': str(dimension.id),
@@ -360,10 +458,14 @@ class ReporteViewSet(viewsets.ViewSet):
                 'gap_promedio': float(stats['gap_avg'] or 0),
                 'porcentaje_cumplimiento_promedio': float(stats['cumplimiento_avg'] or 0),
                 'total_usuarios_evaluados': stats['total_usuarios'],
-                'usuarios': usuarios_detalle,
+                'tiene_proyecto_activo': proyecto_activo is not None,
+                'proyecto_id': str(proyecto_activo.id) if proyecto_activo else None,
+                'total_proyectos': total_proyectos,  # ← Conteo correcto
+                'usuarios': usuarios_data,  # ← Array de usuarios
             })
         
         return sorted(resultado, key=lambda x: x['dimension']['orden'])
+
 
     def _agrupar_por_usuario_evaluacion(self, calculos):
         """Agrupa cálculos por usuario"""

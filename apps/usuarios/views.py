@@ -16,6 +16,7 @@ from .serializers import (
 )
 from apps.core.permissions import EsAdminOSuperAdmin, EsAuditor, EsSuperAdmin
 from apps.core.mixins import ResponseMixin
+from drf_spectacular.utils import extend_schema
 
 Usuario = get_user_model()
 
@@ -49,6 +50,7 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     """Vista personalizada para login con EMAIL"""
     serializer_class = CustomTokenObtainPairSerializer
 
+@extend_schema(tags=['1. Autenticación y Usuarios'])
 class UsuarioViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para CRUD de usuarios con control de acceso

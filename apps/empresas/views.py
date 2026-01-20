@@ -7,7 +7,9 @@ from .models import Empresa
 from .serializers import EmpresaSerializer, EmpresaListSerializer
 from apps.core.permissions import EsAdminOSuperAdmin, EsSuperAdmin
 from apps.core.mixins import ResponseMixin
+from drf_spectacular.utils import extend_schema
 
+@extend_schema(tags=['2. Gestión de Empresas'])
 class EmpresaViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para gestión de empresas

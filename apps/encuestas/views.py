@@ -30,12 +30,13 @@ from apps.core.permissions import (
     EsAdminOSuperAdminOAuditor
 )
 from apps.core.mixins import ResponseMixin
+from drf_spectacular.utils import extend_schema
 
 
 # =============================================================================
 # VIEWSET PARA ENCUESTAS
 # =============================================================================
-
+@extend_schema(tags=['3. Gestión de Evaluaciones(Encuestas-Excel)'])
 class EncuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para gestión de encuestas - SOLO LECTURA Y EDICIÓN
@@ -350,8 +351,7 @@ class EncuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
 # VIEWSET PARA DIMENSIONES
 # =============================================================================
 
-# apps/encuestas/views.py
-
+@extend_schema(tags=['3. Gestión de Evaluaciones(Encuestas-Excel)'])
 class DimensionViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para gestión de dimensiones - SOLO LECTURA Y EDICIÓN
@@ -523,7 +523,7 @@ class DimensionViewSet(ResponseMixin, viewsets.ModelViewSet):
 # =============================================================================
 # VIEWSET PARA PREGUNTAS
 # =============================================================================
-
+@extend_schema(tags=['3. Gestión de Evaluaciones(Encuestas-Excel)'])
 class PreguntaViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para gestión de preguntas - SOLO LECTURA Y EDICIÓN
@@ -624,7 +624,7 @@ class PreguntaViewSet(ResponseMixin, viewsets.ModelViewSet):
 # =============================================================================
 # VIEWSET PARA NIVELES DE REFERENCIA
 # =============================================================================
-
+@extend_schema(tags=['3. Gestión de Evaluaciones(Encuestas-Excel)'])
 class NivelReferenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para niveles de referencia - SOLO LECTURA Y EDICIÓN
