@@ -10,7 +10,7 @@ from apps.usuarios.serializers import UsuarioListSerializer
 from apps.encuestas.models import ConfigNivelDeseado
 from django.utils import timezone
 from datetime import date, timedelta
-
+from drf_spectacular.utils import extend_schema_field
 
 # =============================================================================
 # SERIALIZERS PRINCIPALES
@@ -84,7 +84,9 @@ class AsignacionSerializer(serializers.ModelSerializer):
             'fecha_creacion', 'fecha_actualizacion'
         ]
     
-        # ⭐ NUEVO MÉTODO
+    
+    # ⭐ Agregar decorador
+    @extend_schema_field(serializers.DictField(allow_null=True))
     def get_evaluacion_empresa_info(self, obj):
         """Información de la evaluación empresa"""
         if obj.evaluacion_empresa:
@@ -264,6 +266,7 @@ class AsignacionListSerializer(serializers.ModelSerializer):
             'fecha_creacion',
         ]
     
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_evaluacion_nombre(self, obj):
         """Retorna nombre de la encuesta de la evaluacion_empresa"""
         if obj.evaluacion_empresa:

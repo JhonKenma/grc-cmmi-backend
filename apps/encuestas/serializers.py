@@ -495,17 +495,6 @@ class EvaluacionEmpresaSerializer(serializers.ModelSerializer):
             }
         return None    
     
-    def get_administrador_info(self, obj):
-        """Información del administrador responsable"""
-        if obj.administrador:
-            return {
-                'id': obj.administrador.id,
-                'nombre_completo': obj.administrador.nombre_completo,
-                'email': obj.administrador.email,
-                'cargo': obj.administrador.cargo,
-            }
-        return None
-    
     def validate_fecha_limite(self, value):
         """Validar que la fecha límite sea futura"""
         from datetime import date

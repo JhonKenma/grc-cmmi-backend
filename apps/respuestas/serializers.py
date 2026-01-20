@@ -16,7 +16,7 @@ from .models import (
 from apps.encuestas.models import Pregunta, Dimension
 from apps.asignaciones.models import Asignacion
 from apps.usuarios.models import Usuario
-
+from drf_spectacular.utils import extend_schema_field
 
 # ============================================
 # SERIALIZERS DE TIPOS DE DOCUMENTO
@@ -695,6 +695,8 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
 
 class CalculoNivelSerializer(serializers.ModelSerializer):
     """Serializer para cálculos de nivel de madurez"""
+    asignacion_id = serializers.UUIDField(source='asignacion.id', read_only=True)
+    dimension_id = serializers.UUIDField(source='dimension.id', read_only=True)
     
     dimension_nombre = serializers.CharField(source='dimension.nombre', read_only=True)
     dimension_codigo = serializers.CharField(source='dimension.codigo', read_only=True)
@@ -706,12 +708,19 @@ class CalculoNivelSerializer(serializers.ModelSerializer):
     class Meta:
         model = CalculoNivel
         fields = [
-            'id', 'asignacion', 'dimension', 'dimension_nombre', 'dimension_codigo',
-            'nivel_actual', 'nivel_deseado', 'gap',
+            'id', 
+            'asignacion_id', 
+            'dimension_id', 
+            'dimension_nombre', 
+            'dimension_codigo',
+            'nivel_actual', 
+            'nivel_deseado', 
+            'gap',
             'total_preguntas', 
-            # ⭐ NUEVOS CAMPOS
-            'respuestas_si_cumple', 'respuestas_cumple_parcial', 
-            'respuestas_no_cumple', 'respuestas_no_aplica',
+            'respuestas_si_cumple', 
+            'respuestas_cumple_parcial', 
+            'respuestas_no_cumple', 
+            'respuestas_no_aplica',
             # ⚠️ CAMPOS LEGACY (mantener por compatibilidad o eliminar después)
             'respuestas_yes', 'respuestas_no', 'respuestas_na',
             'porcentaje_cumplimiento', 'clasificacion_gap', 'clasificacion_gap_display',
