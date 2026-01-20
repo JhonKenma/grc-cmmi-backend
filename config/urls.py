@@ -28,7 +28,7 @@ urlpatterns = [
     path('api/asignaciones/', include('apps.asignaciones.urls')),
     path('api/', include('apps.respuestas.urls')),
     path('api/', include('apps.reportes.urls')),
-    
+    path('api/', include('apps.proyectos_remediacion.urls')),
     path('api/dashboard/', include('apps.dashboard.urls')),
 
     # ==============================

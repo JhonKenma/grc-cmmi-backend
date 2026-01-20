@@ -54,6 +54,7 @@ INSTALLED_APPS = [
     'apps.dashboard',
     'apps.reportes',
     'apps.notificaciones',
+    'apps.proyectos_remediacion',
     'django_extensions',
 
     'drf_spectacular',
@@ -321,6 +322,23 @@ if SUPABASE_URL and SUPABASE_KEY:
 # ═══════════════════════════════════════════════════════
 # CONFIGURACIÓN DE SEGURIDAD PARA PRODUCCIÓN
 # ═══════════════════════════════════════════════════════
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Tu API GRC',
+    'DESCRIPTION': 'Documentación del sistema de gestión',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    # ESTO ES LO QUE BUSCAS:
+    'SCHEMA_PATH_PREFIX': r'/api/', # Limpia el prefijo común en la doc
+    'SORT_OPERATION_PARAMETERS': True,
+    'TAGS': [
+        {'name': '1. Autenticación y Usuarios', 'description': 'Endpoints de usuarios'},
+        {'name': '2. Gestión de Empresas', 'description': 'Gestión de empresas'},
+        {'name': '3. Gestión de Evaluaciones(Encuestas-Excel)', 'description': 'Gestión de Evaluaciones(Encuestas-Excel'},
+        
+        # ... define aquí el orden exacto que quieres
+    ],
+}
+
 
 if not DEBUG:
     # HTTPS
