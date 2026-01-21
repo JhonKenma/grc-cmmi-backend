@@ -10,7 +10,7 @@ class UsuarioNotificacionSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Usuario
-        fields = ['id', 'email', 'nombre', 'apellido', 'nombre_completo', 'rol']
+        fields = ['id', 'email', 'first_name', 'last_name', 'nombre_completo', 'rol']
         read_only_fields = fields
 
 
