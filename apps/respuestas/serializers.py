@@ -721,10 +721,14 @@ class CalculoNivelSerializer(serializers.ModelSerializer):
             'respuestas_cumple_parcial', 
             'respuestas_no_cumple', 
             'respuestas_no_aplica',
-            # ⚠️ CAMPOS LEGACY (mantener por compatibilidad o eliminar después)
-            'respuestas_yes', 'respuestas_no', 'respuestas_na',
-            'porcentaje_cumplimiento', 'clasificacion_gap', 'clasificacion_gap_display',
+            'respuestas_yes', 
+            'respuestas_no', 
+            'respuestas_na',
+            'porcentaje_cumplimiento', 
+            'clasificacion_gap', 
+            'clasificacion_gap_display',
             'calculado_at'
         ]
         read_only_fields = ['id', 'calculado_at']
+        depth = 0
 
