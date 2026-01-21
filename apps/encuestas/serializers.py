@@ -8,7 +8,7 @@ from .models import (
     NivelReferencia, ConfigNivelDeseado
 )
 from apps.empresas.serializers import EmpresaSerializer
-
+from drf_spectacular.utils import extend_schema_field
 
 # =============================================================================
 # SERIALIZERS PARA NIVELES DE REFERENCIA
@@ -432,6 +432,18 @@ class EvaluacionEmpresaSerializer(serializers.ModelSerializer):
     
     empresa_info = EmpresaSerializer(source='empresa', read_only=True)
     encuesta_info = EncuestaListSerializer(source='encuesta', read_only=True)
+    # ⭐ AGREGAR ANTES del método
+    @extend_schema_field(serializers.DictField(allow_null=True))
+    def get_administrador_info(self, obj):
+        if obj.administrador:
+            return {
+                'id': obj.administrador.id,
+                'nombre_completo': obj.administrador.nombre_completo,
+                'email': obj.administrador.email,
+                'cargo': obj.administrador.cargo,
+            }
+        return None
+    
     administrador_info = serializers.SerializerMethodField()
     asignado_por_nombre = serializers.CharField(
         source='asignado_por.nombre_completo',
@@ -484,16 +496,6 @@ class EvaluacionEmpresaSerializer(serializers.ModelSerializer):
             }
         return None
     
-    def get_administrador_info(self, obj):
-        """Información del administrador responsable"""
-        if obj.administrador:
-            return {
-                'id': obj.administrador.id,
-                'nombre_completo': obj.administrador.nombre_completo,
-                'email': obj.administrador.email,
-                'cargo': obj.administrador.cargo,
-            }
-        return None    
     
     def validate_fecha_limite(self, value):
         """Validar que la fecha límite sea futura"""

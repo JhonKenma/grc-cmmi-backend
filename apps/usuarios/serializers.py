@@ -3,10 +3,24 @@ from rest_framework import serializers
 from django.contrib.auth.password_validation import validate_password
 from .models import Usuario
 from apps.empresas.serializers import EmpresaSerializer
+from drf_spectacular.utils import extend_schema_field
 
 class UsuarioSerializer(serializers.ModelSerializer):
     """Serializer completo de usuario"""
-    empresa_info = serializers.SerializerMethodField()  # ⭐ CAMBIAR A SerializerMethodField
+    # ⭐ AGREGAR ANTES del método
+    @extend_schema_field(serializers.DictField(allow_null=True))
+    def get_empresa_info(self, obj):
+        if obj.empresa:
+            return {
+                'id': str(obj.empresa.id),
+                'nombre': obj.empresa.nombre,
+                'ruc': obj.empresa.ruc,
+                'razon_social': obj.empresa.razon_social,
+                'sector': obj.empresa.sector,
+            }
+        return None
+    
+    empresa_info = serializers.SerializerMethodField()
     password = serializers.CharField(
         write_only=True,
         required=False,
@@ -154,17 +168,6 @@ class UsuarioSerializer(serializers.ModelSerializer):
         return instance
     
     # ⭐ AGREGAR ESTE MÉTODO
-    def get_empresa_info(self, obj):
-        """Retorna información de la empresa con UUID como string"""
-        if obj.empresa:
-            return {
-                'id': str(obj.empresa.id),  # ⭐ CONVERTIR UUID A STRING
-                'nombre': obj.empresa.nombre,
-                'ruc': obj.empresa.ruc,
-                'razon_social': obj.empresa.razon_social,
-                'sector': obj.empresa.sector,
-            }
-        return None
 
 class UsuarioListSerializer(serializers.ModelSerializer):
     """Serializer simplificado para listados"""

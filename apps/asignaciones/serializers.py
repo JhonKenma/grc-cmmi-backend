@@ -19,7 +19,19 @@ from drf_spectacular.utils import extend_schema_field
 class AsignacionSerializer(serializers.ModelSerializer):
     """Serializer completo de asignaciones con información relacionada"""
     
-    # ⭐ NUEVO - Info de evaluación empresa
+    # ⭐ AGREGAR ANTES del método
+    @extend_schema_field(serializers.DictField(allow_null=True))
+    def get_evaluacion_empresa_info(self, obj):
+        if obj.evaluacion_empresa:
+            return {
+                'id': str(obj.evaluacion_empresa.id),
+                'encuesta_nombre': obj.evaluacion_empresa.encuesta.nombre,
+                'empresa_nombre': obj.evaluacion_empresa.empresa.nombre,
+                'estado': obj.evaluacion_empresa.estado,
+                'porcentaje_avance': float(obj.evaluacion_empresa.porcentaje_avance),
+            }
+        return None
+    
     evaluacion_empresa_info = serializers.SerializerMethodField()
     
     encuesta_info = EncuestaListSerializer(source='encuesta', read_only=True)
@@ -230,6 +242,13 @@ class AsignacionListSerializer(serializers.ModelSerializer):
     
     # ⭐ NUEVO: Info de evaluacion_empresa
     evaluacion_empresa_id = serializers.UUIDField(source='evaluacion_empresa.id', read_only=True, allow_null=True)
+    # ⭐ AGREGAR ANTES del método
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_evaluacion_nombre(self, obj):
+        if obj.evaluacion_empresa:
+            return obj.evaluacion_empresa.encuesta.nombre
+        return obj.encuesta.nombre if obj.encuesta else None
+    
     evaluacion_nombre = serializers.SerializerMethodField()
     
     # Info de dimensión
