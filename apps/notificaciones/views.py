@@ -39,18 +39,28 @@ class NotificacionViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
     
     def get_serializer_class(self):
         """Usa serializer detallado para retrieve (GET /id/)"""
+        # 🛡️ PROTECCIÓN: Si es anónimo, retornar el más básico para evitar circulares en documentación
+        if not self.request.user or self.request.user.is_anonymous:
+            return NotificacionListSerializer
+
         if self.action == 'retrieve':
-            return NotificacionDetalleSerializer  # ⭐ SERIALIZER COMPLETO
+            return NotificacionDetalleSerializer
         elif self.action == 'list':
             return NotificacionListSerializer
-        elif self.action == 'marcar_leida' or self.action == 'marcar_todas_leidas':
+        elif self.action in ['marcar_leida', 'marcar_todas_leidas']:
             return MarcarLeidaSerializer
         return NotificacionSerializer
     
     def get_queryset(self):
         """Usuario solo ve sus propias notificaciones"""
+        user = self.request.user
+        
+        # 🛡️ PROTECCIÓN: Vital para Render y Swagger
+        if not user or user.is_anonymous:
+            return Notificacion.objects.none()
+            
         return Notificacion.objects.filter(
-            usuario=self.request.user,
+            usuario=user,
             activo=True
         ).select_related('usuario').order_by('-fecha_creacion')
     
@@ -137,35 +147,29 @@ class NotificacionViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
     
     @action(detail=False, methods=['get'], url_path='no_leidas')
     def no_leidas(self, request):
-        """
-        Obtener notificaciones no leídas
-        GET /api/notificaciones/no_leidas/?limite=20
-        """
-        limite = int(request.query_params.get('limite', 50))
-        
-        notificaciones = NotificacionService.obtener_no_leidas(
-            usuario=request.user,
-            limite=limite
-        )
-        
-        serializer = NotificacionListSerializer(notificaciones, many=True)
-        
-        return Response({
-            'count': notificaciones.count(),
-            'results': serializer.data
-        })
+            # 🛡️ PROTECCIÓN adicional
+            if request.user.is_anonymous:
+                return Response({'count': 0, 'results': []})
+                
+            limite = int(request.query_params.get('limite', 50))
+            notificaciones = NotificacionService.obtener_no_leidas(
+                usuario=request.user,
+                limite=limite
+            )
+            serializer = NotificacionListSerializer(notificaciones, many=True)
+            return Response({
+                'count': notificaciones.count(),
+                'results': serializer.data
+            })
     
     @action(detail=False, methods=['get'], url_path='contador')
     def contador(self, request):
-        """
-        Contador de notificaciones no leídas
-        GET /api/notificaciones/contador/
-        """
-        count = NotificacionService.contar_no_leidas(usuario=request.user)
-        
-        return Response({
-            'no_leidas': count
-        })
+            # 🛡️ PROTECCIÓN adicional
+            if request.user.is_anonymous:
+                return Response({'no_leidas': 0})
+                
+            count = NotificacionService.contar_no_leidas(usuario=request.user)
+            return Response({'no_leidas': count})
     
     @action(detail=True, methods=['post'], url_path='marcar_leida')
     def marcar_leida(self, request, pk=None):

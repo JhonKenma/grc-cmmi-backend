@@ -61,55 +61,56 @@ class EncuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
     http_method_names = ['get', 'patch', 'post']  # Solo GET, PATCH y POST (no PUT, no DELETE, no CREATE via POST /)
     
     def get_serializer_class(self):
-        """
-        Retornar serializer según el rol del usuario y la acción
-        """
-        user = self.request.user
-        
-        # Para carga de Excel
-        if self.action == 'cargar_excel':
-            return CargaExcelSerializer
-        
-        # Para listado
-        if self.action == 'list':
-            return EncuestaListSerializer
-        
-        # ⭐ AGREGAR ESTE BLOQUE
-        # Para retrieve (detalle)
-        if self.action == 'retrieve':
-            # Administradores NO deben ver niveles ni recomendaciones
-            if user.rol == 'administrador':
-                return EncuestaAdminSerializer
-            # SuperAdmin y Auditores SÍ ven niveles completos
+            user = self.request.user
+            
+            # 🛡️ PROTECCIÓN: Si el usuario no está logueado o es anónimo
+            if not user or user.is_anonymous:
+                return EncuestaListSerializer
+
+            if self.action == 'cargar_excel':
+                return CargaExcelSerializer
+            
+            if self.action == 'list':
+                return EncuestaListSerializer
+            
+            if self.action == 'retrieve':
+                # 🛡️ PROTECCIÓN: Usar getattr para mayor seguridad
+                rol = getattr(user, 'rol', None)
+                if rol == 'administrador':
+                    return EncuestaAdminSerializer
+                return EncuestaSerializer
+            
             return EncuestaSerializer
-        
-        # Para otras acciones
-        return EncuestaSerializer
     
     def get_queryset(self):
-        user = self.request.user
-        queryset = Encuesta.objects.prefetch_related('dimensiones__preguntas__niveles_referencia').all()
-        
-        # SuperAdmin ve TODAS las encuestas
-        if user.rol == 'superadmin':
-            return queryset
-        
-        # Administrador y Auditor: Solo encuestas asignadas a su empresa
-        if user.rol in ['administrador', 'auditor']:
-            if not user.empresa:
+            user = self.request.user
+            queryset = Encuesta.objects.prefetch_related('dimensiones__preguntas__niveles_referencia').all()
+
+            # 🛡️ PROTECCIÓN: Si el usuario es anónimo, retornar vacío
+            if not user or user.is_anonymous:
                 return queryset.none()
             
-            try:
-                from apps.asignaciones.models import Asignacion
-                encuestas_ids = Asignacion.objects.filter(
-                    empresa=user.empresa
-                ).values_list('encuesta_id', flat=True).distinct()
-                return queryset.filter(id__in=encuestas_ids, activo=True)
-            except ImportError:
-                return queryset.filter(activo=True)
-        
-        # Usuario: SIN ACCESO
-        return queryset.none()
+            rol = getattr(user, 'rol', None)
+
+            # SuperAdmin ve TODAS las encuestas
+            if rol == 'superadmin':
+                return queryset
+            
+            # Administrador y Auditor: Solo encuestas asignadas a su empresa
+            if rol in ['administrador', 'auditor']:
+                if not getattr(user, 'empresa', None):
+                    return queryset.none()
+                
+                try:
+                    # El import aquí está bien para evitar circulares
+                    encuestas_ids = Asignacion.objects.filter(
+                        empresa=user.empresa
+                    ).values_list('encuesta_id', flat=True).distinct()
+                    return queryset.filter(id__in=encuestas_ids, activo=True)
+                except Exception:
+                    return queryset.filter(activo=True)
+            
+            return queryset.none()
     
     def get_permissions(self):
         # EDICIÓN: Solo SuperAdmin
@@ -376,6 +377,10 @@ class DimensionViewSet(ResponseMixin, viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
+        
+        # 🛡️ PROTECCIÓN
+        if not user or user.is_anonymous:
+            return Dimension.objects.none()
         queryset = Dimension.objects.select_related('encuesta').prefetch_related('preguntas').all()
         
         # Filtrar por encuesta si se proporciona
