@@ -2,16 +2,24 @@
 from rest_framework import serializers
 from .models import Notificacion, PlantillaNotificacion
 from apps.usuarios.models import Usuario
-
+from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.types import OpenApiTypes
 
 class UsuarioNotificacionSerializer(serializers.ModelSerializer):
     """Serializer simplificado de usuario para notificaciones"""
-    nombre_completo = serializers.CharField(read_only=True)
+    
+    # Usamos nombre_completo que ya tienes definido como @property en el modelo
+    nombre_completo = serializers.ReadOnlyField() 
     
     class Meta:
         model = Usuario
-        fields = ['id', 'email', 'first_name', 'last_name', 'nombre_completo', 'rol']
+        fields = ['id', 'email', 'nombre', 'apellido', 'nombre_completo', 'rol']
         read_only_fields = fields
+
+    # Esto quita el Warning amarillo de la consola
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_nombre_completo(self, obj):
+        return obj.nombre_completo
 
 
 class NotificacionDetalleSerializer(serializers.ModelSerializer):
@@ -118,21 +126,27 @@ class NotificacionDetalleSerializer(serializers.ModelSerializer):
         Obtiene información detallada de la asignación relacionada
         (si existe en datos_adicionales)
         """
-        if not obj.datos_adicionales:
+        # 1. Validación inicial de seguridad
+        if not obj or not obj.datos_adicionales:
             return None
         
+        # 2. Extraer el ID
         asignacion_id = obj.datos_adicionales.get('asignacion_id')
         if not asignacion_id:
             return None
         
         try:
             from apps.asignaciones.models import Asignacion
+            # 3. Consulta a la base de datos
             asignacion = Asignacion.objects.select_related(
                 'encuesta',
                 'dimension',
                 'usuario_asignado',
                 'asignado_por'
-            ).get(id=asignacion_id)
+            ).filter(id=asignacion_id).first() # .first() es más seguro que .get() para evitar errores si no existe
+            
+            if not asignacion:
+                return {'id': asignacion_id, 'error': 'Asignación no encontrada'}
             
             # Información básica de la asignación
             info = {

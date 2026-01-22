@@ -819,8 +819,3 @@ class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
         )
         
         return Response(resumen)
-
-
-# ============================================
-# VIEWSET: INICIATIVAS
-# ============================================
