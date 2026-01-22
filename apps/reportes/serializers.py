@@ -4,7 +4,7 @@ from rest_framework import serializers
 
 
 class ReporteGAPEmpresaSerializer(serializers.Serializer):
-    empresa_id = serializers.UUIDField(required=True)  # <-- CAMBIA ESTO
+    empresa_id = serializers.UUIDField(required=False)  # <-- CAMBIA ESTO
     dimension_id = serializers.UUIDField(required=False, allow_null=True)
 
 
