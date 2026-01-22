@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'apps.reportes',
     'apps.notificaciones',
     'apps.proyectos_remediacion',
+    'apps.proveedores',
     'django_extensions',
 
     'drf_spectacular',

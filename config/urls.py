@@ -22,6 +22,7 @@ urlpatterns = [
     # ==============================
     path('api/empresas/', include('apps.empresas.urls')),
     path('api/auth/', include('apps.usuarios.urls')),
+    path('api/', include('apps.proveedores.urls')),
     path('api/encuestas/', include('apps.encuestas.urls')),
     # ⭐ NO BORRAR
     path('api/', include('apps.notificaciones.urls')),  # ← Quitar "notificaciones/"
