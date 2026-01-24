@@ -3,48 +3,332 @@
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
-from datetime import date
+from datetime import date, timedelta
 
-from .models import ProyectoCierreBrecha
+from .models import ProyectoCierreBrecha, ItemProyecto
 from apps.respuestas.models import CalculoNivel
-from apps.empresas.models import Empresa
 from apps.usuarios.models import Usuario
-from apps.encuestas.models import Pregunta, Dimension
+from apps.encuestas.models import Pregunta
+from apps.proveedores.models import Proveedor
 from apps.empresas.serializers import EmpresaSerializer
 from apps.usuarios.serializers import UsuarioListSerializer
 
 
 # ═══════════════════════════════════════════════════════════════
-# SERIALIZERS DE LECTURA (Para mostrar datos completos)
+# SERIALIZERS PARA ITEMPROYECTO (NUEVO)
+# ═══════════════════════════════════════════════════════════════
+
+class ItemProyectoListSerializer(serializers.ModelSerializer):
+    """
+    Serializer para listado de ítems
+    """
+    responsable_nombre = serializers.CharField(source='responsable_ejecucion.nombre_completo', read_only=True)
+    proveedor_nombre = serializers.CharField(source='proveedor.razon_social', read_only=True, allow_null=True)
+    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
+    
+    # Propiedades calculadas
+    diferencia_presupuesto = serializers.ReadOnlyField()
+    puede_iniciar = serializers.ReadOnlyField()
+    dias_restantes = serializers.ReadOnlyField()
+    esta_vencido = serializers.ReadOnlyField()
+    
+    class Meta:
+        model = ItemProyecto
+        fields = [
+            'id',
+            'numero_item',
+            'nombre_item',
+            'descripcion',
+            'requiere_proveedor',
+            'proveedor',
+            'proveedor_nombre',
+            'nombre_responsable_proveedor',
+            'responsable_ejecucion',
+            'responsable_nombre',
+            'presupuesto_planificado',
+            'presupuesto_ejecutado',
+            'diferencia_presupuesto',
+            'fecha_inicio',
+            'duracion_dias',
+            'fecha_fin',
+            'tiene_dependencia',
+            'item_dependencia',
+            'estado',
+            'estado_display',
+            'porcentaje_avance',
+            'puede_iniciar',
+            'dias_restantes',
+            'esta_vencido',
+            'fecha_creacion',
+        ]
+
+
+class ItemProyectoDetailSerializer(serializers.ModelSerializer):
+    """
+    Serializer detallado de ítem con toda la información
+    """
+    responsable_info = UsuarioListSerializer(source='responsable_ejecucion', read_only=True)
+    proveedor_info = serializers.SerializerMethodField()
+    item_dependencia_info = serializers.SerializerMethodField()
+    items_que_dependen = serializers.SerializerMethodField()
+    
+    # Display fields
+    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
+    
+    # Propiedades calculadas
+    diferencia_presupuesto = serializers.ReadOnlyField()
+    puede_iniciar = serializers.ReadOnlyField()
+    dias_restantes = serializers.ReadOnlyField()
+    esta_vencido = serializers.ReadOnlyField()
+    
+    class Meta:
+        model = ItemProyecto
+        fields = '__all__'
+    
+    def get_proveedor_info(self, obj):
+        """Información del proveedor si existe"""
+        if obj.proveedor:
+            return {
+                'id': str(obj.proveedor.id),
+                'razon_social': obj.proveedor.razon_social,
+                'ruc': obj.proveedor.ruc,
+                'categoria': obj.proveedor.get_categoria_display() if hasattr(obj.proveedor, 'get_categoria_display') else None,
+                'email': obj.proveedor.email if hasattr(obj.proveedor, 'email') else obj.proveedor.contacto_email,
+            }
+        return None
+    
+    def get_item_dependencia_info(self, obj):
+        """Información del ítem del que depende"""
+        if obj.item_dependencia:
+            return {
+                'id': str(obj.item_dependencia.id),
+                'numero_item': obj.item_dependencia.numero_item,
+                'nombre_item': obj.item_dependencia.nombre_item,
+                'estado': obj.item_dependencia.estado,
+                'estado_display': obj.item_dependencia.get_estado_display(),
+                'porcentaje_avance': obj.item_dependencia.porcentaje_avance,
+            }
+        return None
+    
+    def get_items_que_dependen(self, obj):
+        """Ítems que dependen de este"""
+        dependientes = obj.items_dependientes.all()
+        return [
+            {
+                'id': str(item.id),
+                'numero_item': item.numero_item,
+                'nombre_item': item.nombre_item,
+                'estado': item.estado,
+            }
+            for item in dependientes
+        ]
+
+
+class ItemProyectoCreateUpdateSerializer(serializers.ModelSerializer):
+    """
+    Serializer para CREAR/ACTUALIZAR ítems de proyecto
+    """
+    
+    class Meta:
+        model = ItemProyecto
+        fields = [
+            'proyecto',
+            'numero_item',
+            'nombre_item',
+            'descripcion',
+            'requiere_proveedor',
+            'proveedor',
+            'nombre_responsable_proveedor',
+            'responsable_ejecucion',
+            'presupuesto_planificado',
+            'presupuesto_ejecutado',
+            'fecha_inicio',
+            'duracion_dias',
+            'tiene_dependencia',
+            'item_dependencia',
+            'estado',
+            'porcentaje_avance',
+        ]
+        read_only_fields = ['fecha_fin']  # Se calcula automáticamente
+
+        extra_kwargs = {
+            'requiere_proveedor': {'required': False},
+            'proveedor': {'required': False},
+            'tiene_dependencia': {'required': False},
+            'item_dependencia': {'required': False},
+        }
+        
+    def validate(self, attrs):
+        """Validaciones cruzadas"""
+        
+        # ═══ 1. VALIDAR PROYECTO EN MODO POR_ITEMS ═══
+        proyecto = attrs.get('proyecto') or (self.instance.proyecto if self.instance else None)
+        
+        if not proyecto:
+            raise serializers.ValidationError({
+                'proyecto': 'Debe especificar un proyecto'
+            })
+        
+        if proyecto.modo_presupuesto != 'por_items':
+            raise serializers.ValidationError({
+                'proyecto': 'El proyecto debe estar en modo "por_items" para agregar ítems'
+            })
+        
+        # ═══ 2. VALIDAR PROVEEDOR (solo si se está modificando) ═══
+        # Solo validar si se envía requiere_proveedor o proveedor en la actualización
+        if 'requiere_proveedor' in attrs or 'proveedor' in attrs:
+            requiere_proveedor = attrs.get('requiere_proveedor', getattr(self.instance, 'requiere_proveedor', False))
+            proveedor = attrs.get('proveedor', getattr(self.instance, 'proveedor', None) if self.instance else None)
+            
+            if requiere_proveedor and not proveedor:
+                raise serializers.ValidationError({
+                    'proveedor': 'Debe seleccionar un proveedor si requiere_proveedor=True'
+                })
+            
+            if not requiere_proveedor and proveedor:
+                raise serializers.ValidationError({
+                    'proveedor': 'No debe seleccionar proveedor si requiere_proveedor=False'
+                })
+            
+            # ⭐ VALIDAR EMPRESA (con soporte para proveedores globales)
+            if proveedor:
+                # Validar que esté activo
+                if not proveedor.activo:
+                    raise serializers.ValidationError({
+                        'proveedor': 'El proveedor seleccionado no está activo'
+                    })
+                
+                # Validar empresa (permitir proveedores globales)
+                if proveedor.empresa is not None and proveedor.empresa != proyecto.empresa:
+                    raise serializers.ValidationError({
+                        'proveedor': f'El proveedor debe pertenecer a {proyecto.empresa.nombre} o ser un proveedor global'
+                    })
+        
+        # ═══ 3. VALIDAR RESPONSABLE (solo si se está modificando) ═══
+        if 'responsable_ejecucion' in attrs:
+            responsable = attrs.get('responsable_ejecucion')
+            if responsable and responsable.empresa != proyecto.empresa:
+                raise serializers.ValidationError({
+                    'responsable_ejecucion': f'El responsable debe pertenecer a {proyecto.empresa.nombre}'
+                })
+        
+        # ═══ 4. VALIDAR FECHAS (solo si se modifican) ═══
+        fecha_inicio = attrs.get('fecha_inicio', getattr(self.instance, 'fecha_inicio', None) if self.instance else None)
+        duracion_dias = attrs.get('duracion_dias', getattr(self.instance, 'duracion_dias', None) if self.instance else None)
+        
+        if fecha_inicio and duracion_dias:
+            # Validar que esté dentro del rango del proyecto
+            fecha_fin_item = fecha_inicio + timedelta(days=duracion_dias)
+            
+            if fecha_inicio < proyecto.fecha_inicio:
+                raise serializers.ValidationError({
+                    'fecha_inicio': f'No puede ser anterior a la fecha de inicio del proyecto ({proyecto.fecha_inicio})'
+                })
+            
+            if fecha_fin_item > proyecto.fecha_fin_estimada:
+                raise serializers.ValidationError({
+                    'duracion_dias': f'El ítem terminaría después del proyecto ({proyecto.fecha_fin_estimada})'
+                })
+        
+        # ═══ 5. VALIDAR DEPENDENCIAS (solo si se modifican) ═══
+        if 'tiene_dependencia' in attrs or 'item_dependencia' in attrs:
+            tiene_dependencia = attrs.get('tiene_dependencia', getattr(self.instance, 'tiene_dependencia', False) if self.instance else False)
+            item_dependencia = attrs.get('item_dependencia', getattr(self.instance, 'item_dependencia', None) if self.instance else None)
+            
+            if tiene_dependencia and not item_dependencia:
+                raise serializers.ValidationError({
+                    'item_dependencia': 'Debe seleccionar el ítem del que depende'
+                })
+            
+            if not tiene_dependencia and item_dependencia:
+                raise serializers.ValidationError({
+                    'item_dependencia': 'No debe seleccionar dependencia si tiene_dependencia=False'
+                })
+            
+            # Validar que la dependencia sea del mismo proyecto
+            if item_dependencia and item_dependencia.proyecto != proyecto:
+                raise serializers.ValidationError({
+                    'item_dependencia': 'El ítem de dependencia debe ser del mismo proyecto'
+                })
+            
+            # Validar que no se cree dependencia circular
+            if item_dependencia and self.instance:
+                numero_actual = attrs.get('numero_item', self.instance.numero_item)
+                if item_dependencia.numero_item >= numero_actual:
+                    raise serializers.ValidationError({
+                        'item_dependencia': 'Solo puede depender de ítems anteriores (número menor)'
+                    })
+        
+        # ═══ 6. VALIDAR PRESUPUESTO (solo si se modifican) ═══
+        if 'presupuesto_planificado' in attrs:
+            presupuesto_planificado = attrs.get('presupuesto_planificado')
+            if presupuesto_planificado < 0:
+                raise serializers.ValidationError({
+                    'presupuesto_planificado': 'El presupuesto no puede ser negativo'
+                })
+        
+        if 'presupuesto_ejecutado' in attrs:
+            presupuesto_ejecutado = attrs.get('presupuesto_ejecutado')
+            if presupuesto_ejecutado < 0:
+                raise serializers.ValidationError({
+                    'presupuesto_ejecutado': 'El presupuesto ejecutado no puede ser negativo'
+                })
+        
+        # ═══ 7. VALIDAR ESTADO Y AVANCE ═══
+        estado = attrs.get('estado', getattr(self.instance, 'estado', 'pendiente') if self.instance else 'pendiente')
+        porcentaje_avance = attrs.get('porcentaje_avance', getattr(self.instance, 'porcentaje_avance', 0) if self.instance else 0)
+        
+        if estado == 'completado' and porcentaje_avance < 100:
+            raise serializers.ValidationError({
+                'porcentaje_avance': 'El avance debe ser 100% si el estado es "completado"'
+            })
+        
+        return attrs
+
+    def create(self, validated_data):
+        """Crear ítem"""
+        return ItemProyecto.objects.create(**validated_data)
+    
+    def update(self, instance, validated_data):
+        """Actualizar ítem"""
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
+
+
+# ═══════════════════════════════════════════════════════════════
+# SERIALIZERS PARA PROYECTO (ACTUALIZADOS)
 # ═══════════════════════════════════════════════════════════════
 
 class ProyectoCierreBrechaListSerializer(serializers.ModelSerializer):
     """
     Serializer simplificado para LISTADO de proyectos
-    Incluye solo campos esenciales para vistas de lista
     """
     
-    # Información de la empresa
     empresa_nombre = serializers.CharField(source='empresa.nombre', read_only=True)
-    
-    # Información del GAP
     dimension_nombre = serializers.CharField(source='calculo_nivel.dimension.nombre', read_only=True)
-    gap_original = serializers.DecimalField(source='calculo_nivel.gap', max_digits=3, decimal_places=1, read_only=True)
+    gap_original = serializers.ReadOnlyField()
     
-    # Responsables
     dueno_nombre = serializers.CharField(source='dueno_proyecto.nombre_completo', read_only=True)
     responsable_nombre = serializers.CharField(source='responsable_implementacion.nombre_completo', read_only=True)
     
-    # Estados display
+    # Display fields
     estado_display = serializers.CharField(source='get_estado_display', read_only=True)
     prioridad_display = serializers.CharField(source='get_prioridad_display', read_only=True)
     categoria_display = serializers.CharField(source='get_categoria_display', read_only=True)
+    modo_presupuesto_display = serializers.CharField(source='get_modo_presupuesto_display', read_only=True)
     
-    # Campos calculados
+    # Propiedades calculadas
     dias_restantes = serializers.ReadOnlyField()
     dias_transcurridos = serializers.ReadOnlyField()
     esta_vencido = serializers.ReadOnlyField()
+    presupuesto_total_planificado = serializers.ReadOnlyField()
+    presupuesto_total_ejecutado = serializers.ReadOnlyField()
     porcentaje_presupuesto_gastado = serializers.ReadOnlyField()
+    total_items = serializers.ReadOnlyField()
+    items_completados = serializers.ReadOnlyField()
+    porcentaje_avance_items = serializers.ReadOnlyField()
     
     class Meta:
         model = ProyectoCierreBrecha
@@ -62,6 +346,8 @@ class ProyectoCierreBrechaListSerializer(serializers.ModelSerializer):
             'prioridad_display',
             'categoria',
             'categoria_display',
+            'modo_presupuesto',
+            'modo_presupuesto_display',
             'dueno_nombre',
             'responsable_nombre',
             'fecha_inicio',
@@ -69,10 +355,13 @@ class ProyectoCierreBrechaListSerializer(serializers.ModelSerializer):
             'dias_restantes',
             'dias_transcurridos',
             'esta_vencido',
-            'presupuesto_asignado',
-            'presupuesto_gastado',
+            'presupuesto_total_planificado',
+            'presupuesto_total_ejecutado',
             'porcentaje_presupuesto_gastado',
             'moneda',
+            'total_items',
+            'items_completados',
+            'porcentaje_avance_items',
             'fecha_creacion',
         ]
 
@@ -80,52 +369,44 @@ class ProyectoCierreBrechaListSerializer(serializers.ModelSerializer):
 class ProyectoCierreBrechaDetailSerializer(serializers.ModelSerializer):
     """
     Serializer COMPLETO para DETALLE de un proyecto
-    Incluye TODOS los campos y relaciones
     """
     
-    # ═══ INFORMACIÓN DE RELACIONES ═══
+    # Relaciones
     empresa_info = EmpresaSerializer(source='empresa', read_only=True)
-    
-    # GAP original
     calculo_nivel_info = serializers.SerializerMethodField()
-    
-    # Responsables
     dueno_proyecto_info = UsuarioListSerializer(source='dueno_proyecto', read_only=True)
     responsable_implementacion_info = UsuarioListSerializer(source='responsable_implementacion', read_only=True)
-    equipo_implementacion_info = UsuarioListSerializer(source='equipo_implementacion', many=True, read_only=True)
     validador_interno_info = UsuarioListSerializer(source='validador_interno', read_only=True)
-    auditor_verificacion_info = UsuarioListSerializer(source='auditor_verificacion', read_only=True)
-    responsable_validacion_info = UsuarioListSerializer(source='responsable_validacion', read_only=True)
     creado_por_info = UsuarioListSerializer(source='creado_por', read_only=True)
     
     # Preguntas abordadas
     preguntas_abordadas_info = serializers.SerializerMethodField()
     
-    # Estados display
+    # Ítems del proyecto (si modo_presupuesto='por_items')
+    items = ItemProyectoListSerializer(many=True, read_only=True)
+    
+    # Display fields
     estado_display = serializers.CharField(source='get_estado_display', read_only=True)
     prioridad_display = serializers.CharField(source='get_prioridad_display', read_only=True)
     categoria_display = serializers.CharField(source='get_categoria_display', read_only=True)
-    normativa_display = serializers.CharField(source='get_normativa_display', read_only=True)
-    tipo_brecha_display = serializers.CharField(source='get_tipo_brecha_display', read_only=True)
-    estrategia_cierre_display = serializers.CharField(source='get_estrategia_cierre_display', read_only=True)
-    frecuencia_reporte_display = serializers.CharField(source='get_frecuencia_reporte_display', read_only=True)
-    canal_comunicacion_display = serializers.CharField(source='get_canal_comunicacion_display', read_only=True)
-    metodo_verificacion_display = serializers.CharField(source='get_metodo_verificacion_display', read_only=True)
-    resultado_final_display = serializers.CharField(source='get_resultado_final_display', read_only=True)
+    modo_presupuesto_display = serializers.CharField(source='get_modo_presupuesto_display', read_only=True)
     moneda_display = serializers.CharField(source='get_moneda_display', read_only=True)
+    resultado_final_display = serializers.CharField(source='get_resultado_final_display', read_only=True)
     
-    # Campos calculados
+    # Propiedades calculadas
     dias_restantes = serializers.ReadOnlyField()
     dias_transcurridos = serializers.ReadOnlyField()
     duracion_estimada_dias = serializers.ReadOnlyField()
-    porcentaje_tiempo_transcurrido = serializers.ReadOnlyField()
-    presupuesto_disponible = serializers.ReadOnlyField()
-    porcentaje_presupuesto_gastado = serializers.ReadOnlyField()
     esta_vencido = serializers.ReadOnlyField()
     gap_original = serializers.ReadOnlyField()
     dimension_nombre = serializers.ReadOnlyField()
-    nivel_deseado_original = serializers.ReadOnlyField()
-    nivel_actual_original = serializers.ReadOnlyField()
+    presupuesto_total_planificado = serializers.ReadOnlyField()
+    presupuesto_total_ejecutado = serializers.ReadOnlyField()
+    presupuesto_disponible = serializers.ReadOnlyField()
+    porcentaje_presupuesto_gastado = serializers.ReadOnlyField()
+    total_items = serializers.ReadOnlyField()
+    items_completados = serializers.ReadOnlyField()
+    porcentaje_avance_items = serializers.ReadOnlyField()
     
     class Meta:
         model = ProyectoCierreBrecha
@@ -157,41 +438,32 @@ class ProyectoCierreBrechaDetailSerializer(serializers.ModelSerializer):
                 'codigo': p.codigo,
                 'titulo': p.titulo,
                 'texto': p.texto,
-                'dimension': p.dimension.nombre,
             }
             for p in preguntas
         ]
 
 
-# ═══════════════════════════════════════════════════════════════
-# SERIALIZERS DE ESCRITURA (Para crear/actualizar proyectos)
-# ═══════════════════════════════════════════════════════════════
-
 class ProyectoCierreBrechaCreateSerializer(serializers.ModelSerializer):
     """
-    Serializer para CREAR un nuevo proyecto de remediación
+    Serializer para CREAR un nuevo proyecto
     
-    Validaciones:
-    - Solo Admin o SuperAdmin pueden crear
-    - El GAP debe existir y pertenecer a la empresa
-    - Fechas deben ser coherentes
-    - Responsables deben pertenecer a la empresa
-    - Presupuesto debe ser positivo
+    Soporta DOS modos:
+    1. GLOBAL: Solo presupuesto_global
+    2. POR_ITEMS: Se crean ítems después
     """
     
-    # ⭐ CAMPO ESPECIAL: Permitir seleccionar preguntas específicas (opcional)
     preguntas_abordadas_ids = serializers.ListField(
         child=serializers.UUIDField(),
         required=False,
         allow_empty=True,
         write_only=True,
-        help_text='IDs de preguntas específicas que aborda este proyecto (opcional)'
+        help_text='IDs de preguntas específicas'
     )
     
     class Meta:
         model = ProyectoCierreBrecha
         fields = [
-            # Sección 1: Básico
+            # Básico
             'nombre_proyecto',
             'descripcion',
             'calculo_nivel',
@@ -200,84 +472,28 @@ class ProyectoCierreBrechaCreateSerializer(serializers.ModelSerializer):
             'prioridad',
             'categoria',
             
-            # Sección 2: Brecha
-            'normativa',
-            'control_no_conforme',
-            'tipo_brecha',
-            'nivel_criticidad_original',
-            'impacto_riesgo',
-            'evidencia_no_conformidad',
-            'fecha_identificacion_gap',
+            # Responsables
+            'dueno_proyecto',
+            'responsable_implementacion',
+            'validador_interno',
             
-            # Sección 3: Planificación
-            'estrategia_cierre',
+            # Presupuesto
+            'modo_presupuesto',
+            'moneda',
+            'presupuesto_global',  # Solo si modo_presupuesto='global'
+            
+            # Planificación
             'alcance_proyecto',
             'objetivos_especificos',
             'criterios_aceptacion',
-            'supuestos',
-            'restricciones',
             'riesgos_proyecto',
-            'preguntas_abordadas_ids',  # ⭐ Campo especial
-            
-            # Sección 4: Responsables
-            'dueno_proyecto',
-            'responsable_implementacion',
-            'equipo_implementacion',
-            'validador_interno',
-            'auditor_verificacion',
-            
-            # Sección 5: Recursos
-            'presupuesto_asignado',
-            'moneda',
-            'recursos_humanos_asignados',
-            'recursos_tecnicos',
-            
-            # Sección 6: Seguimiento
-            'frecuencia_reporte',
-            'metricas_desempeno',
-            'umbrales_alerta',
-            'canal_comunicacion',
-            
-            # Sección 7: Validación
-            'criterios_validacion',
-            'metodo_verificacion',
-            'responsable_validacion',
+            'preguntas_abordadas_ids',
         ]
     
     def validate_calculo_nivel(self, value):
         """Validar que el GAP exista y esté activo"""
         if not value.activo:
-            raise serializers.ValidationError(
-                'El GAP seleccionado no está activo'
-            )
-        return value
-    
-    def validate_fecha_inicio(self, value):
-        """Validar que la fecha de inicio no sea muy antigua"""
-        from datetime import timedelta
-        
-        # Permitir hasta 30 días en el pasado
-        fecha_minima = date.today() - timedelta(days=30)
-        if value < fecha_minima:
-            raise serializers.ValidationError(
-                f'La fecha de inicio no puede ser anterior a {fecha_minima}'
-            )
-        return value
-    
-    def validate_presupuesto_asignado(self, value):
-        """Validar que el presupuesto sea positivo"""
-        if value < 0:
-            raise serializers.ValidationError(
-                'El presupuesto debe ser mayor o igual a 0'
-            )
-        return value
-    
-    def validate_recursos_humanos_asignados(self, value):
-        """Validar que las horas sean positivas"""
-        if value < 0:
-            raise serializers.ValidationError(
-                'Los recursos humanos deben ser mayor o igual a 0'
-            )
+            raise serializers.ValidationError('El GAP seleccionado no está activo')
         return value
     
     def validate(self, attrs):
@@ -292,25 +508,21 @@ class ProyectoCierreBrechaCreateSerializer(serializers.ModelSerializer):
                 'fecha_fin_estimada': 'La fecha de fin debe ser posterior a la fecha de inicio'
             })
         
-        # Validar que el proyecto no sea muy largo (máx 2 años)
-        from datetime import timedelta
         duracion = (fecha_fin - fecha_inicio).days
-        if duracion > 730:  # 2 años
+        if duracion > 730:
             raise serializers.ValidationError({
                 'fecha_fin_estimada': 'El proyecto no puede durar más de 2 años'
             })
         
-        # ═══ 2. VALIDAR PERMISOS DEL USUARIO ═══
+        # ═══ 2. VALIDAR PERMISOS ═══
         user = self.context['request'].user
         calculo_nivel = attrs.get('calculo_nivel')
         
-        # Solo Admin o SuperAdmin pueden crear proyectos
         if user.rol not in ['administrador', 'superadmin']:
             raise serializers.ValidationError(
-                'Solo administradores pueden crear proyectos de remediación'
+                'Solo administradores pueden crear proyectos'
             )
         
-        # Admin solo puede crear para su empresa
         if user.rol == 'administrador':
             if calculo_nivel.empresa != user.empresa:
                 raise serializers.ValidationError({
@@ -320,53 +532,36 @@ class ProyectoCierreBrechaCreateSerializer(serializers.ModelSerializer):
         # ═══ 3. VALIDAR RESPONSABLES ═══
         empresa = calculo_nivel.empresa
         
-        # Dueno del proyecto
         dueno = attrs.get('dueno_proyecto')
         if dueno.empresa != empresa:
             raise serializers.ValidationError({
                 'dueno_proyecto': f'El dueño debe pertenecer a {empresa.nombre}'
             })
         
-        # Responsable de implementación
         responsable = attrs.get('responsable_implementacion')
         if responsable.empresa != empresa:
             raise serializers.ValidationError({
                 'responsable_implementacion': f'El responsable debe pertenecer a {empresa.nombre}'
             })
         
-        # Equipo de implementación
-        equipo = attrs.get('equipo_implementacion', [])
-        for miembro in equipo:
-            if miembro.empresa != empresa:
-                raise serializers.ValidationError({
-                    'equipo_implementacion': f'{miembro.nombre_completo} no pertenece a {empresa.nombre}'
-                })
-        
-        # Validador interno
         validador = attrs.get('validador_interno')
         if validador and validador.empresa != empresa:
             raise serializers.ValidationError({
                 'validador_interno': f'El validador debe pertenecer a {empresa.nombre}'
             })
         
-        # Auditor
-        auditor = attrs.get('auditor_verificacion')
-        if auditor and auditor.empresa != empresa:
+        # ═══ 4. VALIDAR MODO PRESUPUESTO ═══
+        modo_presupuesto = attrs.get('modo_presupuesto', 'global')
+        presupuesto_global = attrs.get('presupuesto_global', 0)
+        
+        if modo_presupuesto == 'global' and presupuesto_global <= 0:
             raise serializers.ValidationError({
-                'auditor_verificacion': f'El auditor debe pertenecer a {empresa.nombre}'
+                'presupuesto_global': 'Debe especificar un presupuesto mayor a 0 en modo global'
             })
         
-        # Responsable de validación
-        resp_validacion = attrs.get('responsable_validacion')
-        if resp_validacion and resp_validacion.empresa != empresa:
-            raise serializers.ValidationError({
-                'responsable_validacion': f'El responsable de validación debe pertenecer a {empresa.nombre}'
-            })
-        
-        # ═══ 4. VALIDAR PREGUNTAS ABORDADAS (SI SE PROPORCIONAN) ═══
+        # ═══ 5. VALIDAR PREGUNTAS ═══
         preguntas_ids = attrs.pop('preguntas_abordadas_ids', [])
         if preguntas_ids:
-            # Validar que las preguntas pertenezcan a la dimensión del GAP
             dimension = calculo_nivel.dimension
             preguntas = Pregunta.objects.filter(id__in=preguntas_ids, activo=True)
             
@@ -381,46 +576,25 @@ class ProyectoCierreBrechaCreateSerializer(serializers.ModelSerializer):
                         'preguntas_abordadas_ids': f'La pregunta {pregunta.codigo} no pertenece a la dimensión {dimension.nombre}'
                     })
             
-            # Guardar preguntas validadas para usarlas en create()
             attrs['_preguntas_validadas'] = preguntas
         
         return attrs
     
     @transaction.atomic
     def create(self, validated_data):
-        """Crear proyecto con todos los datos"""
+        """Crear proyecto"""
         
-        # ═══ 1. EXTRAER DATOS ESPECIALES ═══
-        equipo = validated_data.pop('equipo_implementacion', [])
         preguntas_validadas = validated_data.pop('_preguntas_validadas', [])
         
-        # ═══ 2. ASIGNAR EMPRESA Y USUARIO CREADOR ═══
         calculo_nivel = validated_data['calculo_nivel']
         validated_data['empresa'] = calculo_nivel.empresa
         validated_data['creado_por'] = self.context['request'].user
-        
-        # ═══ 3. ASIGNAR ESTADO INICIAL ═══
         validated_data['estado'] = 'planificado'
         
-        # ═══ 4. PRE-LLENAR DATOS DE LA BRECHA SI NO SE PROPORCIONARON ═══
-        # Si no se llenó la fecha de identificación, usar la del GAP
-        if not validated_data.get('fecha_identificacion_gap'):
-            validated_data['fecha_identificacion_gap'] = calculo_nivel.calculado_at.date()
-        
-        # ═══ 5. CREAR EL PROYECTO ═══
         proyecto = ProyectoCierreBrecha.objects.create(**validated_data)
         
-        # ═══ 6. ASIGNAR EQUIPO (ManyToMany) ═══
-        if equipo:
-            proyecto.equipo_implementacion.set(equipo)
-        
-        # ═══ 7. ASIGNAR PREGUNTAS ABORDADAS ═══
         if preguntas_validadas:
             proyecto.preguntas_abordadas.set(preguntas_validadas)
-        
-        # ═══ 8. ENVIAR NOTIFICACIONES ═══
-        # TODO: Implementar servicio de notificaciones
-        # NotificacionProyectoService.notificar_proyecto_creado(proyecto)
         
         return proyecto
 
@@ -428,90 +602,49 @@ class ProyectoCierreBrechaCreateSerializer(serializers.ModelSerializer):
 class ProyectoCierreBrechaUpdateSerializer(serializers.ModelSerializer):
     """
     Serializer para ACTUALIZAR un proyecto existente
-    
-    Restricciones:
-    - NO se puede cambiar el GAP asociado
-    - NO se puede cambiar la empresa
-    - Solo ciertos campos según el estado
     """
     
-    # ⭐ Campo especial para preguntas
     preguntas_abordadas_ids = serializers.ListField(
         child=serializers.UUIDField(),
         required=False,
         allow_empty=True,
         write_only=True,
-        help_text='IDs de preguntas específicas'
     )
     
     class Meta:
         model = ProyectoCierreBrecha
         fields = [
-            # Básico (algunos no editables)
             'nombre_proyecto',
             'descripcion',
             'fecha_fin_estimada',
             'prioridad',
             'categoria',
             'estado',
-            
-            # Brecha (solo algunos editables)
-            'control_no_conforme',
-            'impacto_riesgo',
-            
-            # Planificación
-            'estrategia_cierre',
             'alcance_proyecto',
             'objetivos_especificos',
             'criterios_aceptacion',
-            'supuestos',
-            'restricciones',
             'riesgos_proyecto',
-            'preguntas_abordadas_ids',
-            
-            # Responsables
             'dueno_proyecto',
             'responsable_implementacion',
-            'equipo_implementacion',
             'validador_interno',
-            'auditor_verificacion',
-            
-            # Recursos
-            'presupuesto_asignado',
-            'presupuesto_gastado',
-            'recursos_humanos_asignados',
-            'recursos_tecnicos',
-            
-            # Seguimiento
-            'frecuencia_reporte',
-            'metricas_desempeno',
-            'umbrales_alerta',
-            'canal_comunicacion',
-            
-            # Validación
-            'criterios_validacion',
-            'metodo_verificacion',
-            'responsable_validacion',
-            
-            # Cierre
+            'presupuesto_global',  # Solo en modo global
+            'presupuesto_global_gastado',  # Solo en modo global
             'lecciones_aprendidas',
-            'acciones_mejora_continua',
-            'recomendaciones_futuros_gap',
+            'preguntas_abordadas_ids',
         ]
     
     def validate_estado(self, value):
-        """Validar transiciones de estado permitidas"""
+        """Validar transiciones de estado"""
         if self.instance:
             estado_actual = self.instance.estado
             
-            # Definir transiciones válidas
             transiciones_validas = {
                 'planificado': ['en_ejecucion', 'cancelado'],
                 'en_ejecucion': ['en_validacion', 'suspendido', 'cancelado'],
                 'en_validacion': ['cerrado', 'en_ejecucion'],
                 'suspendido': ['en_ejecucion', 'cancelado'],
-                'cerrado': [],  # No se puede cambiar de cerrado
-                'cancelado': [],  # No se puede cambiar de cancelado
+                'cerrado': [],
+                'cancelado': [],
             }
             
             if value != estado_actual:
@@ -522,41 +655,26 @@ class ProyectoCierreBrechaUpdateSerializer(serializers.ModelSerializer):
         
         return value
     
-    def validate_presupuesto_gastado(self, value):
-        """Validar que no se gaste más del presupuesto"""
-        if self.instance:
-            if value > self.instance.presupuesto_asignado:
-                raise serializers.ValidationError(
-                    f'El gasto no puede superar el presupuesto asignado ({self.instance.presupuesto_asignado})'
-                )
-        return value
-    
     def validate(self, attrs):
         """Validaciones cruzadas"""
         
         user = self.context['request'].user
         
-        # ═══ 1. VALIDAR PERMISOS ═══
-        # Solo Admin de la empresa o SuperAdmin pueden editar
+        # Validar permisos
         if user.rol == 'administrador':
             if self.instance.empresa != user.empresa:
-                raise serializers.ValidationError(
-                    'Solo puedes editar proyectos de tu empresa'
-                )
+                raise serializers.ValidationError('Solo puedes editar proyectos de tu empresa')
         elif user.rol not in ['superadmin']:
-            raise serializers.ValidationError(
-                'No tienes permisos para editar proyectos'
-            )
+            raise serializers.ValidationError('No tienes permisos para editar proyectos')
         
-        # ═══ 2. VALIDAR FECHAS ═══
+        # Validar fechas
         fecha_fin = attrs.get('fecha_fin_estimada')
-        if fecha_fin:
-            if fecha_fin <= self.instance.fecha_inicio:
-                raise serializers.ValidationError({
-                    'fecha_fin_estimada': 'La fecha de fin debe ser posterior a la fecha de inicio'
-                })
+        if fecha_fin and fecha_fin <= self.instance.fecha_inicio:
+            raise serializers.ValidationError({
+                'fecha_fin_estimada': 'La fecha de fin debe ser posterior a la fecha de inicio'
+            })
         
-        # ═══ 3. VALIDAR RESPONSABLES (SI SE CAMBIAN) ═══
+        # Validar responsables
         empresa = self.instance.empresa
         
         dueno = attrs.get('dueno_proyecto')
@@ -571,7 +689,7 @@ class ProyectoCierreBrechaUpdateSerializer(serializers.ModelSerializer):
                 'responsable_implementacion': f'El responsable debe pertenecer a {empresa.nombre}'
             })
         
-        # ═══ 4. VALIDAR PREGUNTAS ═══
+        # Validar preguntas
         preguntas_ids = attrs.pop('preguntas_abordadas_ids', None)
         if preguntas_ids is not None:
             dimension = self.instance.calculo_nivel.dimension
@@ -591,31 +709,16 @@ class ProyectoCierreBrechaUpdateSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         """Actualizar proyecto"""
         
-        # ═══ 1. EXTRAER DATOS ESPECIALES ═══
-        equipo = validated_data.pop('equipo_implementacion', None)
         preguntas_validadas = validated_data.pop('_preguntas_validadas', None)
         
-        # ═══ 2. ACTUALIZAR CAMPOS NORMALES ═══
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         
-        # ═══ 3. INCREMENTAR VERSIÓN ═══
         instance.version += 1
-        
-        # ═══ 4. GUARDAR ═══
         instance.save()
         
-        # ═══ 5. ACTUALIZAR EQUIPO SI SE PROPORCIONÓ ═══
-        if equipo is not None:
-            instance.equipo_implementacion.set(equipo)
-        
-        # ═══ 6. ACTUALIZAR PREGUNTAS SI SE PROPORCIONARON ═══
         if preguntas_validadas is not None:
             instance.preguntas_abordadas.set(preguntas_validadas)
-        
-        # ═══ 7. ENVIAR NOTIFICACIONES ═══
-        # TODO: Implementar
-        # NotificacionProyectoService.notificar_proyecto_actualizado(instance)
         
         return instance
 
@@ -627,6 +730,15 @@ class ProyectoCierreBrechaUpdateSerializer(serializers.ModelSerializer):
 class ProyectoSimpleSerializer(serializers.ModelSerializer):
     """Serializer ultra-simple para referencias rápidas"""
     
+    modo_presupuesto_display = serializers.CharField(source='get_modo_presupuesto_display', read_only=True)
+    
     class Meta:
         model = ProyectoCierreBrecha
-        fields = ['id', 'codigo_proyecto', 'nombre_proyecto', 'estado']
+        fields = [
+            'id',
+            'codigo_proyecto',
+            'nombre_proyecto',
+            'estado',
+            'modo_presupuesto',
+            'modo_presupuesto_display',
+        ]

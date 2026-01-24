@@ -2,12 +2,14 @@
 
 from django.db import models
 from apps.core.models import BaseModel
+from apps.empresas.models import Empresa
 import uuid
 
 class Proveedor(BaseModel):
     """
     Proveedor de servicios
-    Solo gestionable por superadmin y administradores
+    - Superadmin: Puede crear proveedores globales (sin empresa)
+    - Administrador: Puede crear proveedores para su empresa
     """
     
     TIPOS_PROVEEDOR = [
@@ -21,9 +23,20 @@ class Proveedor(BaseModel):
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
+    # ⭐ NUEVO: Relación con Empresa
+    empresa = models.ForeignKey(
+        Empresa,
+        on_delete=models.CASCADE,
+        related_name='proveedores',
+        verbose_name='Empresa',
+        null=True,
+        blank=True,
+        help_text='Si está vacío, es un proveedor global (solo superadmin)'
+    )
+    
     # Información Básica del Proveedor
     razon_social = models.CharField(max_length=200, verbose_name='Razón Social')
-    ruc = models.CharField(max_length=20, unique=True, verbose_name='RUC/Tax ID')
+    ruc = models.CharField(max_length=20, verbose_name='RUC/Tax ID')
     
     # Tipo de Proveedor
     tipo_proveedor = models.CharField(
@@ -45,9 +58,6 @@ class Proveedor(BaseModel):
         verbose_name='Creado Por'
     )
     
-    # Estado (activo/inactivo)
-    # activo ya viene de BaseModel, pero lo configuramos en el save()
-    
     class Meta:
         db_table = 'proveedores'
         verbose_name = 'Proveedor'
@@ -57,15 +67,39 @@ class Proveedor(BaseModel):
             models.Index(fields=['ruc']),
             models.Index(fields=['tipo_proveedor']),
             models.Index(fields=['activo']),
+            models.Index(fields=['empresa']),  # ⭐ NUEVO índice
+        ]
+        # ⭐ NUEVO: RUC único por empresa (permite duplicados entre empresas)
+        constraints = [
+            models.UniqueConstraint(
+                fields=['ruc', 'empresa'],
+                name='unique_ruc_por_empresa'
+            )
         ]
     
     def __str__(self):
-        return f"{self.razon_social} ({self.get_tipo_proveedor_display()})"
+        empresa_str = f" - {self.empresa.nombre}" if self.empresa else " (Global)"
+        return f"{self.razon_social}{empresa_str}"
     
     def save(self, *args, **kwargs):
+        # Validar lógica de empresa según el rol del creador
+        if self.creado_por:
+            # Si el creador es superadmin, puede crear proveedores globales
+            if self.creado_por.rol == 'superadmin':
+                # Superadmin puede dejar empresa = None (proveedor global)
+                pass
+            else:
+                # Otros roles (administrador) DEBEN asignar su empresa
+                if not self.empresa:
+                    if self.creado_por.empresa:
+                        self.empresa = self.creado_por.empresa
+                    else:
+                        raise ValueError('Los administradores deben tener una empresa asignada para crear proveedores')
+        
         # Si es nuevo proveedor, inicia desactivado
         if not self.pk:
             self.activo = False
+        
         super().save(*args, **kwargs)
     
     def activar(self):
@@ -77,3 +111,8 @@ class Proveedor(BaseModel):
         """Desactivar proveedor"""
         self.activo = False
         self.save()
+    
+    @property
+    def es_global(self):
+        """Verifica si es un proveedor global (sin empresa)"""
+        return self.empresa is None

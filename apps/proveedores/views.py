@@ -4,7 +4,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from apps.core.permissions import EsAdminOSuperAdmin  # ← TU PERMISO EXISTENTE
+from apps.core.permissions import EsAdminOSuperAdmin
 from .models import Proveedor
 from .serializers import (
     ProveedorSerializer,
@@ -15,17 +15,28 @@ from .serializers import (
 class ProveedorViewSet(viewsets.ModelViewSet):
     """
     ViewSet para gestión de proveedores
-    Solo accesible por superadmin y administradores
+    - Superadmin: Ve TODOS los proveedores (globales + de empresas)
+    - Administrador: Solo ve proveedores de SU empresa
     """
-    permission_classes = [IsAuthenticated, EsAdminOSuperAdmin]  # ← USANDO TU PERMISO
+    permission_classes = [IsAuthenticated, EsAdminOSuperAdmin]
     
     def get_queryset(self):
+        """
+        ⭐ CORREGIDO: Filtrar proveedores según el rol
+        """
         user = self.request.user
         
-        # Superadmin y Admin pueden ver todos
-        if user.rol in ['superadmin', 'administrador']:
+        # Superadmin ve TODO (proveedores globales + de empresas)
+        if user.rol == 'superadmin':
             return Proveedor.objects.all()
         
+        # Administrador solo ve proveedores de SU empresa
+        if user.rol == 'administrador':
+            if not user.empresa:
+                return Proveedor.objects.none()
+            return Proveedor.objects.filter(empresa=user.empresa)
+        
+        # Otros roles no tienen acceso
         return Proveedor.objects.none()
     
     def get_serializer_class(self):
@@ -79,30 +90,59 @@ class ProveedorViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def activos(self, request):
-        """GET /api/proveedores/activos/"""
+        """
+        GET /api/proveedores/activos/
+        ⭐ Retorna proveedores activos según el rol del usuario
+        """
         proveedores = self.get_queryset().filter(activo=True)
         
-        # ⭐ OPCIÓN 1: Usar el paginador (recomendado)
+        # Usar paginación (recomendado)
         page = self.paginate_queryset(proveedores)
         if page is not None:
             serializer = ProveedorSerializer(page, many=True)
             return self.get_paginated_response(serializer.data)
         
-        # ⭐ OPCIÓN 2: Sin paginación (si prefieres)
+        # Sin paginación
         serializer = ProveedorSerializer(proveedores, many=True)
-        return Response(serializer.data)  # ← Retorna array directo
+        return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def inactivos(self, request):
-        """GET /api/proveedores/inactivos/"""
+        """
+        GET /api/proveedores/inactivos/
+        ⭐ Retorna proveedores inactivos según el rol del usuario
+        """
         proveedores = self.get_queryset().filter(activo=False)
         
-        # ⭐ OPCIÓN 1: Usar el paginador (recomendado)
+        # Usar paginación (recomendado)
         page = self.paginate_queryset(proveedores)
         if page is not None:
             serializer = ProveedorSerializer(page, many=True)
             return self.get_paginated_response(serializer.data)
         
-        # ⭐ OPCIÓN 2: Sin paginación
+        # Sin paginación
         serializer = ProveedorSerializer(proveedores, many=True)
-        return Response(serializer.data)  # ← Retorna array directo
+        return Response(serializer.data)
+    
+    # ⭐ NUEVO: Endpoint para ver proveedores globales (solo superadmin)
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def globales(self, request):
+        """
+        GET /api/proveedores/globales/
+        Solo superadmin puede ver proveedores globales
+        """
+        if request.user.rol != 'superadmin':
+            return Response({
+                'success': False,
+                'message': 'Solo superadmin puede ver proveedores globales'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        proveedores = Proveedor.objects.filter(empresa__isnull=True)
+        
+        page = self.paginate_queryset(proveedores)
+        if page is not None:
+            serializer = ProveedorSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = ProveedorSerializer(proveedores, many=True)
+        return Response(serializer.data)
