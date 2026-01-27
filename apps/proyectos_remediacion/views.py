@@ -8,9 +8,10 @@ from django.db import transaction
 from django.db.models import Q, Count, Sum
 from django.utils import timezone
 from datetime import timedelta, date
-
-from .models import ProyectoCierreBrecha, ItemProyecto
+from decimal import Decimal
+from .models import AprobacionGAP, ProyectoCierreBrecha, ItemProyecto
 from .serializers import (
+    AprobacionGAPListSerializer,
     ProyectoCierreBrechaListSerializer,
     ProyectoCierreBrechaDetailSerializer,
     ProyectoCierreBrechaCreateSerializer,
@@ -18,37 +19,18 @@ from .serializers import (
     ItemProyectoListSerializer,
     ItemProyectoDetailSerializer,
     ItemProyectoCreateUpdateSerializer,
+    SolicitarAprobacionSerializer,  # ⭐ AGREGAR
+    ResponderAprobacionSerializer,  # ⭐ AGREGAR
 )
 from apps.core.permissions import EsSuperAdmin, EsAdminOSuperAdmin
 from apps.core.mixins import ResponseMixin
 from apps.respuestas.models import CalculoNivel
-
+from apps.notificaciones.models import Notificacion  # ⭐ AGREGAR ESTE IMPORT
+from .serializers import AprobacionGAPDetailSerializer
+from datetime import date
 
 class ProyectoCierreBrechaViewSet(ResponseMixin, viewsets.ModelViewSet):
-    """
-    ViewSet para gestión de Proyectos de Cierre de Brecha
-    
-    ENDPOINTS PRINCIPALES:
-    - GET    /api/proyectos-remediacion/                          → Listar proyectos
-    - POST   /api/proyectos-remediacion/                          → Crear proyecto
-    - GET    /api/proyectos-remediacion/{id}/                     → Detalle de proyecto
-    - PATCH  /api/proyectos-remediacion/{id}/                     → Actualizar proyecto
-    - DELETE /api/proyectos-remediacion/{id}/                     → Desactivar proyecto
-    
-    ENDPOINTS DE ÍTEMS:
-    - GET    /api/proyectos-remediacion/{id}/items/               → Listar ítems del proyecto
-    - POST   /api/proyectos-remediacion/{id}/agregar_item/        → Agregar ítem
-    - PATCH  /api/proyectos-remediacion/{id}/actualizar_item/     → Actualizar ítem
-    - DELETE /api/proyectos-remediacion/{id}/eliminar_item/       → Eliminar ítem
-    - POST   /api/proyectos-remediacion/{id}/reordenar_items/     → Reordenar ítems
-    
-    ENDPOINTS ESPECIALES:
-    - POST   /api/proyectos-remediacion/crear_desde_gap/          → Crear proyecto desde GAP
-    - GET    /api/proyectos-remediacion/mis_proyectos/            → Mis proyectos asignados
-    - GET    /api/proyectos-remediacion/estadisticas/             → Estadísticas generales
-    - GET    /api/proyectos-remediacion/vencidos/                 → Proyectos vencidos
-    """
-    
+
     permission_classes = [IsAuthenticated]
     http_method_names = ['get', 'post', 'patch', 'delete']
     
@@ -338,77 +320,107 @@ class ProyectoCierreBrechaViewSet(ResponseMixin, viewsets.ModelViewSet):
             status_code=status.HTTP_201_CREATED
         )
     
-    @action(detail=True, methods=['patch'], url_path='actualizar-item', permission_classes=[IsAuthenticated, EsAdminOSuperAdmin])
+    @action(detail=True, methods=['patch'], url_path='actualizar-item', permission_classes=[IsAuthenticated])
     def actualizar_item(self, request, pk=None):
-        """
-        Actualizar un ítem existente
-        PATCH /api/proyectos-remediacion/{id}/actualizar-item/
-        
-        Body:
-        {
-            "item_id": "uuid",
-            "porcentaje_avance": 50,
-            "presupuesto_ejecutado": 2500,
-            "estado": "en_proceso"
-        }
-        """
-        proyecto = self.get_object()
-        
-        item_id = request.data.get('item_id')
-        if not item_id:
-            return self.error_response(
-                message='Se requiere item_id',
-                status_code=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            item = proyecto.items.get(id=item_id, activo=True)
-        except ItemProyecto.DoesNotExist:
-            return self.error_response(
-                message='Ítem no encontrado',
-                status_code=status.HTTP_404_NOT_FOUND
-            )
-        
-        # ═══ VALIDAR SI PUEDE ACTUALIZAR ESTADO ═══
-        nuevo_estado = request.data.get('estado')
-        if nuevo_estado == 'en_proceso' or nuevo_estado == 'completado':
-            if not item.puede_iniciar:
+            """
+            Acción unificada para actualizar un ítem (estado, avance, presupuesto).
+            PATCH /api/proyectos-remediacion/{id}/actualizar-item/
+            """
+            proyecto = self.get_object()
+            user = request.user
+            item_id = request.data.get('item_id')
+
+            if not item_id:
                 return self.error_response(
-                    message=f'El ítem está bloqueado. Debe completarse primero el ítem #{item.item_dependencia.numero_item}',
+                    message='El campo item_id es requerido',
                     status_code=status.HTTP_400_BAD_REQUEST
                 )
-        
-        # ═══ ACTUALIZAR ═══
-        serializer = ItemProyectoCreateUpdateSerializer(
-            item,
-            data=request.data,
-            partial=True
-        )
-        
-        if not serializer.is_valid():
-            return self.error_response(
-                message='Error en validación de datos',
-                errors=serializer.errors,
-                status_code=status.HTTP_400_BAD_REQUEST
+
+            # ═══ 1. OBTENER ÍTEM Y VALIDAR PERMISOS ═══
+            try:
+                item = proyecto.items.get(id=item_id, activo=True)
+            except ItemProyecto.DoesNotExist:
+                return self.error_response(
+                    message='Ítem no encontrado en este proyecto',
+                    status_code=status.HTTP_404_NOT_FOUND
+                )
+
+            # Solo Admins o el Responsable del ítem/Dueño del proyecto pueden editar
+            es_responsable = item.responsable_ejecucion == user or proyecto.dueno_proyecto == user
+            if user.rol not in ['superadmin', 'administrador'] and not es_responsable:
+                return self.error_response(
+                    message='No tienes permisos para actualizar este ítem',
+                    status_code=status.HTTP_403_FORBIDDEN
+                )
+
+            # ═══ 2. VALIDAR BLOQUEO POR DEPENDENCIAS ═══
+            nuevo_estado = request.data.get('estado')
+            if nuevo_estado in ['en_proceso', 'completado']:
+                if not item.puede_iniciar:
+                    # Si existe 'item_dependencia', informamos cuál es
+                    dep_info = f" #{item.item_dependencia.numero_item}" if item.item_dependencia else ""
+                    return self.error_response(
+                        message=f'El ítem está bloqueado. Debe completarse primero el ítem antecedente{dep_info}.',
+                        status_code=status.HTTP_400_BAD_REQUEST
+                    )
+
+            # ═══ 3. PREPARAR DATOS Y SERIALIZADOR ═══
+            # Clonamos los datos para poder manipularlos antes de validar
+            datos_update = request.data.copy()
+
+            # Lógica de negocio automática: si el avance es 100, forzar estado completado
+            if float(datos_update.get('porcentaje_avance', 0)) >= 100:
+                datos_update['estado'] = 'completado'
+            
+            # Si el estado es completado, asegurar que el avance sea 100
+            if datos_update.get('estado') == 'completado':
+                datos_update['porcentaje_avance'] = 100
+                if not item.fecha_completado:
+                    item.fecha_completado = timezone.now().date()
+
+            serializer = ItemProyectoCreateUpdateSerializer(
+                item, 
+                data=datos_update, 
+                partial=True,
+                context={'request': request}
             )
-        
-        item = serializer.save()
-        
-        # ═══ SI SE COMPLETÓ, DESBLOQUEAR DEPENDIENTES ═══
-        if item.estado == 'completado':
-            dependientes = item.items_dependientes.filter(estado='bloqueado', activo=True)
-            for dep in dependientes:
-                if dep.puede_iniciar:
-                    dep.estado = 'pendiente'
-                    dep.save()
-        
-        # ═══ RESPUESTA ═══
-        output_serializer = ItemProyectoDetailSerializer(item)
-        
-        return self.success_response(
-            data=output_serializer.data,
-            message=f'Ítem #{item.numero_item} actualizado exitosamente'
-        )
+
+            if not serializer.is_valid():
+                return self.error_response(
+                    message='Error en validación de datos',
+                    errors=serializer.errors,
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+
+            # ═══ 4. GUARDAR Y GESTIONAR DESBLOQUEOS ═══
+            try:
+                with transaction.atomic():
+                    item_actualizado = serializer.save()
+
+                    # Si se completó, buscar ítems dependientes para desbloquearlos
+                    if item_actualizado.estado == 'completado':
+                        # Desbloquear hijos directos que ahora "pueden iniciar"
+                        dependientes = item_actualizado.items_dependientes.filter(
+                            estado='bloqueado', 
+                            activo=True
+                        )
+                        for dep in dependientes:
+                            if dep.puede_iniciar: # Propiedad del modelo que valida todas sus dependencias
+                                dep.estado = 'pendiente'
+                                dep.save(update_fields=['estado'])
+
+                    # ═══ 5. RESPUESTA ═══
+                    output_serializer = ItemProyectoDetailSerializer(item_actualizado)
+                    return self.success_response(
+                        data=output_serializer.data,
+                        message=f'Ítem #{item_actualizado.numero_item} actualizado exitosamente'
+                    )
+
+            except Exception as e:
+                return self.error_response(
+                    message=f'Error al procesar la actualización: {str(e)}',
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
     
     @action(detail=True, methods=['delete'], url_path='eliminar-item', permission_classes=[IsAuthenticated, EsAdminOSuperAdmin])
     def eliminar_item(self, request, pk=None):
@@ -548,7 +560,26 @@ class ProyectoCierreBrechaViewSet(ResponseMixin, viewsets.ModelViewSet):
         nombre_base = request.data.get('nombre_proyecto') or f'Remediación: {calculo_nivel.dimension.nombre}'
         if proyectos_previos_count > 0:
             nombre_base = f"{nombre_base} (Fase {proyectos_previos_count + 1})"
+
+        # --- Lógica de Validador Automático ---
+        # 1. Intentar obtenerlo del request
+        validador_id = request.data.get('validador_interno_id')
         
+        # 2. Si no viene, intentar obtener el creador de la asignación del GAP
+        if not validador_id:
+                asignacion = calculo_nivel.asignacion
+                if asignacion:
+                    # Tu modelo usa 'asignado_por', no 'creado_por'
+                    # Usamos .id solo si el objeto existe para evitar nuevos errores
+                    if asignacion.asignado_por:
+                        validador_id = asignacion.asignado_por.id
+                    else:
+                        # Si nadie la asignó, usamos el administrador de la evaluación empresa
+                        validador_id = asignacion.evaluacion_empresa.administrador.id
+                else:
+                    # Último recurso: el usuario que está operando ahora
+                    validador_id = request.user.id
+
         datos_proyecto = {
             'calculo_nivel': calculo_nivel.id,
             'nombre_proyecto': nombre_base,
@@ -562,12 +593,10 @@ class ProyectoCierreBrechaViewSet(ResponseMixin, viewsets.ModelViewSet):
             'prioridad': self._mapear_prioridad_gap(calculo_nivel.clasificacion_gap),
             'categoria': request.data.get('categoria', 'tecnico'),
             
-            # ⭐ NUEVO: Modo de presupuesto
             'modo_presupuesto': request.data.get('modo_presupuesto', 'global'),
             'moneda': request.data.get('moneda', 'USD'),
             'presupuesto_global': request.data.get('presupuesto_global', 0),
             
-            # Planificación
             'alcance_proyecto': request.data.get('alcance_proyecto') or 
                                f'Cerrar brecha en {calculo_nivel.dimension.nombre}',
             
@@ -584,7 +613,7 @@ class ProyectoCierreBrechaViewSet(ResponseMixin, viewsets.ModelViewSet):
             # Responsables
             'dueno_proyecto': request.data.get('dueno_proyecto_id'),
             'responsable_implementacion': request.data.get('responsable_implementacion_id'),
-            'validador_interno': request.data.get('validador_interno_id'),
+            'validador_interno': validador_id,  # <--- Validador asignado aquí
         }
         
         # ═══ 6. CREAR PROYECTO ═══
@@ -797,6 +826,463 @@ class ProyectoCierreBrechaViewSet(ResponseMixin, viewsets.ModelViewSet):
             'proyectos': serializer.data
         })
 
+    @action(detail=False, methods=['get'])
+    def por_dimension_y_evaluacion(self, request):
+        """
+        Obtener proyectos de una dimensión específica en una evaluación específica
+        GET /api/proyectos-remediacion/por_dimension_y_evaluacion/?dimension_id=X&evaluacion_id=Y
+        """
+        dimension_id = request.query_params.get('dimension_id')
+        evaluacion_id = request.query_params.get('evaluacion_id')
+        
+        if not dimension_id:
+            return self.error_response(
+                message='Se requiere dimension_id',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not evaluacion_id:
+            return self.error_response(
+                message='Se requiere evaluacion_id',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ═══ 1. OBTENER CALCULOS DE NIVEL DE ESA DIMENSIÓN EN ESA EVALUACIÓN ═══
+        calculos = CalculoNivel.objects.filter(
+            dimension_id=dimension_id,
+            evaluacion_id=evaluacion_id,
+            activo=True
+        )
+        
+        if not calculos.exists():
+            return Response({
+                'success': True,
+                'dimension_id': dimension_id,
+                'evaluacion_id': evaluacion_id,
+                'dimension_nombre': '',
+                'total': 0,
+                'proyectos': []
+            })
+        
+        # ═══ 2. OBTENER PROYECTOS DE ESOS CÁLCULOS ═══
+        proyectos_queryset = ProyectoCierreBrecha.objects.filter(
+            calculo_nivel__in=calculos,
+            activo=True
+        ).select_related(
+            'empresa',
+            'calculo_nivel',
+            'calculo_nivel__dimension',
+            'dueno_proyecto',
+            'responsable_implementacion',
+            'validador_interno'
+        ).prefetch_related(
+            'items'
+        ).order_by('-fecha_creacion')
+        
+        # ═══ 3. FILTRAR POR PERMISOS ═══
+        user = request.user
+        
+        if user.rol == 'administrador':
+            if user.empresa:
+                proyectos_queryset = proyectos_queryset.filter(empresa=user.empresa)
+            else:
+                proyectos_queryset = proyectos_queryset.none()
+        elif user.rol not in ['superadmin']:
+            # Usuario solo ve donde está asignado
+            proyectos_queryset = proyectos_queryset.filter(
+                Q(dueno_proyecto=user) |
+                Q(responsable_implementacion=user) |
+                Q(validador_interno=user)
+            ).distinct()
+        
+        # ═══ 4. SERIALIZAR ═══
+        serializer = ProyectoCierreBrechaListSerializer(proyectos_queryset, many=True)
+        
+        # ═══ 5. RESPUESTA ═══
+        dimension_nombre = calculos.first().dimension.nombre if calculos.exists() else ''
+        
+        return Response({
+            'success': True,
+            'dimension_id': dimension_id,
+            'evaluacion_id': evaluacion_id,
+            'dimension_nombre': dimension_nombre,
+            'total': proyectos_queryset.count(),
+            'proyectos': serializer.data
+        })
+
+    
+    # Nuevos ENDPOINTS 26/01/2026
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, EsAdminOSuperAdmin])
+    def solicitar_aprobacion(self, request, pk=None):
+        """
+        Solicita la aprobación para cerrar el GAP del proyecto.
+        """
+        proyecto = self.get_object()
+        user = request.user
+        
+        # ═══ VALIDACIONES ═══
+        
+        # 1. MODIFICADO: Incluir 'pendiente' y cualquier estado inicial lógico
+        estados_validos = ['en_ejecucion', 'planificado', 'pendiente', 'en_progreso']
+        if proyecto.estado not in estados_validos:
+            return self.error_response(
+                message=f'El proyecto está en estado "{proyecto.estado}". No puede solicitar aprobación en este estado.',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # 2. Si es modo por_items, validar que todos estén completados
+        if proyecto.modo_presupuesto == 'por_items':
+            # Verificar si existen ítems primero
+            if proyecto.total_items == 0:
+                return self.error_response(
+                    message='No puedes solicitar aprobación de un proyecto sin ítems de planificación.',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+
+            items_pendientes = proyecto.items.filter(
+                activo=True
+            ).exclude(estado='completado').count()
+            
+            if items_pendientes > 0:
+                return self.error_response(
+                    message=f'Aún hay {items_pendientes} ítem(s) pendiente(s) de completar',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # 3. Verificar que no haya una aprobación pendiente (se mantiene igual)
+        aprobacion_pendiente = AprobacionGAP.objects.filter(
+            proyecto=proyecto,
+            estado='pendiente',
+            activo=True
+        ).first()
+        
+        if aprobacion_pendiente:
+            return self.error_response(
+                message='Ya existe una solicitud de aprobación pendiente para este proyecto',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # 4. Determinar el validador (CORREGIDO campo asignado_por)
+        validador = proyecto.validador_interno
+        
+        if not validador and proyecto.calculo_nivel:
+            try:
+                asignacion = proyecto.calculo_nivel.asignacion
+                if asignacion:
+                    # ⭐ CAMBIO AQUÍ: 'asignado_por' en lugar de 'creado_por'
+                    validador = asignacion.asignado_por
+            except Exception as e:
+                print(f"Error al buscar validador: {e}")
+        
+        if not validador:
+            return self.error_response(
+                message='No se pudo determinar el validador para este proyecto. Por favor, asígnale un validador interno manualmente.',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ═══ CREAR SOLICITUD DE APROBACIÓN ═══
+        
+        serializer = SolicitarAprobacionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            with transaction.atomic():
+                # Crear aprobación
+                aprobacion = AprobacionGAP.objects.create(
+                    proyecto=proyecto,
+                    solicitado_por=user,
+                    validador=validador,
+                    comentarios_solicitud=serializer.validated_data.get('comentarios', ''),
+                    documentos_adjuntos=serializer.validated_data.get('documentos_adjuntos', []),
+                    items_completados=proyecto.items_completados if proyecto.modo_presupuesto == 'por_items' else 0,
+                    items_totales=proyecto.total_items if proyecto.modo_presupuesto == 'por_items' else 0,
+                    presupuesto_ejecutado=proyecto.presupuesto_total_ejecutado,
+                    presupuesto_planificado=proyecto.presupuesto_total_planificado,
+                    gap_original=proyecto.gap_original,
+                )
+                
+                # Cambiar estado del proyecto
+                proyecto.estado = 'en_validacion'
+                proyecto.save(update_fields=['estado'])
+                
+        except Exception as e:
+            return self.error_response(
+                message=f'Error al crear la solicitud: {str(e)}',
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # ═══ RESPUESTA ═══
+        # Asegúrate de que AprobacionGAPDetailSerializer esté importado arriba
+        output_serializer = AprobacionGAPDetailSerializer(aprobacion)
+        
+        return self.success_response(
+            data=output_serializer.data,
+            message=f'Solicitud de aprobación enviada a {validador.nombre_completo}',
+            status_code=status.HTTP_201_CREATED
+        )
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def aprobar_cierre_gap(self, request, pk=None):
+        """
+        Aprueba el cierre del GAP de un proyecto.
+        POST /api/proyectos-remediacion/{id}/aprobar_cierre_gap/
+        
+        Body:
+        {
+            "observaciones": "Excelente trabajo, todo documentado correctamente"
+        }
+        """
+        proyecto = self.get_object()
+        user = request.user
+        
+        # ═══ VALIDACIONES ═══
+        
+        # 1. Verificar que exista una aprobación pendiente
+        aprobacion = AprobacionGAP.objects.filter(
+            proyecto=proyecto,
+            estado='pendiente',
+            activo=True
+        ).first()
+        
+        if not aprobacion:
+            return self.error_response(
+                message='No hay una solicitud de aprobación pendiente para este proyecto',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # 2. Verificar que el usuario sea el validador
+        if aprobacion.validador != user:
+            return self.error_response(
+                message='No tienes permisos para aprobar esta solicitud',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        # ═══ APROBAR ═══
+        
+        serializer = ResponderAprobacionSerializer(data={
+            'aprobado': True,
+            'observaciones': request.data.get('observaciones', '')
+        })
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            with transaction.atomic():
+                # Actualizar aprobación
+                aprobacion.estado = 'aprobado'
+                aprobacion.fecha_revision = timezone.now()
+                aprobacion.observaciones = serializer.validated_data.get('observaciones', '')
+                aprobacion.save()
+                
+                # Cerrar proyecto
+                proyecto.estado = 'cerrado'
+                proyecto.fecha_fin_real = date.today()
+                proyecto.save(update_fields=['estado', 'fecha_fin_real'])
+                
+                # ⭐ CERRAR GAP (Actualizar CalculoNivel)
+                if proyecto.calculo_nivel:
+                    # Aquí puedes agregar lógica adicional para marcar el GAP como cerrado
+                    # Por ejemplo, agregar un campo `gap_cerrado = True` en CalculoNivel
+                    pass
+                
+                # Crear notificación al solicitante
+                Notificacion.objects.create(
+                    usuario=aprobacion.solicitado_por,
+                    tipo='aprobacion',  # Asegúrate de que este valor esté en Notificacion.TIPOS
+                    titulo=f'✅ GAP aprobado - {proyecto.codigo_proyecto}',
+                    mensaje=(
+                        f'Tu solicitud de cierre de GAP para el proyecto '
+                        f'{proyecto.codigo_proyecto} ha sido APROBADA.'
+                    ),
+                    url_accion=f'/proyectos-remediacion/{proyecto.id}', # ANTES ERA 'url'
+                    datos_adicionales={                                # ANTES ERA 'metadata'
+                        'proyecto_id': str(proyecto.id),
+                        'aprobacion_id': str(aprobacion.id),
+                    }
+                )
+        
+        # CAMBIA ESTO:
+        except Exception as e:
+            # Agrega esta línea para ver el error real en la terminal negra
+            print(f"DEBUG ERROR: {str(e)}") 
+            import traceback
+            traceback.print_exc() # Esto imprimirá el error completo con línea y todo
+            
+            return self.error_response(
+                message=f'Error al aprobar: {str(e)}',
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # ═══ RESPUESTA ═══
+        output_serializer = AprobacionGAPDetailSerializer(aprobacion)
+        
+        return self.success_response(
+            data=output_serializer.data,
+            message='GAP aprobado exitosamente'
+        )
+
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def rechazar_cierre_gap(self, request, pk=None):
+        """
+        Rechaza el cierre del GAP de un proyecto.
+        POST /api/proyectos-remediacion/{id}/rechazar_cierre_gap/
+        
+        Body:
+        {
+            "observaciones": "Falta evidencia de capacitación al personal"
+        }
+        """
+        proyecto = self.get_object()
+        user = request.user
+        
+        # ═══ VALIDACIONES ═══
+        
+        # 1. Verificar que exista una aprobación pendiente
+        aprobacion = AprobacionGAP.objects.filter(
+            proyecto=proyecto,
+            estado='pendiente',
+            activo=True
+        ).first()
+        
+        if not aprobacion:
+            return self.error_response(
+                message='No hay una solicitud de aprobación pendiente para este proyecto',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # 2. Verificar que el usuario sea el validador
+        if aprobacion.validador != user:
+            return self.error_response(
+                message='No tienes permisos para rechazar esta solicitud',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        # ═══ RECHAZAR ═══
+        
+        serializer = ResponderAprobacionSerializer(data={
+            'aprobado': False,
+            'observaciones': request.data.get('observaciones', '')
+        })
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            with transaction.atomic():
+                # Actualizar aprobación
+                aprobacion.estado = 'rechazado'
+                aprobacion.fecha_revision = timezone.now()
+                aprobacion.observaciones = serializer.validated_data['observaciones']
+                aprobacion.save()
+                
+                # Devolver proyecto a ejecución
+                proyecto.estado = 'en_ejecucion'
+                proyecto.save(update_fields=['estado'])
+                
+                # Crear notificación al solicitante
+                Notificacion.objects.create(
+                    usuario=aprobacion.solicitado_por,
+                    tipo='aprobacion',
+                    titulo=f'✅ GAP aprobado - {proyecto.codigo_proyecto}',
+                    mensaje=(
+                        f'Tu solicitud de cierre de GAP para el proyecto '
+                        f'{proyecto.codigo_proyecto} ha sido APROBADA.\n\n'
+                        f'Validador: {user.nombre_completo}\n'
+                        f'Observaciones: {aprobacion.observaciones or "Sin observaciones"}'
+                    ),
+                    url_accion=f'/proyectos-remediacion/{proyecto.id}',
+                    datos_adicionales={
+                        'proyecto_id': str(proyecto.id),
+                        'aprobacion_id': str(aprobacion.id),
+                    }
+                )
+                        
+        except Exception as e:
+            return self.error_response(
+                message=f'Error al rechazar: {str(e)}',
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # ═══ RESPUESTA ═══
+        output_serializer = AprobacionGAPDetailSerializer(aprobacion)
+        
+        return self.success_response(
+            data=output_serializer.data,
+            message='Solicitud rechazada. Se ha notificado al responsable.'
+        )
+
+
+    @action(detail=False, methods=['get'])
+    def aprobaciones_pendientes(self, request):
+        """
+        Obtiene las aprobaciones pendientes del usuario actual.
+        GET /api/proyectos-remediacion/aprobaciones_pendientes/
+        """
+        user = request.user
+        
+        aprobaciones = AprobacionGAP.objects.filter(
+            validador=user,
+            estado='pendiente',
+            activo=True
+        ).select_related(
+            'proyecto',
+            'solicitado_por'
+        ).order_by('-fecha_solicitud')
+        
+        serializer = AprobacionGAPListSerializer(aprobaciones, many=True)
+        
+        return Response({
+            'count': aprobaciones.count(),
+            'aprobaciones': serializer.data
+        })
+
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def completar_item(self, request, pk=None):
+        """
+        Marca un ítem como completado.
+        POST /api/proyectos-remediacion/{id}/completar_item/
+        
+        Body:
+        {
+            "item_id": "uuid-del-item",
+            "observaciones": "Trabajo completado satisfactoriamente"  // opcional
+        }
+        """
+        proyecto = self.get_object()
+        item_id = request.data.get('item_id')
+        
+        if not item_id:
+            return self.error_response(
+                message='El campo item_id es requerido',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            item = ItemProyecto.objects.get(id=item_id, proyecto=proyecto, activo=True)
+        except ItemProyecto.DoesNotExist:
+            return self.error_response(
+                message='Ítem no encontrado',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # ═══ MARCAR COMO COMPLETADO ═══
+        item.estado = 'completado'
+        item.porcentaje_avance = 100
+        item.fecha_completado = date.today()
+        
+        if 'observaciones' in request.data:
+            item.observaciones = request.data['observaciones']
+            item.save(update_fields=['estado', 'porcentaje_avance', 'fecha_completado', 'observaciones'])
+        else:
+            item.save(update_fields=['estado', 'porcentaje_avance', 'fecha_completado'])
+        
+        # ═══ RESPUESTA ═══
+        serializer = ItemProyectoListSerializer(item)
+        
+        return self.success_response(
+            data=serializer.data,
+            message=f'Ítem #{item.numero_item} marcado como completado'
+        )
 
 # ═══════════════════════════════════════════════════════════════
 # VIEWSET PARA ITEMPROYECTO (ALTERNATIVA) ⭐
@@ -860,3 +1346,4 @@ class ItemProyectoViewSet(ResponseMixin, viewsets.ModelViewSet):
             queryset = queryset.filter(estado=estado)
         
         return queryset.order_by('proyecto', 'numero_item')
+    
