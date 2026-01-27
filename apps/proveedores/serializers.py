@@ -112,6 +112,7 @@ class ProveedorCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         # Asignar usuario que está creando
         validated_data['creado_por'] = self.context['request'].user
+        validated_data['activo'] = False
         return super().create(validated_data)
 
 
