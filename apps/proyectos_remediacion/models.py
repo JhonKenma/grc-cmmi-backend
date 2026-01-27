@@ -1,14 +1,16 @@
 # apps/proyectos_remediacion/models.py
 
+from decimal import Decimal
 from django.db import models
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.db.models import Sum
 from apps.core.models import BaseModel
+from apps.proyectos_remediacion.utils.date_utils import agregar_dias_laborables, calcular_dias_laborables_entre_fechas
 from apps.respuestas.models import CalculoNivel
 from apps.empresas.models import Empresa
 from apps.usuarios.models import Usuario
 from apps.encuestas.models import Pregunta
-from datetime import timedelta
+from datetime import date, timedelta
 import uuid
 
 
@@ -622,6 +624,17 @@ class ItemProyecto(BaseModel):
         verbose_name='Avance (%)'
     )
     
+    fecha_completado = models.DateField(
+    null=True,
+    blank=True,
+    verbose_name='Fecha de Completado',
+    help_text='Fecha en que el ítem fue marcado como completado'
+    )
+    observaciones = models.TextField(
+    blank=True,
+    verbose_name='Observaciones'
+    )
+    
     class Meta:
         db_table = 'items_proyecto'
         verbose_name = 'Ítem de Proyecto'
@@ -678,3 +691,322 @@ class ItemProyecto(BaseModel):
         if self.estado not in ['completado']:
             return self.fecha_fin < timezone.now().date()
         return False
+    
+    @property
+    def fecha_fin_estimada(self) -> date:
+        """
+        Calcula la fecha de fin estimada basándose en días laborables.
+        Excluye sábados y domingos.
+        """
+        if not self.fecha_inicio or not self.duracion_dias:
+            return self.fecha_inicio
+        
+        return agregar_dias_laborables(self.fecha_inicio, self.duracion_dias)
+    
+    @property
+    def fecha_fin_real(self) -> date:
+        """
+        Fecha de finalización real del ítem (cuando se completó).
+        Si aún no está completado, retorna None.
+        """
+        if self.estado == 'completado' and self.fecha_completado:
+            return self.fecha_completado
+        return None
+    
+    @property
+    def dias_laborables_transcurridos(self) -> int:
+        """
+        Días laborables transcurridos desde el inicio.
+        """
+        if not self.fecha_inicio:
+            return 0
+        
+        hoy = date.today()
+        
+        # Si ya se completó, usar fecha de completado
+        if self.fecha_completado:
+            fecha_fin = self.fecha_completado
+        else:
+            fecha_fin = hoy
+        
+        return calcular_dias_laborables_entre_fechas(self.fecha_inicio, fecha_fin)
+    
+    @property
+    def dias_laborables_restantes(self) -> int:
+        """
+        Días laborables restantes hasta la fecha fin estimada.
+        """
+        if not self.fecha_inicio or not self.duracion_dias:
+            return 0
+        
+        hoy = date.today()
+        fecha_fin = self.fecha_fin_estimada
+        
+        if hoy >= fecha_fin:
+            return 0
+        
+        return calcular_dias_laborables_entre_fechas(hoy, fecha_fin)
+    
+    @property
+    def esta_retrasado(self) -> bool:
+        """
+        Verifica si el ítem está retrasado (pasó la fecha estimada y no está completado).
+        """
+        if self.estado == 'completado':
+            return False
+        
+        if not self.fecha_inicio or not self.duracion_dias:
+            return False
+        
+        return date.today() > self.fecha_fin_estimada
+    
+    # ═══════════════════════════════════════════════════════════════
+    # ELASTICIDAD DE PRESUPUESTO (10%)
+    # ═══════════════════════════════════════════════════════════════
+    
+    @property
+    def presupuesto_elasticidad(self) -> Decimal:
+        """
+        Margen de elasticidad del presupuesto (10% del presupuesto planificado).
+        """
+        return self.presupuesto_planificado * Decimal('0.10')
+    
+    @property
+    def presupuesto_limite(self) -> Decimal:
+        """
+        Límite máximo de presupuesto permitido (presupuesto + elasticidad).
+        """
+        return self.presupuesto_planificado + self.presupuesto_elasticidad
+    
+    @property
+    def porcentaje_presupuesto_usado(self) -> float:
+        """
+        Porcentaje del presupuesto planificado que se ha utilizado.
+        """
+        if self.presupuesto_planificado <= 0:
+            return 0.0
+        
+        return float((self.presupuesto_ejecutado / self.presupuesto_planificado) * 100)
+    
+    @property
+    def esta_en_elasticidad(self) -> bool:
+        """
+        Verifica si el gasto está dentro del margen de elasticidad (100-110%).
+        """
+        return (
+            self.presupuesto_ejecutado > self.presupuesto_planificado and
+            self.presupuesto_ejecutado <= self.presupuesto_limite
+        )
+    
+    @property
+    def excede_presupuesto_limite(self) -> bool:
+        """
+        Verifica si el gasto ejecutado excede el límite permitido (>110%).
+        """
+        return self.presupuesto_ejecutado > self.presupuesto_limite
+    
+    @property
+    def monto_excedido(self) -> Decimal:
+        """
+        Monto que excede el límite de presupuesto.
+        Retorna 0 si no excede.
+        """
+        if self.excede_presupuesto_limite:
+            return self.presupuesto_ejecutado - self.presupuesto_limite
+        return Decimal('0.00')
+    
+    @property
+    def estado_presupuesto(self) -> str:
+        """
+        Estado del presupuesto del ítem:
+        - 'ok': Dentro del presupuesto planificado (< 100%)
+        - 'elasticidad': En margen de elasticidad (100-110%)
+        - 'excedido': Excede el límite (> 110%)
+        """
+        if self.excede_presupuesto_limite:
+            return 'excedido'
+        elif self.esta_en_elasticidad:
+            return 'elasticidad'
+        else:
+            return 'ok'
+    
+    def __str__(self):
+        return f"#{self.numero_item} - {self.nombre_item} ({self.proyecto.codigo_proyecto})"
+    
+    class Meta:
+        verbose_name = 'Ítem de Proyecto'
+        verbose_name_plural = 'Ítems de Proyecto'
+        ordering = ['proyecto', 'numero_item']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['proyecto', 'numero_item'],
+                name='unique_numero_item_por_proyecto'
+            )
+        ]
+        
+
+class AprobacionGAP(BaseModel):
+    """
+    Modelo para gestionar el workflow de aprobación de cierre de GAP.
+    
+    Cuando un proyecto de remediación se completa, el responsable solicita
+    la aprobación. El validador (dueño de evaluación o validador interno)
+    puede aprobar o rechazar el cierre del GAP.
+    """
+    
+    ESTADOS_CHOICES = [
+        ('pendiente', 'Pendiente'),
+        ('aprobado', 'Aprobado'),
+        ('rechazado', 'Rechazado'),
+    ]
+    
+    # ═══ RELACIONES ═══
+    proyecto = models.ForeignKey(
+        ProyectoCierreBrecha,
+        on_delete=models.CASCADE,
+        related_name='aprobaciones',
+        verbose_name='Proyecto'
+    )
+    
+    solicitado_por = models.ForeignKey(
+        'usuarios.Usuario',
+        on_delete=models.PROTECT,
+        related_name='aprobaciones_solicitadas',
+        verbose_name='Solicitado por'
+    )
+    
+    validador = models.ForeignKey(
+        'usuarios.Usuario',
+        on_delete=models.PROTECT,
+        related_name='aprobaciones_asignadas',
+        verbose_name='Validador',
+        help_text='Usuario que debe aprobar o rechazar'
+    )
+    
+    # ═══ DATOS DE LA SOLICITUD ═══
+    fecha_solicitud = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name='Fecha de solicitud'
+    )
+    
+    comentarios_solicitud = models.TextField(
+        blank=True,
+        verbose_name='Comentarios de la solicitud',
+        help_text='Comentarios del responsable al solicitar la aprobación'
+    )
+    
+    # ═══ DATOS DE LA REVISIÓN ═══
+    estado = models.CharField(
+        max_length=20,
+        choices=ESTADOS_CHOICES,
+        default='pendiente',
+        verbose_name='Estado'
+    )
+    
+    fecha_revision = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Fecha de revisión'
+    )
+    
+    observaciones = models.TextField(
+        blank=True,
+        verbose_name='Observaciones',
+        help_text='Observaciones del validador (requerido si rechaza)'
+    )
+    
+    # ═══ EVIDENCIAS ═══
+    documentos_adjuntos = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name='Documentos adjuntos',
+        help_text='Lista de URLs de documentos de evidencia'
+    )
+    
+    # ═══ MÉTRICAS AL MOMENTO DE LA SOLICITUD ═══
+    items_completados = models.IntegerField(
+        default=0,
+        verbose_name='Ítems completados'
+    )
+    
+    items_totales = models.IntegerField(
+        default=0,
+        verbose_name='Ítems totales'
+    )
+    
+    presupuesto_ejecutado = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name='Presupuesto ejecutado'
+    )
+    
+    presupuesto_planificado = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name='Presupuesto planificado'
+    )
+    
+    gap_original = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        verbose_name='GAP original'
+    )
+    
+    # ═══ PROPIEDADES CALCULADAS ═══
+    
+    @property
+    def esta_pendiente(self) -> bool:
+        """Verifica si la aprobación está pendiente"""
+        return self.estado == 'pendiente'
+    
+    @property
+    def fue_aprobado(self) -> bool:
+        """Verifica si fue aprobado"""
+        return self.estado == 'aprobado'
+    
+    @property
+    def fue_rechazado(self) -> bool:
+        """Verifica si fue rechazado"""
+        return self.estado == 'rechazado'
+    
+    @property
+    def dias_pendiente(self) -> int:
+        """Días que lleva pendiente de revisión"""
+        if self.estado != 'pendiente':
+            return 0
+        
+        from datetime import datetime
+        from django.utils import timezone
+        
+        ahora = timezone.now()
+        delta = ahora - self.fecha_solicitud
+        return delta.days
+    
+    @property
+    def porcentaje_completitud(self) -> float:
+        """Porcentaje de ítems completados"""
+        if self.items_totales == 0:
+            return 0.0
+        return (self.items_completados / self.items_totales) * 100
+    
+    @property
+    def porcentaje_presupuesto_usado(self) -> float:
+        """Porcentaje del presupuesto utilizado"""
+        if self.presupuesto_planificado == 0:
+            return 0.0
+        return float((self.presupuesto_ejecutado / self.presupuesto_planificado) * 100)
+    
+    def __str__(self):
+        return f"Aprobación {self.proyecto.codigo_proyecto} - {self.get_estado_display()}"
+    
+    class Meta:
+        verbose_name = 'Aprobación de GAP'
+        verbose_name_plural = 'Aprobaciones de GAP'
+        ordering = ['-fecha_solicitud']
+        indexes = [
+            models.Index(fields=['estado', 'fecha_solicitud']),
+            models.Index(fields=['validador', 'estado']),
+        ]
