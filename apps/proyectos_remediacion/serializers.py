@@ -15,22 +15,49 @@ from apps.usuarios.serializers import UsuarioListSerializer
 
 
 # ═══════════════════════════════════════════════════════════════
-# SERIALIZERS PARA ITEMPROYECTO (NUEVO)
+# SERIALIZER PARA ITEM PROYECTO (ACTUALIZADO CON NUEVOS CAMPOS)
 # ═══════════════════════════════════════════════════════════════
 
 class ItemProyectoListSerializer(serializers.ModelSerializer):
     """
-    Serializer para listado de ítems
+    Serializer para listar ítems (actualizado con fechas laborables y elasticidad)
     """
-    responsable_nombre = serializers.CharField(source='responsable_ejecucion.nombre_completo', read_only=True)
-    proveedor_nombre = serializers.CharField(source='proveedor.razon_social', read_only=True, allow_null=True)
-    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
     
-    # Propiedades calculadas
-    diferencia_presupuesto = serializers.ReadOnlyField()
+    proveedor_nombre = serializers.CharField(
+        source='proveedor.razon_social',
+        read_only=True,
+        allow_null=True
+    )
+    
+    responsable_nombre = serializers.CharField(
+        source='responsable_ejecucion.nombre_completo',
+        read_only=True,
+        allow_null=True
+    )
+    
+    item_dependencia_numero = serializers.IntegerField(
+        source='item_dependencia.numero_item',
+        read_only=True,
+        allow_null=True
+    )
+    
+    # ⭐ NUEVOS CAMPOS CALCULADOS
+    fecha_fin_estimada = serializers.ReadOnlyField()
+    dias_laborables_restantes = serializers.ReadOnlyField()
+    esta_retrasado = serializers.ReadOnlyField()
+    
+    # ⭐ ELASTICIDAD DE PRESUPUESTO
+    presupuesto_elasticidad = serializers.ReadOnlyField()
+    presupuesto_limite = serializers.ReadOnlyField()
+    porcentaje_presupuesto_usado = serializers.ReadOnlyField()
+    esta_en_elasticidad = serializers.ReadOnlyField()
+    excede_presupuesto_limite = serializers.ReadOnlyField()
+    monto_excedido = serializers.ReadOnlyField()
+    estado_presupuesto = serializers.ReadOnlyField()
+    
+    # Campos existentes
     puede_iniciar = serializers.ReadOnlyField()
-    dias_restantes = serializers.ReadOnlyField()
-    esta_vencido = serializers.ReadOnlyField()
+    estado_dependencia = serializers.ReadOnlyField()
     
     class Meta:
         model = ItemProyecto
@@ -47,20 +74,30 @@ class ItemProyectoListSerializer(serializers.ModelSerializer):
             'responsable_nombre',
             'presupuesto_planificado',
             'presupuesto_ejecutado',
-            'diferencia_presupuesto',
+            'presupuesto_elasticidad',  # ⭐ NUEVO
+            'presupuesto_limite',  # ⭐ NUEVO
+            'porcentaje_presupuesto_usado',  # ⭐ NUEVO
+            'esta_en_elasticidad',  # ⭐ NUEVO
+            'excede_presupuesto_limite',  # ⭐ NUEVO
+            'monto_excedido',  # ⭐ NUEVO
+            'estado_presupuesto',  # ⭐ NUEVO
             'fecha_inicio',
             'duracion_dias',
-            'fecha_fin',
+            'fecha_fin_estimada',  # ⭐ NUEVO (calculado con días laborables)
+            'dias_laborables_restantes',  # ⭐ NUEVO
+            'esta_retrasado',  # ⭐ NUEVO
             'tiene_dependencia',
             'item_dependencia',
+            'item_dependencia_numero',
             'estado',
-            'estado_display',
             'porcentaje_avance',
             'puede_iniciar',
-            'dias_restantes',
-            'esta_vencido',
+            'estado_dependencia',
+            'fecha_completado',
+            'observaciones',
             'fecha_creacion',
         ]
+
 
 
 class ItemProyectoDetailSerializer(serializers.ModelSerializer):
@@ -318,7 +355,7 @@ class ProyectoCierreBrechaListSerializer(serializers.ModelSerializer):
     prioridad_display = serializers.CharField(source='get_prioridad_display', read_only=True)
     categoria_display = serializers.CharField(source='get_categoria_display', read_only=True)
     modo_presupuesto_display = serializers.CharField(source='get_modo_presupuesto_display', read_only=True)
-    
+    evaluacion_id = serializers.SerializerMethodField()
     # Propiedades calculadas
     dias_restantes = serializers.ReadOnlyField()
     dias_transcurridos = serializers.ReadOnlyField()
@@ -351,6 +388,7 @@ class ProyectoCierreBrechaListSerializer(serializers.ModelSerializer):
             'dueno_nombre',
             'responsable_nombre',
             'fecha_inicio',
+            'evaluacion_id',
             'fecha_fin_estimada',
             'dias_restantes',
             'dias_transcurridos',
@@ -364,7 +402,25 @@ class ProyectoCierreBrechaListSerializer(serializers.ModelSerializer):
             'porcentaje_avance_items',
             'fecha_creacion',
         ]
-
+        
+    def get_evaluacion_id(self, obj):
+        """Obtener ID de la evaluación desde calculo_nivel"""
+        try:
+            if obj.calculo_nivel:
+                # Intenta obtener desde el campo directo
+                if hasattr(obj.calculo_nivel, 'evaluacion') and obj.calculo_nivel.evaluacion:
+                    return str(obj.calculo_nivel.evaluacion.id)
+                
+                # Si no existe, intenta desde asignación
+                if hasattr(obj.calculo_nivel, 'asignacion') and obj.calculo_nivel.asignacion:
+                    if hasattr(obj.calculo_nivel.asignacion, 'encuesta') and obj.calculo_nivel.asignacion.encuesta:
+                        return str(obj.calculo_nivel.asignacion.encuesta.id)
+        except Exception as e:
+            # Loggear el error si quieres debuggear
+            # print(f"Error obteniendo evaluacion_id: {e}")
+            pass
+        
+        return None
 
 class ProyectoCierreBrechaDetailSerializer(serializers.ModelSerializer):
     """
@@ -742,3 +798,162 @@ class ProyectoSimpleSerializer(serializers.ModelSerializer):
             'modo_presupuesto',
             'modo_presupuesto_display',
         ]
+        
+# SERIALIZERS nuevos agregados para ítems con nuevos campos y aprobaciones GAP
+
+from apps.proyectos_remediacion.models import AprobacionGAP
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# SERIALIZERS PARA APROBACIÓN DE GAP
+# ═══════════════════════════════════════════════════════════════
+
+class AprobacionGAPListSerializer(serializers.ModelSerializer):
+    """
+    Serializer para listar aprobaciones
+    """
+    
+    proyecto_codigo = serializers.CharField(source='proyecto.codigo_proyecto', read_only=True)
+    proyecto_nombre = serializers.CharField(source='proyecto.nombre_proyecto', read_only=True)
+    solicitado_por_nombre = serializers.CharField(source='solicitado_por.nombre_completo', read_only=True)
+    validador_nombre = serializers.CharField(source='validador.nombre_completo', read_only=True)
+    
+    # Campos calculados
+    esta_pendiente = serializers.ReadOnlyField()
+    dias_pendiente = serializers.ReadOnlyField()
+    porcentaje_completitud = serializers.ReadOnlyField()
+    porcentaje_presupuesto_usado = serializers.ReadOnlyField()
+    
+    class Meta:
+        model = AprobacionGAP
+        fields = [
+            'id',
+            'proyecto',
+            'proyecto_codigo',
+            'proyecto_nombre',
+            'solicitado_por',
+            'solicitado_por_nombre',
+            'validador',
+            'validador_nombre',
+            'fecha_solicitud',
+            'estado',
+            'fecha_revision',
+            'esta_pendiente',
+            'dias_pendiente',
+            'items_completados',
+            'items_totales',
+            'porcentaje_completitud',
+            'presupuesto_ejecutado',
+            'presupuesto_planificado',
+            'porcentaje_presupuesto_usado',
+            'gap_original',
+            'fecha_creacion',
+        ]
+
+
+class AprobacionGAPDetailSerializer(serializers.ModelSerializer):
+    """
+    Serializer detallado para una aprobación
+    """
+    
+    proyecto_info = ProyectoCierreBrechaDetailSerializer(source='proyecto', read_only=True)
+    solicitado_por_info = serializers.SerializerMethodField()
+    validador_info = serializers.SerializerMethodField()
+    
+    # Campos calculados
+    esta_pendiente = serializers.ReadOnlyField()
+    fue_aprobado = serializers.ReadOnlyField()
+    fue_rechazado = serializers.ReadOnlyField()
+    dias_pendiente = serializers.ReadOnlyField()
+    porcentaje_completitud = serializers.ReadOnlyField()
+    porcentaje_presupuesto_usado = serializers.ReadOnlyField()
+    
+    class Meta:
+        model = AprobacionGAP
+        fields = [
+            'id',
+            'proyecto',
+            'proyecto_info',
+            'solicitado_por',
+            'solicitado_por_info',
+            'validador',
+            'validador_info',
+            'fecha_solicitud',
+            'comentarios_solicitud',
+            'estado',
+            'fecha_revision',
+            'observaciones',
+            'documentos_adjuntos',
+            'items_completados',
+            'items_totales',
+            'presupuesto_ejecutado',
+            'presupuesto_planificado',
+            'gap_original',
+            'esta_pendiente',
+            'fue_aprobado',
+            'fue_rechazado',
+            'dias_pendiente',
+            'porcentaje_completitud',
+            'porcentaje_presupuesto_usado',
+            'fecha_creacion',
+        ]
+    
+    def get_solicitado_por_info(self, obj):
+        return {
+            'id': str(obj.solicitado_por.id),
+            'nombre_completo': obj.solicitado_por.nombre_completo,
+            'email': obj.solicitado_por.email,
+        }
+    
+    def get_validador_info(self, obj):
+        return {
+            'id': str(obj.validador.id),
+            'nombre_completo': obj.validador.nombre_completo,
+            'email': obj.validador.email,
+        }
+
+
+class SolicitarAprobacionSerializer(serializers.Serializer):
+    """
+    Serializer para solicitar la aprobación de cierre de GAP
+    """
+    
+    comentarios = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='Comentarios opcionales al solicitar la aprobación'
+    )
+    
+    documentos_adjuntos = serializers.ListField(
+        child=serializers.URLField(),
+        required=False,
+        allow_empty=True,
+        help_text='URLs de documentos de evidencia'
+    )
+
+
+class ResponderAprobacionSerializer(serializers.Serializer):
+    """
+    Serializer para aprobar o rechazar una solicitud
+    """
+    
+    aprobado = serializers.BooleanField(
+        help_text='True para aprobar, False para rechazar'
+    )
+    
+    observaciones = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='Observaciones del validador (requerido si rechaza)'
+    )
+    
+    def validate(self, attrs):
+        # Si rechaza, las observaciones son obligatorias
+        if not attrs.get('aprobado') and not attrs.get('observaciones'):
+            raise serializers.ValidationError({
+                'observaciones': 'Las observaciones son obligatorias al rechazar'
+            })
+        
+        return attrs
+    
