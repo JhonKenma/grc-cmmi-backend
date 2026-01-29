@@ -295,3 +295,108 @@ class PlantillaNotificacionSerializer(serializers.ModelSerializer):
             'prioridad_default', 'activo', 'fecha_creacion', 'fecha_actualizacion'
         ]
         read_only_fields = ['id', 'fecha_creacion', 'fecha_actualizacion']
+        
+# ═══════════════════════════════════════════════════════════════
+# SERIALIZERS PARA ENVÍO DE NOTIFICACIONES PERSONALIZADAS ⭐
+# ═══════════════════════════════════════════════════════════════
+
+class EnviarNotificacionSerializer(serializers.Serializer):
+    """
+    Serializer para enviar notificaciones personalizadas
+    
+    SuperAdmin puede enviar a:
+    - Un usuario específico
+    - Todos los usuarios de una empresa
+    - Todos los administradores
+    - Todos los usuarios
+    
+    Administrador puede enviar a:
+    - Usuarios de su propia empresa
+    """
+    
+    # Destinatarios (al menos uno requerido)
+    usuario_id = serializers.IntegerField(
+        required=False,
+        help_text='ID del usuario destinatario (individual)'
+    )
+    empresa_id = serializers.IntegerField(
+        required=False,
+        help_text='ID de la empresa (todos los usuarios de esa empresa)'
+    )
+    enviar_a_todos_admins = serializers.BooleanField(
+        default=False,
+        help_text='Enviar a todos los administradores del sistema'
+    )
+    enviar_a_todos = serializers.BooleanField(
+        default=False,
+        help_text='Enviar a todos los usuarios (solo SuperAdmin)'
+    )
+    
+    # Contenido
+    tipo = serializers.ChoiceField(
+        choices=[
+            ('mensaje_personalizado', 'Mensaje Personalizado'),
+            ('anuncio', 'Anuncio'),
+            ('sistema', 'Sistema'),
+        ],
+        default='mensaje_personalizado'
+    )
+    titulo = serializers.CharField(
+        max_length=255,
+        help_text='Título de la notificación'
+    )
+    mensaje = serializers.CharField(
+        help_text='Mensaje completo de la notificación'
+    )
+    
+    # Opcionales
+    prioridad = serializers.ChoiceField(
+        choices=Notificacion.PRIORIDADES,
+        default='normal'
+    )
+    url_accion = serializers.URLField(
+        required=False,
+        allow_blank=True,
+        help_text='URL a la que redirigir (puede ser deep link para móvil)'
+    )
+    enviar_email = serializers.BooleanField(
+        default=True,
+        help_text='Si debe enviar email además de notificación interna'
+    )
+    
+    def validate(self, data):
+        """Validar que al menos un destinatario esté especificado"""
+        tiene_destinatario = any([
+            data.get('usuario_id'),
+            data.get('empresa_id'),
+            data.get('enviar_a_todos_admins'),
+            data.get('enviar_a_todos')
+        ])
+        
+        if not tiene_destinatario:
+            raise serializers.ValidationError(
+                'Debe especificar al menos un destinatario: '
+                'usuario_id, empresa_id, enviar_a_todos_admins o enviar_a_todos'
+            )
+        
+        return data
+
+
+class HistorialNotificacionesSerializer(serializers.Serializer):
+    """
+    Serializer para obtener historial de notificaciones
+    """
+    periodo = serializers.ChoiceField(
+        choices=[
+            ('nuevas', 'Nuevas (no leídas)'),
+            ('semana', 'Última semana'),
+            ('mes', 'Último mes'),
+            ('todas', 'Todas'),
+        ],
+        default='nuevas'
+    )
+    limite = serializers.IntegerField(
+        default=50,
+        min_value=1,
+        max_value=200
+    )
