@@ -19,6 +19,15 @@ class Notificacion(BaseModel):
         ('comentario', 'Nuevo Comentario'),
         ('aprobacion', 'Solicitud de Aprobación'),
         ('sistema', 'Notificación del Sistema'),
+        
+        # Aprobaciones de GAP
+        ('proyecto_en_validacion', 'Proyecto en Validación'),
+        ('gap_aprobado', 'GAP Aprobado'),
+        ('gap_rechazado', 'GAP Rechazado'),
+        
+        # ⭐ NUEVO: Notificaciones personalizadas
+        ('mensaje_personalizado', 'Mensaje Personalizado'),
+        ('anuncio', 'Anuncio'),
     ]
     
     PRIORIDADES = [
