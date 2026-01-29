@@ -1,12 +1,18 @@
 # apps/notificaciones/views.py
+from datetime import timedelta, timezone
+from venv import logger
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.core.mail import send_mail
 from django.conf import settings
+from django.db.models import Count, Q
+
+from apps.usuarios.models import Usuario
 from .models import Notificacion, PlantillaNotificacion
 from .serializers import (
+    EnviarNotificacionSerializer,
     NotificacionSerializer,
     NotificacionDetalleSerializer,  # ⭐ NUEVO
     NotificacionListSerializer,
@@ -15,8 +21,9 @@ from .serializers import (
 )
 from .services import NotificacionService
 from apps.core.mixins import ResponseMixin
-from apps.core.permissions import EsAdminOSuperAdmin
-
+from apps.core.permissions import EsAdminOSuperAdmin, EsSuperAdmin
+from datetime import timedelta
+from django.utils import timezone
 
 class NotificacionViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
     """
@@ -492,6 +499,401 @@ class NotificacionViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+    @action(detail=False, methods=['post'], url_path='enviar-personalizada', permission_classes=[IsAuthenticated, EsAdminOSuperAdmin])
+    def enviar_personalizada(self, request):
+        """
+        Enviar notificación personalizada a usuarios
+        
+        POST /api/notificaciones/enviar-personalizada/
+        
+        Permisos:
+        - SuperAdmin: Puede enviar a cualquier usuario/empresa
+        - Administrador: Solo puede enviar a usuarios de su empresa
+        
+        Body:
+        {
+            // DESTINATARIOS (al menos uno requerido):
+            "usuario_id": 123,                    // Un usuario específico
+            "empresa_id": 456,                    // Todos los usuarios de una empresa
+            "enviar_a_todos_admins": true,       // Todos los administradores
+            "enviar_a_todos": true,              // Todos los usuarios (solo SuperAdmin)
+            
+            // CONTENIDO:
+            "tipo": "mensaje_personalizado",     // o "anuncio"
+            "titulo": "Importante: Mantenimiento del Sistema",
+            "mensaje": "El sistema estará en mantenimiento...",
+            "prioridad": "alta",                 // baja, normal, alta, urgente
+            "url_accion": "https://app.example.com/anuncios/123",
+            "enviar_email": true
+        }
+        
+        Response:
+        {
+            "success": true,
+            "message": "Notificación enviada exitosamente",
+            "data": {
+                "usuarios_notificados": 15,
+                "emails_enviados": 15,
+                "destinatarios": [
+                    {"id": 1, "nombre": "Juan Pérez", "email": "juan@example.com"},
+                    ...
+                ]
+            }
+        }
+        """
+        serializer = EnviarNotificacionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        data = serializer.validated_data
+        user = request.user
+        
+        # ═══ DETERMINAR DESTINATARIOS ═══
+        destinatarios = []
+        
+        # 1. Usuario individual
+        if data.get('usuario_id'):
+            try:
+                usuario = Usuario.objects.get(id=data['usuario_id'], activo=True)
+                
+                # Validar permisos
+                if user.rol == 'administrador':
+                    if usuario.empresa != user.empresa:
+                        return self.error_response(
+                            message='No tienes permisos para enviar notificaciones a usuarios de otras empresas',
+                            status_code=status.HTTP_403_FORBIDDEN
+                        )
+                
+                destinatarios.append(usuario)
+            except Usuario.DoesNotExist:
+                return self.error_response(
+                    message='Usuario no encontrado',
+                    status_code=status.HTTP_404_NOT_FOUND
+                )
+        
+        # 2. Todos los usuarios de una empresa
+        if data.get('empresa_id'):
+            if user.rol == 'administrador':
+                if user.empresa and user.empresa.id != data['empresa_id']:
+                    return self.error_response(
+                        message='Solo puedes enviar notificaciones a tu propia empresa',
+                        status_code=status.HTTP_403_FORBIDDEN
+                    )
+            
+            usuarios_empresa = Usuario.objects.filter(
+                empresa_id=data['empresa_id'],
+                activo=True
+            )
+            destinatarios.extend(list(usuarios_empresa))
+        
+        # 3. Todos los administradores
+        if data.get('enviar_a_todos_admins'):
+            if user.rol == 'administrador':
+                # Admin solo puede enviar a admins de su empresa
+                admins = Usuario.objects.filter(
+                    rol='administrador',
+                    empresa=user.empresa,
+                    activo=True
+                )
+            else:
+                # SuperAdmin puede enviar a todos los admins
+                admins = Usuario.objects.filter(
+                    rol='administrador',
+                    activo=True
+                )
+            destinatarios.extend(list(admins))
+        
+        # 4. Todos los usuarios (solo SuperAdmin)
+        if data.get('enviar_a_todos'):
+            if user.rol != 'superadmin':
+                return self.error_response(
+                    message='Solo SuperAdmin puede enviar notificaciones a todos los usuarios',
+                    status_code=status.HTTP_403_FORBIDDEN
+                )
+            
+            todos = Usuario.objects.filter(activo=True)
+            destinatarios.extend(list(todos))
+        
+        # Eliminar duplicados
+        destinatarios = list(set(destinatarios))
+        
+        if not destinatarios:
+            return self.error_response(
+                message='No se encontraron destinatarios válidos',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ═══ CREAR NOTIFICACIONES ═══
+        notificaciones_creadas = []
+        emails_enviados = 0
+        
+        for destinatario in destinatarios:
+            try:
+                notificacion = NotificacionService.crear_notificacion(
+                    usuario=destinatario,
+                    tipo=data['tipo'],
+                    titulo=data['titulo'],
+                    mensaje=data['mensaje'],
+                    prioridad=data['prioridad'],
+                    url_accion=data.get('url_accion', ''),
+                    datos_adicionales={
+                        'enviado_por': user.nombre_completo,
+                        'enviado_por_id': user.id,
+                        'fecha_envio': timezone.now().isoformat(),
+                    },
+                    enviar_email=data['enviar_email']
+                )
+                notificaciones_creadas.append(notificacion)
+                
+                if notificacion.email_enviado:
+                    emails_enviados += 1
+                    
+            except Exception as e:
+                logger.error(f"Error al enviar notificación a {destinatario.email}: {str(e)}")
+                continue
+        
+        # ═══ RESPUESTA ═══
+        return self.success_response(
+            data={
+                'usuarios_notificados': len(notificaciones_creadas),
+                'emails_enviados': emails_enviados,
+                'destinatarios': [
+                    {
+                        'id': d.id,
+                        'nombre': d.nombre_completo,
+                        'email': d.email,
+                        'rol': d.rol
+                    }
+                    for d in destinatarios
+                ]
+            },
+            message=f'Notificación enviada exitosamente a {len(notificaciones_creadas)} usuario(s)'
+        )
+
+
+    @action(detail=False, methods=['get'], url_path='historial')
+    def historial(self, request):
+        """
+        Obtener historial de notificaciones con filtros
+        
+        GET /api/notificaciones/historial/?periodo=nuevas&limite=50
+        
+        Parámetros:
+        - periodo: nuevas | semana | mes | todas (default: nuevas)
+        - limite: cantidad máxima (default: 50, max: 200)
+        
+        Periodos:
+        - nuevas: No leídas
+        - semana: Leídas en los últimos 7 días
+        - mes: Leídas en los últimos 30 días
+        - todas: Todas las notificaciones
+        
+        Response:
+        {
+            "success": true,
+            "data": {
+                "periodo": "semana",
+                "total": 15,
+                "nuevas": 5,
+                "leidas": 10,
+                "notificaciones": [...]
+            }
+        }
+        """
+        periodo = request.query_params.get('periodo', 'nuevas')
+        limite = int(request.query_params.get('limite', 50))
+        limite = min(limite, 200)  # Máximo 200
+        
+        user = request.user
+        queryset = Notificacion.objects.filter(
+            usuario=user,
+            activo=True
+        ).select_related('usuario').order_by('-fecha_creacion')
+        
+        # ═══ APLICAR FILTROS POR PERIODO ═══
+        ahora = timezone.now()
+        
+        if periodo == 'nuevas':
+            # Solo no leídas
+            queryset = queryset.filter(leida=False)
+        
+        elif periodo == 'semana':
+            # Leídas en los últimos 7 días
+            hace_semana = ahora - timedelta(days=7)
+            queryset = queryset.filter(
+                Q(leida=False) |  # Incluir no leídas también
+                Q(leida=True, fecha_leida__gte=hace_semana)
+            )
+        
+        elif periodo == 'mes':
+            # Leídas en los últimos 30 días
+            hace_mes = ahora - timedelta(days=30)
+            queryset = queryset.filter(
+                Q(leida=False) |  # Incluir no leídas también
+                Q(leida=True, fecha_leida__gte=hace_mes)
+            )
+        
+        elif periodo == 'todas':
+            # Todas (sin filtro adicional)
+            pass
+        
+        # ═══ LIMITAR RESULTADOS ═══
+        total = queryset.count()
+        notificaciones = queryset[:limite]
+        
+        # ═══ CONTAR NUEVAS Y LEÍDAS ═══
+        nuevas = queryset.filter(leida=False).count()
+        leidas = queryset.filter(leida=True).count()
+        
+        # ═══ SERIALIZAR ═══
+        serializer = NotificacionListSerializer(notificaciones, many=True)
+        
+        return self.success_response(
+            data={
+                'periodo': periodo,
+                'total': total,
+                'mostrando': len(notificaciones),
+                'nuevas': nuevas,
+                'leidas': leidas,
+                'notificaciones': serializer.data
+            }
+        )
+
+
+    @action(detail=False, methods=['get'], url_path='estadisticas')
+    def estadisticas(self, request):
+        """
+        Estadísticas de notificaciones del usuario
+        
+        GET /api/notificaciones/estadisticas/
+        
+        Response:
+        {
+            "success": true,
+            "data": {
+                "total": 50,
+                "nuevas": 5,
+                "leidas_semana": 10,
+                "leidas_mes": 20,
+                "por_tipo": {
+                    "mensaje_personalizado": 15,
+                    "asignacion_evaluacion": 10,
+                    ...
+                },
+                "por_prioridad": {
+                    "urgente": 2,
+                    "alta": 8,
+                    "normal": 35,
+                    "baja": 5
+                }
+            }
+        }
+        """
+        user = request.user
+        ahora = timezone.now()
+        
+        queryset = Notificacion.objects.filter(usuario=user, activo=True)
+        
+        # Contadores
+        total = queryset.count()
+        nuevas = queryset.filter(leida=False).count()
+        
+        hace_semana = ahora - timedelta(days=7)
+        leidas_semana = queryset.filter(
+            leida=True,
+            fecha_leida__gte=hace_semana
+        ).count()
+        
+        hace_mes = ahora - timedelta(days=30)
+        leidas_mes = queryset.filter(
+            leida=True,
+            fecha_leida__gte=hace_mes
+        ).count()
+        
+        # Por tipo
+        from django.db.models import Count
+        por_tipo = dict(
+            queryset.values_list('tipo').annotate(count=Count('tipo'))
+        )
+        
+        # Por prioridad
+        por_prioridad = dict(
+            queryset.values_list('prioridad').annotate(count=Count('prioridad'))
+        )
+        
+        return self.success_response(
+            data={
+                'total': total,
+                'nuevas': nuevas,
+                'leidas_semana': leidas_semana,
+                'leidas_mes': leidas_mes,
+                'por_tipo': por_tipo,
+                'por_prioridad': por_prioridad
+            }
+        )
+
+    @action(detail=False, methods=['get'], url_path='usuarios-disponibles', permission_classes=[IsAuthenticated, EsAdminOSuperAdmin])
+    def usuarios_disponibles(self, request):
+        """
+        Obtener lista de usuarios para enviar notificaciones
+        GET /api/notificaciones/usuarios-disponibles/
+        
+        Admin: Solo ve usuarios de su empresa
+        SuperAdmin: Ve todos los usuarios
+        """
+        user = request.user
+        
+        # Filtrar según rol
+        if user.rol == 'superadmin':
+            usuarios = Usuario.objects.filter(activo=True).select_related('empresa')
+        elif user.rol == 'administrador':
+            if user.empresa:
+                usuarios = Usuario.objects.filter(empresa=user.empresa, activo=True).select_related('empresa')
+            else:
+                usuarios = Usuario.objects.none()
+        else:
+            return self.error_response(
+                message='No tienes permisos para acceder a esta lista',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Construir lista de usuarios
+        usuarios_list = []
+        for u in usuarios:
+            usuario_dict = {
+                'id': u.id,
+                'nombre_completo': u.nombre_completo,
+                'email': u.email,
+                'rol': u.rol,
+            }
+            
+            if u.empresa:
+                usuario_dict['empresa_info'] = {
+                    'id': u.empresa.id,
+                    'nombre': u.empresa.nombre
+                }
+            
+            usuarios_list.append(usuario_dict)
+        
+        return self.success_response(
+            data=usuarios_list
+        )
+
+
+    @action(detail=False, methods=['get'], url_path='empresas-disponibles', permission_classes=[IsAuthenticated, EsSuperAdmin])
+    def empresas_disponibles(self, request):
+        """
+        Obtener lista de empresas (solo SuperAdmin)
+        GET /api/notificaciones/empresas-disponibles/
+        """
+        from apps.empresas.models import Empresa
+        
+        empresas = Empresa.objects.filter(activo=True).values('id', 'nombre', 'ruc')
+        
+        return self.success_response(
+            data=list(empresas)
+        )
+
+
 class PlantillaNotificacionViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para gestión de plantillas de notificaciones
@@ -534,3 +936,5 @@ class PlantillaNotificacionViewSet(ResponseMixin, viewsets.ModelViewSet):
                 errors=str(e),
                 status_code=status.HTTP_400_BAD_REQUEST
             )
+            
+            
