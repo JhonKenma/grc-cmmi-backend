@@ -23,7 +23,7 @@ from io import BytesIO
 from datetime import datetime
 
 from django.db.models import Avg
-
+from .exporters import PDFExporter, ExcelExporter
 
 
 class ReporteViewSet(viewsets.ViewSet):
@@ -271,34 +271,6 @@ class ReporteViewSet(viewsets.ViewSet):
                 'distribucion_respuestas': self._calcular_distribucion_respuestas(calculos),
             }
             
-            # ========================================================
-            # 📤 LOG CRÍTICO - AGREGAR AQUÍ
-            # ========================================================
-            print("\n" + "="*60)
-            print("📤 VERIFICACIÓN FINAL ANTES DE ENVIAR AL FRONTEND:")
-            print("="*60)
-            
-            for dim in reporte['por_dimension']:
-                print(f"\n✅ {dim['dimension']['nombre']}:")
-                print(f"   total_proyectos: {dim.get('total_proyectos', '❌ MISSING')}")
-                print(f"   tiene_proyecto_activo: {dim.get('tiene_proyecto_activo', '❌ MISSING')}")
-                print(f"   proyecto_id: {dim.get('proyecto_id', '❌ MISSING')}")
-                print(f"   total_usuarios: {len(dim.get('usuarios', []))}")
-            
-            print("\n" + "="*60)
-            print("📤 ESTRUCTURA COMPLETA (primer dimension):")
-            import json
-            if reporte['por_dimension']:
-                primer_dim = reporte['por_dimension'][0]
-                print(json.dumps({
-                    'dimension': primer_dim['dimension'],
-                    'total_proyectos': primer_dim.get('total_proyectos', 'MISSING'),
-                    'total_usuarios': len(primer_dim.get('usuarios', [])),
-                    'keys': list(primer_dim.keys())
-                }, indent=2, default=str))
-            print("="*60 + "\n")
-            # ========================================================
-            
             return self.success_response(
                 data=reporte,
                 message='Reporte de evaluación generado exitosamente'
@@ -387,11 +359,6 @@ class ReporteViewSet(viewsets.ViewSet):
                 estado__in=['planificado', 'en_ejecucion', 'en_validacion'],
                 activo=True
             ).first()
-            
-            print(f"🔍 Dimensión {dimension.nombre}:")
-            print(f"  - Total cálculos: {len(calculos_ids)}")
-            print(f"  - Total proyectos: {total_proyectos}")
-            print(f"  - IDs cálculos: {calculos_ids}")
             
             # --- ESTADÍSTICAS AGREGADAS ---
             stats = calculos_dim.aggregate(
@@ -800,6 +767,110 @@ class ReporteViewSet(viewsets.ViewSet):
             response['Content-Disposition'] = f'attachment; filename="{filename}"'
             
             return response
+        
+        except EvaluacionEmpresa.DoesNotExist:
+            return self.error_response(
+                message='Evaluación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return self.error_response(
+                message='Error al generar Excel',
+                errors=str(e),
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+            
+    @action(detail=False, methods=['get'])
+    def export_pdf_evaluacion(self, request):
+        """
+        Exportar PDF del reporte de evaluación
+        GET /api/reportes/export_pdf_evaluacion/?evaluacion_empresa_id=xxx
+        """
+        evaluacion_empresa_id = request.query_params.get('evaluacion_empresa_id')
+        
+        if not evaluacion_empresa_id:
+            return self.error_response(
+                message='evaluacion_empresa_id es requerido',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            from apps.encuestas.models import EvaluacionEmpresa
+            evaluacion = EvaluacionEmpresa.objects.select_related(
+                'encuesta', 'empresa', 'administrador'
+            ).get(id=evaluacion_empresa_id)
+            
+            # Validar permisos
+            user = request.user
+            if user.rol == 'administrador' and evaluacion.administrador != user:
+                return self.error_response(
+                    message='No tienes permiso para exportar esta evaluación',
+                    status_code=status.HTTP_403_FORBIDDEN
+                )
+            
+            # Obtener cálculos
+            calculos = CalculoNivel.objects.filter(
+                evaluacion_empresa=evaluacion,
+                activo=True
+            ).select_related('dimension', 'usuario', 'asignacion')
+            
+            # ⭐ USAR EL EXPORTADOR (TODO EL CÓDIGO ESTÁ EN pdf_exporter.py)
+            exporter = PDFExporter(evaluacion, calculos)
+            return exporter.export()
+        
+        except EvaluacionEmpresa.DoesNotExist:
+            return self.error_response(
+                message='Evaluación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return self.error_response(
+                message='Error al generar PDF',
+                errors=str(e),
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def export_excel_completo(self, request):
+        """
+        Exportar Excel completo con todas las hojas
+        GET /api/reportes/export_excel_completo/?evaluacion_empresa_id=xxx
+        """
+        evaluacion_empresa_id = request.query_params.get('evaluacion_empresa_id')
+        
+        if not evaluacion_empresa_id:
+            return self.error_response(
+                message='evaluacion_empresa_id es requerido',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            from apps.encuestas.models import EvaluacionEmpresa
+            evaluacion = EvaluacionEmpresa.objects.select_related(
+                'encuesta', 'empresa', 'administrador'
+            ).get(id=evaluacion_empresa_id)
+            
+            # Validar permisos
+            user = request.user
+            if user.rol == 'administrador' and evaluacion.administrador != user:
+                return self.error_response(
+                    message='No tienes permiso para exportar esta evaluación',
+                    status_code=status.HTTP_403_FORBIDDEN
+                )
+            
+            # Obtener cálculos
+            calculos = CalculoNivel.objects.filter(
+                evaluacion_empresa=evaluacion,
+                activo=True
+            ).select_related('dimension', 'usuario', 'asignacion')
+            
+            # ⭐ USAR EL EXPORTADOR (TODO EL CÓDIGO ESTÁ EN excel_exporter.py)
+            exporter = ExcelExporter(evaluacion, calculos)
+            return exporter.export()
         
         except EvaluacionEmpresa.DoesNotExist:
             return self.error_response(
