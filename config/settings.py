@@ -315,9 +315,9 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase inyectado en settings correctamente")
+        print("Supabase inyectado en settings correctamente")
     except Exception as e:
-        print(f"❌ Error crítico en settings: {e}")
+        print(f"Error critico en settings: {e}")
         
         
 # ═══════════════════════════════════════════════════════
