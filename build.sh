@@ -7,11 +7,11 @@ pip install -r requirements.txt
 echo "📦 Recolectando archivos estáticos..."
 python manage.py collectstatic --no-input
 
-echo "🔄 Limpiando registros de migraciones de proveedores..."
-python manage.py migrate --fake proveedores zero || echo "⚠️ No se pudo hacer fake zero"
+echo "🔄 Marcando migraciones de proveedores como aplicadas..."
+python manage.py migrate proveedores --fake-initial
 
-echo "🗄️ Ejecutando migraciones..."
-python manage.py migrate --run-syncdb
+echo "🗄️ Ejecutando migraciones restantes..."
+python manage.py migrate
 
 echo "👤 Creando superusuario (si no existe)..."
 python manage.py crear_superadmin --no-input
