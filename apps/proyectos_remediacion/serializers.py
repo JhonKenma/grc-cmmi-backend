@@ -128,9 +128,12 @@ class ItemProyectoDetailSerializer(serializers.ModelSerializer):
             return {
                 'id': str(obj.proveedor.id),
                 'razon_social': obj.proveedor.razon_social,
-                'ruc': obj.proveedor.ruc,
-                'categoria': obj.proveedor.get_categoria_display() if hasattr(obj.proveedor, 'get_categoria_display') else None,
-                'email': obj.proveedor.email if hasattr(obj.proveedor, 'email') else obj.proveedor.contacto_email,
+                'numero_documento_fiscal': obj.proveedor.numero_documento_fiscal,
+                'tipo_documento_fiscal': obj.proveedor.tipo_documento_fiscal,
+                'tipo_proveedor': obj.proveedor.tipo_proveedor.nombre if obj.proveedor.tipo_proveedor else None,  # ✅ CORRECTO
+                'clasificacion': obj.proveedor.clasificacion.nombre if obj.proveedor.clasificacion else None,  # ✅ CORRECTO
+                'email': obj.proveedor.email_contacto,
+                'telefono': obj.proveedor.telefono_contacto,
             }
         return None
     
