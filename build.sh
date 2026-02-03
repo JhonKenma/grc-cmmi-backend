@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# build.sh - VERSIÓN FINAL
-
 set -o errexit
 
 echo "🔧 Instalando dependencias..."
@@ -8,6 +6,9 @@ pip install -r requirements.txt
 
 echo "📦 Recolectando archivos estáticos..."
 python manage.py collectstatic --no-input
+
+echo "🔄 Reseteando migraciones de proveedores..."
+python manage.py migrate proveedores zero --noinput || echo "⚠️ No hay migraciones previas de proveedores"
 
 echo "🗄️ Ejecutando migraciones..."
 python manage.py migrate
