@@ -1,63 +1,161 @@
 # apps/proveedores/serializers.py
 
 from rest_framework import serializers
-from .models import Proveedor
-from apps.empresas.models import Empresa  # ⭐ IMPORTAR Empresa
+from .models import Proveedor, TipoProveedor, ClasificacionProveedor
+from apps.empresas.models import Empresa
+
+
+# ============================================================
+# SERIALIZERS PARA CATÁLOGOS
+# ============================================================
+
+class TipoProveedorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TipoProveedor
+        fields = ['id', 'nombre', 'descripcion', 'orden', 'activo']
+
+
+class ClasificacionProveedorSerializer(serializers.ModelSerializer):
+    codigo_display = serializers.CharField(
+        source='get_codigo_display',
+        read_only=True
+    )
+    
+    class Meta:
+        model = ClasificacionProveedor
+        fields = ['id', 'codigo', 'codigo_display', 'nombre', 'descripcion', 'color', 'activo']
+
+
+# ============================================================
+# SERIALIZERS PARA PROVEEDOR
+# ============================================================
 
 class ProveedorSerializer(serializers.ModelSerializer):
-    tipo_proveedor_display = serializers.CharField(
-        source='get_tipo_proveedor_display',
+    # Información de relaciones
+    tipo_proveedor_nombre = serializers.CharField(
+        source='tipo_proveedor.nombre',
         read_only=True
     )
-    creado_por_nombre = serializers.CharField(
-        source='creado_por.nombre_completo',
-        read_only=True
+    clasificacion_nombre = serializers.CharField(
+        source='clasificacion.nombre',
+        read_only=True,
+        allow_null=True
     )
-    creado_por_email = serializers.CharField(
-        source='creado_por.email',
-        read_only=True
+    clasificacion_color = serializers.CharField(
+        source='clasificacion.color',
+        read_only=True,
+        allow_null=True
     )
-    # Información de la empresa
     empresa_nombre = serializers.CharField(
         source='empresa.nombre',
         read_only=True,
         allow_null=True
     )
+    creado_por_nombre = serializers.CharField(
+        source='creado_por.nombre_completo',
+        read_only=True
+    )
+    
+    # Campos calculados
     es_global = serializers.BooleanField(read_only=True)
+    nivel_criticidad = serializers.CharField(read_only=True)
+    contrato_vigente = serializers.BooleanField(read_only=True, allow_null=True)
+    
+    # Displays para choices
+    nivel_riesgo_display = serializers.CharField(
+        source='get_nivel_riesgo_display',
+        read_only=True
+    )
+    estado_proveedor_display = serializers.CharField(
+        source='get_estado_proveedor_display',
+        read_only=True
+    )
+    tipo_contrato_display = serializers.CharField(
+        source='get_tipo_contrato_display',
+        read_only=True
+    )
     
     class Meta:
         model = Proveedor
         fields = [
+            # IDs
             'id',
             'empresa',
-            'empresa_nombre',
-            'es_global',
-            'razon_social',
-            'ruc',
             'tipo_proveedor',
-            'tipo_proveedor_display',
-            'contacto_email',
-            'contacto_telefono',
-            'activo',
+            'clasificacion',
             'creado_por',
-            'creado_por_nombre',
-            'creado_por_email',
+            
+            # Información básica
+            'razon_social',
+            'nombre_comercial',
+            
+            # Legal y fiscal
+            'pais',
+            'tipo_documento_fiscal',
+            'numero_documento_fiscal',
+            'direccion_legal',
+            
+            # Contacto
+            'nombre_contacto_principal',
+            'cargo_contacto',
+            'email_contacto',
+            'telefono_contacto',
+            
+            # Contractual
+            'numero_contrato',
+            'fecha_inicio_contrato',
+            'fecha_fin_contrato',
+            'tipo_contrato',
+            'tipo_contrato_display',
+            'sla_aplica',
+            
+            # Estado y clasificación GRC
+            'nivel_riesgo',
+            'nivel_riesgo_display',
+            'proveedor_estrategico',
+            'estado_proveedor',
+            'estado_proveedor_display',
+            'fecha_alta',
+            'fecha_baja',
+            
+            # Cumplimiento
+            'requiere_certificaciones',
+            'certificaciones',
+            'cumple_compliance',
+            'ultima_evaluacion_riesgo',
+            'proxima_evaluacion_riesgo',
+            
+            # Observaciones
+            'observaciones',
+            
+            # Campos base
+            'activo',
             'fecha_creacion',
             'fecha_actualizacion',
+            
+            # Campos calculados y relacionados
+            'tipo_proveedor_nombre',
+            'clasificacion_nombre',
+            'clasificacion_color',
+            'empresa_nombre',
+            'creado_por_nombre',
+            'es_global',
+            'nivel_criticidad',
+            'contrato_vigente',
         ]
         read_only_fields = [
             'id',
             'empresa',
             'creado_por',
+            'fecha_alta',
             'fecha_creacion',
-            'fecha_actualizacion'
+            'fecha_actualizacion',
         ]
 
 
 class ProveedorCreateSerializer(serializers.ModelSerializer):
-    # ⭐ CORRECCIÓN: Usar read_only=True inicialmente
     empresa = serializers.PrimaryKeyRelatedField(
-        read_only=True,  # ⭐ CAMBIO AQUÍ
+        read_only=True,
         required=False,
         allow_null=True,
         help_text='Solo superadmin puede crear proveedores globales (sin empresa) o asignar a otra empresa'
@@ -67,11 +165,43 @@ class ProveedorCreateSerializer(serializers.ModelSerializer):
         model = Proveedor
         fields = [
             'empresa',
-            'razon_social',
-            'ruc',
             'tipo_proveedor',
-            'contacto_email',
-            'contacto_telefono',
+            'clasificacion',
+            
+            # Información básica
+            'razon_social',
+            'nombre_comercial',
+            
+            # Legal y fiscal
+            'pais',
+            'tipo_documento_fiscal',
+            'numero_documento_fiscal',
+            'direccion_legal',
+            
+            # Contacto
+            'nombre_contacto_principal',
+            'cargo_contacto',
+            'email_contacto',
+            'telefono_contacto',
+            
+            # Contractual
+            'numero_contrato',
+            'fecha_inicio_contrato',
+            'fecha_fin_contrato',
+            'tipo_contrato',
+            'sla_aplica',
+            
+            # Estado y clasificación GRC
+            'nivel_riesgo',
+            'proveedor_estrategico',
+            
+            # Cumplimiento
+            'requiere_certificaciones',
+            'certificaciones',
+            'cumple_compliance',
+            
+            # Observaciones
+            'observaciones',
         ]
     
     def __init__(self, *args, **kwargs):
@@ -79,15 +209,12 @@ class ProveedorCreateSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         
         if request and request.user:
-            # ⭐ CORRECCIÓN: Configurar el campo empresa dinámicamente
             if request.user.rol == 'superadmin':
-                # Superadmin puede seleccionar cualquier empresa o dejar vacío
                 self.fields['empresa'] = serializers.PrimaryKeyRelatedField(
                     queryset=Empresa.objects.filter(activo=True),
                     required=False,
                     allow_null=True
                 )
-            # Si no es superadmin, el campo se mantiene read_only
     
     def validate(self, attrs):
         request = self.context.get('request')
@@ -95,56 +222,84 @@ class ProveedorCreateSerializer(serializers.ModelSerializer):
         
         if user:
             if user.rol == 'superadmin':
-                # Superadmin puede crear proveedores globales o para empresas específicas
-                # Si no envía empresa, queda como None (global)
                 pass
             else:
-                # Administradores y otros: DEBEN tener empresa
                 if not user.empresa:
                     raise serializers.ValidationError({
                         'empresa': 'Debes tener una empresa asignada para crear proveedores'
                     })
-                # Forzar que el proveedor sea de su empresa
                 attrs['empresa'] = user.empresa
         
         return attrs
     
     def create(self, validated_data):
-        # Asignar usuario que está creando
         validated_data['creado_por'] = self.context['request'].user
-        validated_data['activo'] = False
+        validated_data['estado_proveedor'] = 'activo'
+        validated_data['activo'] = False  # Inicia desactivado para aprobación
         return super().create(validated_data)
 
 
 class ProveedorUpdateSerializer(serializers.ModelSerializer):
-    # empresa es read_only en actualización (no se puede cambiar)
     empresa = serializers.PrimaryKeyRelatedField(read_only=True)
     
     class Meta:
         model = Proveedor
         fields = [
             'empresa',
-            'razon_social',
-            'ruc',
             'tipo_proveedor',
-            'contacto_email',
-            'contacto_telefono',
+            'clasificacion',
+            
+            # Información básica
+            'razon_social',
+            'nombre_comercial',
+            
+            # Legal y fiscal
+            'pais',
+            'tipo_documento_fiscal',
+            'numero_documento_fiscal',
+            'direccion_legal',
+            
+            # Contacto
+            'nombre_contacto_principal',
+            'cargo_contacto',
+            'email_contacto',
+            'telefono_contacto',
+            
+            # Contractual
+            'numero_contrato',
+            'fecha_inicio_contrato',
+            'fecha_fin_contrato',
+            'tipo_contrato',
+            'sla_aplica',
+            
+            # Estado y clasificación GRC
+            'nivel_riesgo',
+            'proveedor_estrategico',
+            'estado_proveedor',
+            'fecha_baja',
+            
+            # Cumplimiento
+            'requiere_certificaciones',
+            'certificaciones',
+            'cumple_compliance',
+            'ultima_evaluacion_riesgo',
+            'proxima_evaluacion_riesgo',
+            
+            # Observaciones
+            'observaciones',
         ]
     
-    def validate_ruc(self, value):
-        """
-        Validar que el RUC sea único dentro de la misma empresa
-        """
+    def validate_numero_documento_fiscal(self, value):
+        """Validar que el documento fiscal sea único dentro de la misma empresa"""
         instance = self.instance
-        # Verificar si existe otro proveedor con el mismo RUC en la misma empresa
         qs = Proveedor.objects.filter(
-            ruc=value,
+            numero_documento_fiscal=value,
             empresa=instance.empresa
         ).exclude(pk=instance.pk)
         
         if qs.exists():
             raise serializers.ValidationError(
-                'Ya existe un proveedor con este RUC en tu empresa'
+                'Ya existe un proveedor con este documento fiscal en tu empresa'
             )
         
         return value
