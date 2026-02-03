@@ -15,4 +15,7 @@ python manage.py migrate
 echo "👤 Creando superusuario (si no existe)..."
 python manage.py crear_superadmin --no-input
 
+echo "📊 Cargando datos iniciales de proveedores..."
+python manage.py cargar_datos_proveedores
+
 echo "✅ Build completado exitosamente"
