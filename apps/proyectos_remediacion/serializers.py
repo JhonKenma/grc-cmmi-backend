@@ -456,6 +456,7 @@ class ProyectoCierreBrechaDetailSerializer(serializers.ModelSerializer):
     dias_restantes = serializers.ReadOnlyField()
     dias_transcurridos = serializers.ReadOnlyField()
     duracion_estimada_dias = serializers.ReadOnlyField()
+    porcentaje_tiempo_transcurrido = serializers.ReadOnlyField()
     esta_vencido = serializers.ReadOnlyField()
     gap_original = serializers.ReadOnlyField()
     dimension_nombre = serializers.ReadOnlyField()
