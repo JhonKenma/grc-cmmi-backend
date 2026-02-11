@@ -163,10 +163,23 @@ class EncuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
         
         PERMISO: Solo SuperAdmin
         """
+        import logging
+        import traceback
+        logger = logging.getLogger(__name__)
+        
+        # 1️⃣ Validar serializer
         serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        
+        if not serializer.is_valid():
+            logger.error(f"❌ Errores de validación: {serializer.errors}")
+            return self.error_response(
+                message='Datos inválidos',
+                errors=serializer.errors,
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
         
         try:
+            # 3️⃣ Procesar Excel
             cargador = CargadorExcel(
                 archivo_excel=serializer.validated_data['archivo'],
                 nombre_encuesta=serializer.validated_data['nombre_encuesta'],
@@ -174,17 +187,25 @@ class EncuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
                 descripcion=serializer.validated_data.get('descripcion', '')
             )
             
+            logger.info("🔄 Iniciando procesamiento...")
             encuesta = cargador.procesar_y_guardar()
+            logger.info(f"✅ Encuesta creada: {encuesta.id}")
             
             return self.success_response(
                 data=EncuestaSerializer(encuesta).data,
                 message=f'Encuesta cargada exitosamente. {encuesta.total_preguntas} preguntas en {encuesta.total_dimensiones} dimensiones.',
                 status_code=status.HTTP_201_CREATED
             )
+            
         except Exception as e:
+            
             return self.error_response(
                 message='Error al procesar el archivo Excel',
-                errors=str(e),
+                errors={
+                    'tipo': type(e).__name__,
+                    'detalle': str(e),
+                    'traceback': traceback.format_exc()
+                },
                 status_code=status.HTTP_400_BAD_REQUEST
             )
     
