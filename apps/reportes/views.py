@@ -252,15 +252,15 @@ class ReporteViewSet(viewsets.ViewSet):
                     'nombre': evaluacion.encuesta.nombre,
                     'empresa': evaluacion.empresa.nombre,
                     'fecha_asignacion': evaluacion.fecha_asignacion,
-                    'fecha_inicio': evaluacion.fecha_asignacion,  # ⭐ NUEVO
+                    'fecha_inicio': evaluacion.fecha_asignacion,
                     'fecha_limite': evaluacion.fecha_limite,
                     'estado': evaluacion.estado,
                     'porcentaje_avance': float(evaluacion.porcentaje_avance),
-                    'administrador': {                                 # ⭐ AGREGAR ESTE BLOQUE
-                    'id': evaluacion.administrador.id if evaluacion.administrador else None,
-                    'nombre_completo': evaluacion.administrador.nombre_completo if evaluacion.administrador else 'Sin asignar',
-                    'email': evaluacion.administrador.email if evaluacion.administrador else None,
-                    'cargo': evaluacion.administrador.cargo if evaluacion.administrador else None,
+                    'administrador': {
+                        'id': evaluacion.administrador.id if evaluacion.administrador else None,
+                        'nombre_completo': evaluacion.administrador.nombre_completo if evaluacion.administrador else 'Sin asignar',
+                        'email': evaluacion.administrador.email if evaluacion.administrador else None,
+                        'cargo': evaluacion.administrador.cargo if evaluacion.administrador else None,
                     } if evaluacion.administrador else None,
                 },
                 'resumen': {
@@ -274,7 +274,7 @@ class ReporteViewSet(viewsets.ViewSet):
                 },
                 'por_dimension': self._agrupar_por_dimension_evaluacion(calculos, evaluacion),
                 'por_usuario': self._agrupar_por_usuario_evaluacion(calculos),
-                'clasificaciones_gap': self._contar_clasificaciones(calculos),
+                'clasificaciones_gap': self._contar_clasificaciones_por_dimension(calculos, evaluacion),  # ⭐ CAMBIO AQUÍ
                 'distribucion_respuestas': self._calcular_distribucion_respuestas(calculos),
             }
             
@@ -386,6 +386,22 @@ class ReporteViewSet(viewsets.ViewSet):
             except ConfigNivelDeseado.DoesNotExist:
                 nivel_deseado = 3.0
             
+            # --- ⭐ CALCULAR CLASIFICACIÓN DEL GAP PROMEDIO ---
+            gap_promedio = float(stats['gap_avg'] or 0)
+            
+            if gap_promedio >= 2:
+                clasificacion_gap = 'critico'
+            elif gap_promedio >= 1:
+                clasificacion_gap = 'alto'
+            elif gap_promedio >= 0.5:
+                clasificacion_gap = 'medio'
+            elif gap_promedio > 0:
+                clasificacion_gap = 'bajo'
+            elif gap_promedio == 0:
+                clasificacion_gap = 'cumplido'
+            else:  # gap_promedio < 0 (nivel actual > nivel deseado)
+                clasificacion_gap = 'superado'
+            
             # --- ✅ CONSTRUIR ARRAY DE USUARIOS ---
             usuarios_data = []
             
@@ -419,7 +435,7 @@ class ReporteViewSet(viewsets.ViewSet):
                     'respuestas': respuestas_resumen,
                 })
             
-            # --- ✅ RESULTADO FINAL ---
+            # --- ✅ RESULTADO FINAL CON CLASIFICACIÓN ---
             resultado.append({
                 'dimension': {
                     'id': str(dimension.id),
@@ -429,7 +445,8 @@ class ReporteViewSet(viewsets.ViewSet):
                 },
                 'nivel_deseado': nivel_deseado,
                 'nivel_actual_promedio': float(stats['nivel_actual_avg'] or 0),
-                'gap_promedio': float(stats['gap_avg'] or 0),
+                'gap_promedio': gap_promedio,  # ⭐ Usar la variable calculada
+                'clasificacion_gap': clasificacion_gap,  # ⭐ NUEVO CAMPO CRÍTICO
                 'porcentaje_cumplimiento_promedio': float(stats['cumplimiento_avg'] or 0),
                 'total_usuarios_evaluados': stats['total_usuarios'],
                 'tiene_proyecto_activo': proyecto_activo is not None,
@@ -440,6 +457,50 @@ class ReporteViewSet(viewsets.ViewSet):
         
         return sorted(resultado, key=lambda x: x['dimension']['orden'])
 
+    def _contar_clasificaciones_por_dimension(self, calculos, evaluacion):
+        """
+        Cuenta clasificaciones basándose en el GAP PROMEDIO de cada dimensión
+        (no en los cálculos individuales de usuarios)
+        """
+        from apps.encuestas.models import ConfigNivelDeseado
+        from django.db.models import Avg
+        
+        dimensiones_ids = calculos.values_list('dimension_id', flat=True).distinct()
+        dimensiones = evaluacion.encuesta.dimensiones.filter(id__in=dimensiones_ids, activo=True)
+        
+        clasificaciones = {
+            'critico': 0,
+            'alto': 0,
+            'medio': 0,
+            'bajo': 0,
+            'cumplido': 0,
+            'superado': 0,
+        }
+        
+        for dimension in dimensiones:
+            calculos_dim = calculos.filter(dimension=dimension)
+            
+            if not calculos_dim.exists():
+                continue
+            
+            # Calcular GAP promedio de la dimensión
+            gap_promedio = float(calculos_dim.aggregate(Avg('gap'))['gap__avg'] or 0)
+            
+            # Clasificar
+            if gap_promedio >= 2:
+                clasificaciones['critico'] += 1
+            elif gap_promedio >= 1:
+                clasificaciones['alto'] += 1
+            elif gap_promedio >= 0.5:
+                clasificaciones['medio'] += 1
+            elif gap_promedio > 0:
+                clasificaciones['bajo'] += 1
+            elif gap_promedio == 0:
+                clasificaciones['cumplido'] += 1
+            else:
+                clasificaciones['superado'] += 1
+        
+        return clasificaciones
 
     def _agrupar_por_usuario_evaluacion(self, calculos):
         """Agrupa cálculos por usuario"""
