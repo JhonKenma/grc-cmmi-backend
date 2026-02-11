@@ -368,6 +368,13 @@ class ProyectoCierreBrecha(BaseModel):
             return self.fecha_fin_estimada < timezone.now().date()
         return False
     
+    @property
+    def porcentaje_tiempo_transcurrido(self):
+        """Porcentaje del tiempo transcurrido respecto a la duración total"""
+        if self.duracion_estimada_dias > 0:
+            porcentaje = (self.dias_transcurridos / self.duracion_estimada_dias) * 100
+            return min(round(porcentaje, 2), 100)  # Máximo 100%
+        return 0
     # ═══════════════════════════════════════════════════════════
     # PROPIEDADES DE PRESUPUESTO (MODO INTELIGENTE)
     # ═══════════════════════════════════════════════════════════
