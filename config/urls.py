@@ -31,6 +31,8 @@ urlpatterns = [
     path('api/', include('apps.reportes.urls')),
     path('api/', include('apps.proyectos_remediacion.urls')),
     path('api/dashboard/', include('apps.dashboard.urls')),
+    path('api/evaluaciones/', include('apps.evaluaciones.urls')),
+    path('api/', include('apps.asignaciones_iq.urls')),
 
     # ==============================
     # 🔹 Documentación OpenAPI / Swagger / Redoc
