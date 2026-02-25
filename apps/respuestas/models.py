@@ -392,9 +392,12 @@ class Evidencia(BaseModel):
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
     respuesta = models.ForeignKey(
         Respuesta,
         on_delete=models.CASCADE,
+        null=True,  # ⭐ AÑADIR
+        blank=True,  # ⭐ AÑADIR
         related_name='evidencias',
         verbose_name='Respuesta'
     )
@@ -460,7 +463,16 @@ class Evidencia(BaseModel):
         related_name='evidencias_subidas',
         verbose_name='Subido por'
     )
-    
+
+    respuesta_iq = models.ForeignKey(
+        'asignaciones_iq.RespuestaEvaluacionIQ',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='evidencias',
+        verbose_name='Respuesta IQ'
+    )
+
     class Meta:
         db_table = 'evidencias'
         verbose_name = 'Evidencia'
@@ -478,14 +490,33 @@ class Evidencia(BaseModel):
     def __str__(self):
         return f"{self.codigo_documento} - {self.titulo_documento}"
 
+    # def clean(self):
+    #     """Validaciones"""
+    #     # Máximo 3 evidencias por respuesta
+    #     if self.respuesta and not self.pk:
+    #         if self.respuesta.evidencias.count() >= 3:
+    #             raise ValidationError({
+    #                 'respuesta': 'Solo se permiten máximo 3 archivos por respuesta'
+    #             })
+                
     def clean(self):
         """Validaciones"""
+        # ⭐ ACTUALIZAR: Debe tener UNA de las dos respuestas
+        if not self.respuesta and not self.respuesta_iq:
+            raise ValidationError('Debe estar asociada a una respuesta')
+        
+        if self.respuesta and self.respuesta_iq:
+            raise ValidationError('No puede estar asociada a ambos tipos de respuesta')
+        
         # Máximo 3 evidencias por respuesta
-        if self.respuesta and not self.pk:
-            if self.respuesta.evidencias.count() >= 3:
-                raise ValidationError({
-                    'respuesta': 'Solo se permiten máximo 3 archivos por respuesta'
-                })
+        if not self.pk:
+            if self.respuesta:
+                if self.respuesta.evidencias.count() >= 3:
+                    raise ValidationError({'respuesta': 'Solo se permiten máximo 3 archivos'})
+            elif self.respuesta_iq:
+                if Evidencia.objects.filter(respuesta_iq=self.respuesta_iq, activo=True).count() >= 3:
+                    raise ValidationError({'respuesta_iq': 'Solo se permiten máximo 3 archivos'})
+                
     
     def save(self, *args, **kwargs):
         self.full_clean()
