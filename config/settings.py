@@ -49,7 +49,9 @@ INSTALLED_APPS = [
     'apps.empresas',
     'apps.usuarios',
     'apps.encuestas',
+    'apps.evaluaciones',
     'apps.asignaciones',
+    'apps.asignaciones_iq',
     'apps.respuestas',
     'apps.dashboard',
     'apps.reportes',
@@ -57,6 +59,7 @@ INSTALLED_APPS = [
     'apps.proyectos_remediacion',
     'apps.proveedores',
     'django_extensions',
+    
 
     'drf_spectacular',
     'drf_spectacular_sidecar',
