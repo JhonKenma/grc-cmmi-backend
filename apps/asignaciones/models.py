@@ -21,6 +21,7 @@ class Asignacion(BaseModel):
         ('completado', 'Completado'),
         ('vencido', 'Vencido'),
         ('pendiente_revision', 'Pendiente de Revisión'),  
+        ('pendiente_auditoria',  'Pendiente de Auditoría'),
         ('rechazado', 'Rechazado'),  
     ]
     
@@ -200,15 +201,14 @@ class Asignacion(BaseModel):
                 )
         
         # Lógica de estado
-        if self.estado not in ['completado', 'rechazado', 'pendiente_revision']:
+        # ⭐ AGREGAR 'pendiente_auditoria' a los estados que no se tocan automáticamente
+        if self.estado not in ['completado', 'rechazado', 'pendiente_revision', 'pendiente_auditoria', 'auditado']:
             if self.preguntas_respondidas >= self.total_preguntas and self.total_preguntas > 0:
-                if self.requiere_revision:
-                    self.estado = 'pendiente_revision'
+                # ⭐ NUEVO FLUJO: siempre va a pendiente_auditoria al completar
+                # El estado 'completado' solo lo pone el Auditor al cerrar revisión
+                self.estado = 'pendiente_auditoria'
+                if not self.fecha_envio_revision:
                     self.fecha_envio_revision = timezone.now()
-                else:
-                    self.estado = 'completado'
-                    if not self.fecha_completado:
-                        self.fecha_completado = timezone.now()
             elif self.preguntas_respondidas > 0:
                 self.estado = 'en_progreso'
         
@@ -217,17 +217,18 @@ class Asignacion(BaseModel):
             self.porcentaje_avance = (self.preguntas_respondidas / self.total_preguntas) * 100
         
         # Verificar si está vencido
-        if self.estado not in ['completado', 'rechazado'] and self.fecha_limite < timezone.now().date():
+        # ⭐ AGREGAR 'pendiente_auditoria' a los estados protegidos del vencimiento
+        if self.estado not in ['completado', 'rechazado', 'pendiente_auditoria', 'auditado'] and self.fecha_limite < timezone.now().date():
+         #if self.estado not in ['completado', 'rechazado', 'pendiente_auditoria'] and self.fecha_limite < timezone.now().date():
             self.estado = 'vencido'
         
         super().save(*args, **kwargs)
         
-        # ⭐ ACTUALIZAR progreso de la evaluación
+        # Actualizar progreso de la evaluación
         if self.evaluacion_empresa_id:
             try:
                 self.evaluacion_empresa.actualizar_progreso()
             except Exception as e:
-                # No fallar el guardado si falla la actualización de progreso
                 print(f"⚠️ Error al actualizar progreso de evaluación: {e}")
     
     @property
