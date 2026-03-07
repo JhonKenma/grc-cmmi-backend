@@ -45,25 +45,46 @@ class TipoDocumento(BaseModel):
 
 class Respuesta(BaseModel):
     """
-    Respuesta de un usuario a una pregunta específica
-    ⭐ ACTUALIZADO: Con 4 opciones de respuesta según puntaje CMMI + Nivel de Madurez
+    Respuesta de un usuario a una pregunta.
+
+    NUEVO FLUJO:
+    - El usuario SOLO puede marcar NO_APLICA (con justificación obligatoria)
+      O dejar respuesta=None y subir evidencias + justificación.
+    - Las opciones SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE
+      SOLO las asigna el Auditor después de revisar.
+    - Estados del ciclo de vida:
+        borrador            → El usuario está respondiendo
+        enviado             → El usuario envió, esperando revisión del auditor
+        pendiente_auditoria → Notificación enviada al auditor (alias de enviado)
+        auditado            → El auditor calificó todas las preguntas
+        modificado_admin    → El administrador hizo ajustes
     """
-    
-    # ⭐ ACTUALIZADO: 4 opciones de respuesta
-    OPCIONES_RESPUESTA = [
-        ('SI_CUMPLE', 'Sí Cumple'),              # 1.0 punto
-        ('CUMPLE_PARCIAL', 'Cumple Parcialmente'), # 0.5 puntos
-        ('NO_CUMPLE', 'No Cumple'),              # 0.0 puntos
-        ('NO_APLICA', 'No Aplica'),              # Excluido del cálculo
+
+    # ── Opciones que SOLO usa el Auditor ────────────────────────────────────
+    CALIFICACIONES_AUDITOR = [
+        ('SI_CUMPLE',      'Sí Cumple'),           # 1.0 punto
+        ('CUMPLE_PARCIAL', 'Cumple Parcialmente'),  # 0.5 puntos
+        ('NO_CUMPLE',      'No Cumple'),            # 0.0 puntos
     ]
-    
+
+    # ── Opción que usa el Usuario ────────────────────────────────────────────
+    OPCIONES_USUARIO = [
+        ('NO_APLICA', 'No Aplica'),   # Excluido del cálculo; requiere justificación
+    ]
+
+    # ── Todas las opciones posibles (para el campo respuesta) ────────────────
+    OPCIONES_RESPUESTA = OPCIONES_USUARIO + CALIFICACIONES_AUDITOR
+
     ESTADOS = [
-        ('borrador', 'Borrador'),
-        ('enviado', 'Enviado'),
-        ('modificado_admin', 'Modificado por Admin'),
+        ('borrador',            'Borrador'),
+        ('enviado',             'Enviado'),
+        ('pendiente_auditoria', 'Pendiente de Auditoría'),
+        ('auditado',            'Auditado'),
+        ('modificado_admin',    'Modificado por Admin'),
     ]
-    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
     asignacion = models.ForeignKey(
         Asignacion,
         on_delete=models.CASCADE,
@@ -76,49 +97,91 @@ class Respuesta(BaseModel):
         related_name='respuestas',
         verbose_name='Pregunta'
     )
+
+    # ── Campo de respuesta del USUARIO ───────────────────────────────────────
+    # null=True → cuando el usuario sube evidencias sin marcar NO_APLICA
+    # Solo valor permitido para el usuario: 'NO_APLICA'
     respuesta = models.CharField(
         max_length=20,
         choices=OPCIONES_RESPUESTA,
-        verbose_name='Respuesta',
-        help_text='Nivel de cumplimiento: Sí (1.0), Parcial (0.5), No (0.0), N/A (excluido)'
+        null=True,
+        blank=True,
+        verbose_name='Respuesta del Usuario',
+        help_text='El usuario solo puede marcar NO_APLICA. '
+                  'Si deja vacío, sube evidencias para que el auditor califique.'
     )
+
     justificacion = models.TextField(
-        verbose_name='Justificación',
+        verbose_name='Justificación del Usuario',
         blank=True,
         default='',
-        help_text='Obligatorio para "Sí Cumple" (mínimo 10 caracteres)'
+        help_text='Obligatorio siempre (mínimo 10 caracteres). '
+                  'Para NO_APLICA: explica por qué no aplica.'
     )
-    
-    # ⭐ NUEVOS CAMPOS DE NIVEL DE MADUREZ
+
+    comentarios_adicionales = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Comentarios Adicionales del Usuario'
+    )
+
+    # ── Campos de AUDITORÍA (solo los rellena el Auditor) ───────────────────
+    calificacion_auditor = models.CharField(
+        max_length=20,
+        choices=CALIFICACIONES_AUDITOR,
+        null=True,
+        blank=True,
+        verbose_name='Calificación del Auditor',
+        help_text='SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE — asignado por el Auditor'
+    )
+
+    comentarios_auditor = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Comentarios del Auditor',
+        help_text='Observaciones del auditor sobre la respuesta'
+    )
+
+    recomendaciones_auditor = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Recomendaciones del Auditor',
+        help_text='Qué debe mejorar la empresa para subir de nivel'
+    )
+
+    fecha_auditoria = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Fecha de Auditoría',
+        help_text='Fecha en que el auditor calificó esta respuesta'
+    )
+
+    auditado_por = models.ForeignKey(
+        'usuarios.Usuario',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='respuestas_auditadas',
+        verbose_name='Auditado Por'
+    )
+
+    # ── Nivel de madurez (lo asigna el Auditor, no el usuario) ──────────────
     nivel_madurez = models.DecimalField(
         max_digits=2,
         decimal_places=1,
         default=0.0,
         verbose_name='Nivel de Madurez',
-        help_text='Nivel de madurez de implementación (0 a 5 en incrementos de 0.5). Representa qué tan maduro está el proceso implementado.'
+        help_text='Asignado por el auditor (0–5 en incrementos de 0.5)'
     )
-    
-    justificacion_madurez = models.TextField(
-        blank=True,
-        default='',
-        verbose_name='Justificación del Nivel de Madurez',
-        help_text='Explicación de por qué se considera ese nivel de madurez (OPCIONAL)'
-    )
-    
-    comentarios_adicionales = models.TextField(
-        blank=True,
-        default='',
-        verbose_name='Comentarios Adicionales'
-    )
-    
+
+    # ── Auditoría de registro ────────────────────────────────────────────────
     estado = models.CharField(
-        max_length=20,
+        max_length=25,
         choices=ESTADOS,
         default='borrador',
         verbose_name='Estado'
     )
-    
-    # CAMPOS DE AUDITORÍA
+
     respondido_por = models.ForeignKey(
         'usuarios.Usuario',
         on_delete=models.SET_NULL,
@@ -126,11 +189,8 @@ class Respuesta(BaseModel):
         related_name='respuestas_creadas',
         verbose_name='Respondido por'
     )
-    respondido_at = models.DateTimeField(
-        auto_now_add=True, 
-        verbose_name='Fecha de Respuesta'
-    )
-    
+    respondido_at = models.DateTimeField(auto_now_add=True, verbose_name='Fecha de Respuesta')
+
     modificado_por = models.ForeignKey(
         'usuarios.Usuario',
         on_delete=models.SET_NULL,
@@ -139,17 +199,10 @@ class Respuesta(BaseModel):
         related_name='respuestas_modificadas',
         verbose_name='Última modificación por'
     )
-    modificado_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        verbose_name='Fecha de última modificación'
-    )
-    
-    version = models.IntegerField(
-        default=1,
-        verbose_name='Versión'
-    )
-    
+    modificado_at = models.DateTimeField(null=True, blank=True, verbose_name='Fecha de última modificación')
+
+    version = models.IntegerField(default=1, verbose_name='Versión')
+
     class Meta:
         db_table = 'respuestas'
         verbose_name = 'Respuesta'
@@ -160,100 +213,96 @@ class Respuesta(BaseModel):
             models.Index(fields=['asignacion', 'estado']),
             models.Index(fields=['pregunta']),
             models.Index(fields=['respondido_por']),
-            models.Index(fields=['modificado_por']),
+            models.Index(fields=['auditado_por']),
         ]
-    
+
     def __str__(self):
-        return f"{self.pregunta.codigo} - {self.get_respuesta_display()}"
-    
+        cal = self.calificacion_auditor or self.respuesta or 'sin calificar'
+        return f"{self.pregunta.codigo} - {cal}"
+
+    # ────────────────────────────────────────────────────────────────────────
+    # VALIDACIONES
+    # ────────────────────────────────────────────────────────────────────────
+
     def clean(self):
-        """Validaciones personalizadas"""
-        # Validar que pregunta pertenezca a dimensión
-        if self.pregunta.dimension != self.asignacion.dimension:
+        # 1. Justificación siempre obligatoria (mínimo 10 caracteres)
+        if not self.justificacion or len(self.justificacion.strip()) < 10:
             raise ValidationError({
-                'pregunta': 'La pregunta no pertenece a la dimensión de esta asignación'
+                'justificacion': 'La justificación debe tener al menos 10 caracteres'
             })
-        
-        # ⭐ VALIDACIÓN 1: Para "Sí Cumple", justificación mínima 10 caracteres
-        if self.respuesta == 'SI_CUMPLE':
-            if not self.justificacion or len(self.justificacion.strip()) < 10:
-                raise ValidationError({
-                    'justificacion': 'Para respuestas "Sí Cumple", la justificación debe tener al menos 10 caracteres'
-                })
-        
-        # Validación general de justificación (para todas las respuestas)
-        if self.estado in ['enviado', 'modificado_admin']:
-            if not self.justificacion or len(self.justificacion.strip()) < 10:
-                raise ValidationError({
-                    'justificacion': 'La justificación debe tener al menos 10 caracteres'
-                })
-        
-        # ⭐ VALIDACIÓN 2: Nivel de madurez debe ser 0 si NO_CUMPLE o NO_APLICA
-        if self.respuesta in ['NO_CUMPLE', 'NO_APLICA']:
-            if self.nivel_madurez != 0:
-                raise ValidationError({
-                    'nivel_madurez': 'El nivel de madurez debe ser 0 para "No Cumple" o "No Aplica"'
-                })
-        
-        # ⭐ VALIDACIÓN 4: Para SI_CUMPLE o CUMPLE_PARCIAL, nivel de madurez debe ser > 0
-        if self.estado in ['enviado', 'modificado_admin']:
-            if self.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL']:
-                if self.nivel_madurez == 0:
-                    raise ValidationError({
-                        'nivel_madurez': 'Debes indicar un nivel de madurez mayor a 0 si cumples total o parcialmente'
-                    })
-        
-        # ⭐ VALIDACIÓN 5: Nivel de madurez debe ser múltiplo de 0.5
-        if (self.nivel_madurez * 2) % 1 != 0:
+
+        # 2. Si el usuario marcó NO_APLICA, no puede tener calificación de auditor
+        if self.respuesta == 'NO_APLICA' and self.calificacion_auditor:
             raise ValidationError({
-                'nivel_madurez': 'El nivel de madurez debe ser en incrementos de 0.5 (ej: 1.0, 1.5, 2.0, etc.)'
+                'calificacion_auditor': 'Una respuesta NO_APLICA no puede ser calificada por el auditor'
             })
-        
-        # ⭐ VALIDACIÓN 6: Para "Sí Cumple" o "Cumple Parcial" enviado, debe tener evidencias
-        if self.pk and self.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL'] and self.estado in ['enviado', 'modificado_admin']:
-            if not self.evidencias.filter(activo=True).exists():
-                raise ValidationError({
-                    'evidencias': f'Las respuestas "{self.get_respuesta_display()}" requieren al menos una evidencia'
-                })
-        
-        # Máximo 3 evidencias
-        if self.pk and self.evidencias.count() > 3:
+
+        # 3. El usuario NO puede poner calificaciones de auditor directamente
+        if self.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL']:
             raise ValidationError({
-                'evidencias': 'Se permiten máximo 3 archivos de evidencia por respuesta'
+                'respuesta': 'SI_CUMPLE y CUMPLE_PARCIAL solo los asigna el Auditor.'
             })
-    
+
+        # 4. Nivel de madurez: solo el auditor lo asigna
+        #    Solo se valida si ya hay calificación de auditor
+        if self.calificacion_auditor:
+            if self.calificacion_auditor == 'NO_CUMPLE' and self.nivel_madurez != 0:
+                raise ValidationError({
+                    'nivel_madurez': 'El nivel de madurez debe ser 0 para NO_CUMPLE'
+                })
+            if (self.nivel_madurez * 2) % 1 != 0:
+                raise ValidationError({
+                    'nivel_madurez': 'El nivel de madurez debe ser múltiplo de 0.5'
+                })
+
     def save(self, *args, **kwargs):
         if self.pk:
             self.full_clean()
         super().save(*args, **kwargs)
-        
-        # Actualizar contador de preguntas respondidas en asignación
-        if self.estado in ['enviado', 'modificado_admin']:
+
+        # Actualizar preguntas respondidas en la asignación
+        if self.estado in ['enviado', 'pendiente_auditoria', 'auditado', 'modificado_admin']:
             asignacion = self.asignacion
             asignacion.preguntas_respondidas = asignacion.respuestas.filter(
-                estado__in=['enviado', 'modificado_admin']
+                estado__in=['enviado', 'pendiente_auditoria', 'auditado', 'modificado_admin']
             ).count()
             asignacion.save()
-    
+
+    # ────────────────────────────────────────────────────────────────────────
+    # HELPERS
+    # ────────────────────────────────────────────────────────────────────────
+
     def get_puntaje(self):
         """
-        ⭐ Retorna el puntaje según la respuesta
-        - SI_CUMPLE: 1.0
-        - CUMPLE_PARCIAL: 0.5
-        - NO_CUMPLE: 0.0
-        - NO_APLICA: None (se excluye del cálculo)
+        Puntaje basado en la calificación del auditor.
+        - SI_CUMPLE      → 1.0
+        - CUMPLE_PARCIAL → 0.5
+        - NO_CUMPLE      → 0.0
+        - NO_APLICA      → None (excluido del cálculo)
+        - Sin calificar  → None
         """
+        if self.respuesta == 'NO_APLICA':
+            return None
         puntajes = {
-            'SI_CUMPLE': 1.0,
+            'SI_CUMPLE':      1.0,
             'CUMPLE_PARCIAL': 0.5,
-            'NO_CUMPLE': 0.0,
-            'NO_APLICA': None,  # Excluido
+            'NO_CUMPLE':      0.0,
         }
-        return puntajes.get(self.respuesta, 0.0)
-    
-    def get_nivel_madurez_display_verbose(self):
-        """Retorna solo el número del nivel de madurez"""
-        return str(self.nivel_madurez)
+        return puntajes.get(self.calificacion_auditor)
+
+    def marcar_no_cumple_automatico(self):
+        """
+        Llamado cuando el auditor cierra la revisión y esta pregunta
+        quedó sin calificar. Se marca automáticamente como NO_CUMPLE.
+        """
+        from django.utils import timezone
+        self.calificacion_auditor = 'NO_CUMPLE'
+        self.nivel_madurez = 0.0
+        self.comentarios_auditor = 'Sin calificación del auditor — marcado automáticamente como No Cumple.'
+        self.estado = 'auditado'
+        self.fecha_auditoria = timezone.now()
+        # No llamar full_clean para evitar loop; guardar directamente
+        super().save()
     
     
 class HistorialRespuesta(models.Model):
