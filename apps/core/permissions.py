@@ -41,22 +41,12 @@ class EsAuditor(permissions.BasePermission):
     IMPORTANTE: Permite lectura para Auditor, Admin y SuperAdmin
     (Excluye solo a Usuario común)
     """
-    message = 'No tienes permisos para acceder a este recurso.'
-    
+    message = 'Solo los auditores pueden acceder a este recurso.'
+
     def has_permission(self, request, view):
         if not request.user.is_authenticated:
             return False
-        
-        # SuperAdmin y Administrador: Acceso total
-        if request.user.rol in ['superadmin', 'administrador']:
-            return True
-        
-        # Auditor: Solo lectura (GET, HEAD, OPTIONS)
-        if request.user.rol == 'auditor':
-            return request.method in permissions.SAFE_METHODS
-        
-        # Usuario común: Sin acceso
-        return False
+        return request.user.rol in ['auditor', 'administrador', 'superadmin']
 
 
 class EsAdminOSuperAdminOAuditor(permissions.BasePermission):
