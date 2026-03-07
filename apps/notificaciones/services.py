@@ -431,3 +431,106 @@ class NotificacionAsignacionService:
         )
         
         logger.info(f"✅ Notificación de evaluación enviada a {usuario.email}")
+        
+        
+    @staticmethod
+    def notificar_pendiente_auditoria(asignacion, enviado_por):
+        """
+        Notifica al Auditor de la empresa que una asignación
+        está lista para ser revisada.
+        Se llama cuando el usuario envía su última respuesta.
+        """
+        from apps.usuarios.models import Usuario
+
+        auditores = Usuario.objects.filter(
+            empresa=asignacion.empresa,
+            rol='auditor',
+            activo=True
+        )
+
+        for auditor in auditores:
+            NotificacionService.crear_notificacion(
+                usuario=auditor,
+                tipo='pendiente_auditoria',
+                titulo=f'Nueva evaluación lista para auditar: {asignacion.dimension.nombre}',
+                mensaje=(
+                    f'{enviado_por.nombre_completo} ha completado la evaluación '
+                    f'"{asignacion.dimension.nombre}" y está lista para tu revisión.\n'
+                    f'Fecha límite original: {asignacion.fecha_limite.strftime("%d/%m/%Y")}.'
+                ),
+                prioridad='alta',
+                url_accion=f'/auditor/revisiones/{asignacion.id}',
+                datos_adicionales={
+                    'asignacion_id': str(asignacion.id),
+                    'dimension': asignacion.dimension.nombre,
+                    'usuario_asignado': enviado_por.nombre_completo,
+                    'empresa_id': str(asignacion.empresa.id),
+                },
+                enviar_email=True
+            )
+
+        logger.info(f"✅ Notificaciones de auditoría enviadas a {auditores.count()} auditor(es) de {asignacion.empresa.nombre}")
+
+    @staticmethod
+    def notificar_revision_completada(asignacion, auditado_por, gap_info=None):
+        """
+        Notifica al usuario y administrador que la auditoría fue completada.
+        Se llama cuando el auditor cierra la revisión.
+        """
+        gap_texto = ''
+        if gap_info:
+            gap_texto = (
+                f'\n📊 Resultado: Nivel actual {gap_info["nivel_actual"]:.1f} / '
+                f'Nivel deseado {gap_info["nivel_deseado"]:.1f} — '
+                f'GAP {gap_info["gap"]:.1f} ({gap_info["clasificacion"]})'
+            )
+
+        destinatarios = []
+
+        # Notificar al usuario asignado
+        if asignacion.usuario_asignado:
+            destinatarios.append({
+                'usuario':  asignacion.usuario_asignado,
+                'tipo':     'auditoria_completada',
+                'titulo':   f'Tu evaluación fue auditada: {asignacion.dimension.nombre}',
+                'mensaje':  (
+                    f'El auditor {auditado_por.nombre_completo} ha revisado tu evaluación '
+                    f'"{asignacion.dimension.nombre}".{gap_texto}'
+                ),
+                'prioridad': 'normal',
+                'url_accion': f'/mis-asignaciones/{asignacion.id}',
+            })
+
+        # Notificar al administrador
+        if asignacion.evaluacion_empresa and asignacion.evaluacion_empresa.administrador:
+            destinatarios.append({
+                'usuario':  asignacion.evaluacion_empresa.administrador,
+                'tipo':     'auditoria_completada',
+                'titulo':   f'Auditoría completada: {asignacion.dimension.nombre}',
+                'mensaje':  (
+                    f'{auditado_por.nombre_completo} completó la revisión de '
+                    f'{asignacion.usuario_asignado.nombre_completo} '
+                    f'en "{asignacion.dimension.nombre}".{gap_texto}'
+                ),
+                'prioridad': 'normal',
+                'url_accion': f'/evaluaciones/{asignacion.evaluacion_empresa.id}/progreso',
+            })
+
+        for dest in destinatarios:
+            NotificacionService.crear_notificacion(
+                usuario=dest['usuario'],
+                tipo=dest['tipo'],
+                titulo=dest['titulo'],
+                mensaje=dest['mensaje'],
+                prioridad=dest['prioridad'],
+                url_accion=dest['url_accion'],
+                datos_adicionales={
+                    'asignacion_id': str(asignacion.id),
+                    'dimension':     asignacion.dimension.nombre,
+                    'auditado_por':  auditado_por.nombre_completo,
+                    'gap_info':      gap_info,
+                },
+                enviar_email=True
+            )
+
+        logger.info(f"✅ Notificaciones de revisión completada enviadas para asignación {asignacion.id}")
