@@ -350,26 +350,27 @@ class EvaluacionEmpresa(BaseModel):
     def actualizar_progreso(self):
         """Actualiza el progreso basándose en las asignaciones"""
         from apps.asignaciones.models import Asignacion
-        
+
         # Contar dimensiones asignadas (únicas)
         self.dimensiones_asignadas = Asignacion.objects.filter(
             evaluacion_empresa=self,
             dimension__isnull=False,
             activo=True
         ).values('dimension').distinct().count()
-        
-        # Contar dimensiones completadas (únicas)
+
+        # ⭐ Contar dimensiones completadas — incluye todos los estados
+        # post-envío del usuario (el auditor no debe bloquear el progreso)
         self.dimensiones_completadas = Asignacion.objects.filter(
             evaluacion_empresa=self,
             dimension__isnull=False,
-            estado='completado',
+            estado__in=['completado', 'pendiente_auditoria', 'auditado'],
             activo=True
         ).values('dimension').distinct().count()
-        
+
         # Calcular porcentaje
         if self.total_dimensiones > 0:
             self.porcentaje_avance = (self.dimensiones_completadas / self.total_dimensiones) * 100
-        
+
         # Actualizar estado
         if self.dimensiones_completadas == self.total_dimensiones and self.total_dimensiones > 0:
             self.estado = 'completada'
@@ -377,7 +378,7 @@ class EvaluacionEmpresa(BaseModel):
                 self.fecha_completado = timezone.now()
         elif self.dimensiones_asignadas > 0:
             self.estado = 'en_progreso'
-        
+
         self.save()
     
     @property
