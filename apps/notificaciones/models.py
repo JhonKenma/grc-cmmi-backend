@@ -25,9 +25,12 @@ class Notificacion(BaseModel):
         ('gap_aprobado', 'GAP Aprobado'),
         ('gap_rechazado', 'GAP Rechazado'),
         
-        # ⭐ NUEVO: Notificaciones personalizadas
+        # personalizadas
         ('mensaje_personalizado', 'Mensaje Personalizado'),
         ('anuncio', 'Anuncio'),
+        
+        ('pendiente_auditoria', 'Pendiente de Auditoría'),
+        ('auditoria_completada', 'Auditoría Completada'),
     ]
     
     PRIORIDADES = [
