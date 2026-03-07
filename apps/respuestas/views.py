@@ -8,6 +8,7 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.db.models import Q, Count
 from django.utils import timezone
+from apps.core.permissions import EsAuditor
 from apps.core.services.storage_service import StorageService
 from apps.respuestas.services import CalculoNivelService 
 
@@ -23,6 +24,8 @@ from .models import (
     #Iniciativa
 )
 from .serializers import (
+    AuditorCalificarSerializer,
+    AuditorCerrarRevisionSerializer,
     TipoDocumentoSerializer,
     TipoDocumentoListSerializer,
     RespuestaListSerializer,
@@ -167,125 +170,90 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
             )
         
         serializer.save()
-    
+
     @action(detail=True, methods=['post'])
     def enviar(self, request, pk=None):
         """
-        Enviar respuesta individual (cambiar de borrador a enviado)
-        POST /api/respuestas/{id}/enviar/
-        
-        Cuando se envía la ÚLTIMA respuesta (progreso = 100%):
-        - Si requiere_revision → estado='pendiente_revision' (sin GAP)
-        - Si NO requiere_revision → estado='completado' (CON GAP)
+        Enviar respuesta individual (borrador → enviado).
+
+        Cuando TODAS las respuestas de la asignación están enviadas:
+        - Asignación → 'completado' directamente (sin esperar al auditor)
+        - GAP NO se calcula aquí → lo calcula el auditor al cerrar su revisión
+        - Se notifica al Auditor de la empresa para revisión post-cierre
         """
         respuesta = self.get_object()
-        
-        # Validar que sea el creador
+
         if respuesta.respondido_por != request.user:
             return self.error_response(
                 message='Solo puedes enviar tus propias respuestas',
                 status_code=status.HTTP_403_FORBIDDEN
             )
-        
+
         try:
             with transaction.atomic():
-                # Marcar respuesta como enviada
                 serializer = self.get_serializer(respuesta, data={})
                 serializer.is_valid(raise_exception=True)
                 respuesta_actualizada = serializer.save()
-                
-                # Obtener la asignación
+
                 asignacion = respuesta_actualizada.asignacion
-                
-                # Actualizar progreso de la asignación
                 asignacion.actualizar_progreso()
-                
-                mensaje = 'Respuesta enviada exitosamente'
-                gap_info = None
-                asignacion_completada = False
-                
-                # ⭐ VERIFICAR SI ES LA ÚLTIMA RESPUESTA (100% completado)
+
+                mensaje             = 'Respuesta enviada exitosamente'
+                asignacion_completa = False
+
                 if asignacion.porcentaje_avance >= 100:
-                    print(f"🎯 Asignación {asignacion.id} alcanzó 100% de progreso")
-                    asignacion_completada = True
-                    
-                    if asignacion.requiere_revision:
-                        # ═══════════════════════════════════════════════
-                        # CASO 1: REQUIERE REVISIÓN → NO CALCULAR GAP
-                        # ═══════════════════════════════════════════════
-                        asignacion.estado = 'pendiente_revision'
-                        asignacion.fecha_envio_revision = timezone.now()
-                        asignacion.save()
-                        
-                        mensaje = 'Respuesta enviada. ¡Has completado todas las preguntas! Tu evaluación será revisada por el administrador.'
-                        
-                        print(f"⏸️  Asignación enviada a revisión")
-                        print(f"⏸️  GAP NO calculado (se calculará al aprobar)")
-                    
-                    else:
-                        # ═══════════════════════════════════════════════
-                        # CASO 2: NO REQUIERE REVISIÓN → CALCULAR GAP
-                        # ═══════════════════════════════════════════════
-                        asignacion.estado = 'completado'
-                        asignacion.fecha_completado = timezone.now()
-                        asignacion.save()
-                        
-                        print(f"✅ Asignación completada automáticamente")
-                        print(f"🔧 Calculando GAP...")
-                        
+                    asignacion_completa = True
+
+                    # ── Completada directamente, sin esperar al auditor ───────
+                    asignacion.estado           = 'completado'
+                    asignacion.fecha_completado = timezone.now()
+                    asignacion.save()
+
+                    # ⚠️ NO calcular GAP aquí
+                    # El GAP se calcula cuando el auditor cierra su revisión
+
+                    # Actualizar progreso de la evaluación empresa
+                    if asignacion.evaluacion_empresa_id:
                         try:
-                            # ⭐ CALCULAR GAP AUTOMÁTICAMENTE
-                            calculo_gap = CalculoNivelService.calcular_gap_asignacion(asignacion)
-                            
-                            print(f"✅ GAP calculado exitosamente:")
-                            print(f"   📊 Nivel Deseado: {calculo_gap.nivel_deseado}")
-                            print(f"   📊 Nivel Actual: {calculo_gap.nivel_actual:.2f}")
-                            print(f"   📊 GAP: {calculo_gap.gap:.2f}")
-                            print(f"   📊 Clasificación: {calculo_gap.get_clasificacion_gap_display()}")
-                            
-                            gap_info = {
-                                'nivel_deseado': float(calculo_gap.nivel_deseado),
-                                'nivel_actual': float(calculo_gap.nivel_actual),
-                                'gap': float(calculo_gap.gap),
-                                'clasificacion': calculo_gap.get_clasificacion_gap_display(),
-                                'clasificacion_gap': calculo_gap.clasificacion_gap,
-                                'porcentaje_cumplimiento': float(calculo_gap.porcentaje_cumplimiento),
-                            }
-                            
-                            mensaje = f'¡Felicidades! Has completado la evaluación. GAP calculado: {calculo_gap.gap:.1f} ({calculo_gap.get_clasificacion_gap_display()})'
-                        
+                            asignacion.evaluacion_empresa.actualizar_progreso()
                         except Exception as e:
-                            print(f"⚠️  Error al calcular GAP: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            
-                            mensaje = '¡Felicidades! Has completado la evaluación (GAP se calculará después)'
-                    
-                    # Actualizar progreso de la evaluación
-                    if asignacion.evaluacion_empresa:
-                        asignacion.evaluacion_empresa.actualizar_progreso()
-                
+                            print(f'⚠️  Error al actualizar progreso de evaluación: {e}')
+
+                    # Notificar al Auditor para revisión post-cierre
+                    try:
+                        from apps.notificaciones.services import NotificacionAsignacionService
+                        NotificacionAsignacionService.notificar_pendiente_auditoria(
+                            asignacion=asignacion,
+                            enviado_por=request.user,
+                        )
+                        print(f'✅ Notificación enviada al auditor de {asignacion.empresa}')
+                    except Exception as e:
+                        print(f'⚠️  Error al notificar al auditor: {e}')
+
+                    mensaje = (
+                        '¡Has completado todas las preguntas! '
+                        'Tu evaluación fue cerrada y el Auditor fue notificado para revisión.'
+                    )
+
                 else:
-                    # Aún falta responder preguntas
-                    preguntas_restantes = asignacion.total_preguntas - asignacion.preguntas_respondidas
-                    mensaje = f'Respuesta enviada. Te faltan {preguntas_restantes} preguntas ({asignacion.porcentaje_avance:.0f}% completado)'
-                
-                # Respuesta
+                    pendientes = asignacion.total_preguntas - asignacion.preguntas_respondidas
+                    mensaje    = (
+                        f'Respuesta enviada. Te faltan {pendientes} preguntas '
+                        f'({asignacion.porcentaje_avance:.0f}% completado)'
+                    )
+
                 from apps.asignaciones.serializers import AsignacionSerializer
-                
                 return self.success_response(
                     data={
-                        'respuesta': RespuestaDetailSerializer(respuesta_actualizada).data,
-                        'asignacion': AsignacionSerializer(asignacion).data,
-                        'asignacion_completada': asignacion_completada,
-                        'gap_calculado': gap_info,
+                        'respuesta':           RespuestaDetailSerializer(respuesta_actualizada).data,
+                        'asignacion':          AsignacionSerializer(asignacion).data,
+                        'asignacion_completa': asignacion_completa,
                     },
                     message=mensaje,
                     status_code=status.HTTP_200_OK
                 )
-        
+
         except Exception as e:
-            print(f"❌ Error al enviar respuesta: {e}")
             import traceback
             traceback.print_exc()
             return self.error_response(
@@ -326,14 +294,13 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
         GET /api/respuestas/revision/?asignacion={id}
         """
         asignacion_id = request.query_params.get('asignacion')
-        
+
         if not asignacion_id:
             return self.error_response(
                 message='Se requiere el parámetro asignacion',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Validar que el usuario tenga permisos
+
         try:
             from apps.asignaciones.models import Asignacion
             asignacion = Asignacion.objects.get(id=asignacion_id)
@@ -342,37 +309,242 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
                 message='Asignación no encontrada',
                 status_code=status.HTTP_404_NOT_FOUND
             )
-        
-        # Validar permisos
-        if request.user.rol == 'administrador':
+
+        # ── Validar permisos ──────────────────────────────────────────────────
+        if request.user.rol == 'superadmin':
+            pass  # Acceso total
+        elif request.user.rol in ['administrador', 'auditor']:
+            # Admin y Auditor: solo su empresa
             if asignacion.empresa != request.user.empresa:
                 return self.error_response(
                     message='No tienes permisos para ver esta asignación',
                     status_code=status.HTTP_403_FORBIDDEN
                 )
-        elif request.user.rol not in ['superadmin']:
+        else:
             return self.error_response(
                 message='No tienes permisos',
                 status_code=status.HTTP_403_FORBIDDEN
             )
-        
+
         queryset = Respuesta.objects.filter(
             asignacion_id=asignacion_id,
             activo=True
         ).select_related(
             'pregunta',
             'pregunta__dimension',
-            'respondido_por'
+            'respondido_por',
+            'auditado_por',          # ⭐ Para mostrar quién calificó
         ).prefetch_related(
             'evidencias'
         ).order_by('pregunta__orden')
-        
+
         serializer = RespuestaDetailSerializer(queryset, many=True)
-        
+
         return Response({
             'count': queryset.count(),
             'results': serializer.data
         })
+            
+class AuditorViewSet(ResponseMixin, viewsets.GenericViewSet):
+    """
+    ViewSet exclusivo para el rol Auditor.
+
+    Endpoints:
+        GET  /api/auditor/mis_revisiones/              → Asignaciones pendientes de auditar
+        POST /api/auditor/calificar/{respuesta_id}/    → Calificar una respuesta
+        POST /api/auditor/cerrar_revision/{asig_id}/   → Cerrar revisión (GAP automático)
+        GET  /api/auditor/historial/                   → Evaluaciones ya auditadas (con filtro de fecha)
+        GET  /api/auditor/notificaciones/              → Notificaciones del auditor
+    """
+    permission_classes = [IsAuthenticated, EsAuditor]
+
+    # ── mis_revisiones ────────────────────────────────────────────────────────
+    @action(detail=False, methods=['get'])
+    def mis_revisiones(self, request):
+        """
+        Lista asignaciones completadas de la empresa del auditor.
+        Incluye tanto las pendientes de revisar (completado) como las ya auditadas.
+        """
+        user = request.user
+
+        qs = Asignacion.objects.filter(
+            empresa=user.empresa,
+            # ⭐ CORREGIDO: 'completado' en lugar de 'pendiente_auditoria'
+            # El estado pasa a 'completado' cuando el usuario envía la última respuesta
+            estado__in=['completado', 'pendiente_auditoria', 'auditado'],
+            activo=True
+        ).select_related(
+            'dimension', 'usuario_asignado', 'encuesta', 'evaluacion_empresa'
+        ).order_by('-fecha_completado')  # ⭐ Más recientes primero
+
+        evaluacion_id = request.query_params.get('evaluacion_empresa_id')
+        if evaluacion_id:
+            qs = qs.filter(evaluacion_empresa_id=evaluacion_id)
+
+        from apps.asignaciones.serializers import AsignacionSerializer
+        return Response({
+            'count':   qs.count(),
+            'results': AsignacionSerializer(qs, many=True).data
+        })
+
+    # ── calificar ─────────────────────────────────────────────────────────────
+    @action(detail=False, methods=['post'], url_path='calificar/(?P<respuesta_id>[^/.]+)')
+    def calificar(self, request, respuesta_id=None):
+        """
+        El auditor califica una respuesta individual.
+
+        Body:
+        {
+            "calificacion_auditor": "SI_CUMPLE" | "CUMPLE_PARCIAL" | "NO_CUMPLE",
+            "comentarios_auditor": "...",
+            "recomendaciones_auditor": "...",
+            "nivel_madurez": 3.0
+        }
+        """
+        try:
+            respuesta = Respuesta.objects.select_related(
+                'asignacion__empresa', 'asignacion__usuario_asignado'
+            ).get(id=respuesta_id)
+        except Respuesta.DoesNotExist:
+            return self.error_response(
+                message='Respuesta no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+
+        # No calificar NO_APLICA
+        if respuesta.respuesta == 'NO_APLICA':
+            return self.error_response(
+                message='Las respuestas marcadas como "No Aplica" no requieren calificación',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = AuditorCalificarSerializer(
+            respuesta, data=request.data, partial=True, context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        respuesta_actualizada = serializer.save()
+
+        return self.success_response(
+            data=RespuestaDetailSerializer(respuesta_actualizada).data,
+            message='Respuesta calificada exitosamente'
+        )
+
+    # ── cerrar_revision ───────────────────────────────────────────────────────
+    @action(detail=False, methods=['post'], url_path='cerrar_revision/(?P<asignacion_id>[^/.]+)')
+    def cerrar_revision(self, request, asignacion_id=None):
+        """
+        Cierra la revisión de una asignación completa.
+        - Las respuestas sin calificar pasan a NO_CUMPLE automáticamente.
+        - GAP se calcula automáticamente.
+        - Se notifica al administrador y usuario.
+
+        Body (opcional):
+        {
+            "comentario_cierre": "Revisión completada. ..."
+        }
+        """
+        try:
+            asignacion = Asignacion.objects.select_related(
+                'empresa', 'evaluacion_empresa', 'usuario_asignado'
+            ).get(id=asignacion_id)
+        except Asignacion.DoesNotExist:
+            return self.error_response(
+                message='Asignación no encontrada',
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = AuditorCerrarRevisionSerializer(
+            data=request.data,
+            context={'request': request, 'asignacion': asignacion}
+        )
+        serializer.is_valid(raise_exception=True)
+        resultado = serializer.save()
+
+        return self.success_response(
+            data=resultado,
+            message='Revisión cerrada exitosamente. GAP calculado.'
+        )
+
+    # ── historial ─────────────────────────────────────────────────────────────
+    @action(detail=False, methods=['get'])
+    def historial(self, request):
+        """
+        Evaluaciones (asignaciones) ya auditadas por este auditor o de su empresa.
+
+        Query params:
+            fecha_desde  (YYYY-MM-DD)
+            fecha_hasta  (YYYY-MM-DD)
+            evaluacion_empresa_id
+        """
+        user = request.user
+
+        qs = Asignacion.objects.filter(
+            empresa=user.empresa,
+            estado='completado',
+            activo=True
+        ).select_related(
+            'dimension', 'usuario_asignado', 'encuesta', 'evaluacion_empresa'
+        ).order_by('-fecha_completado')
+
+        fecha_desde = request.query_params.get('fecha_desde')
+        fecha_hasta = request.query_params.get('fecha_hasta')
+        evaluacion_id = request.query_params.get('evaluacion_empresa_id')
+
+        if fecha_desde:
+            qs = qs.filter(fecha_completado__date__gte=fecha_desde)
+        if fecha_hasta:
+            qs = qs.filter(fecha_completado__date__lte=fecha_hasta)
+        if evaluacion_id:
+            qs = qs.filter(evaluacion_empresa_id=evaluacion_id)
+
+        from apps.asignaciones.serializers import AsignacionSerializer
+        return Response({
+            'count':   qs.count(),
+            'results': AsignacionSerializer(qs, many=True).data
+        })
+
+    # ── notificaciones ────────────────────────────────────────────────────────
+    @action(detail=False, methods=['get'])
+    def notificaciones(self, request):
+        """
+        Notificaciones del auditor: evaluaciones cerradas/completadas
+        de su empresa ordenadas por fecha.
+
+        Query params:
+            solo_no_leidas (bool)
+            fecha_desde    (YYYY-MM-DD)
+        """
+        user = request.user
+
+        try:
+            from apps.notificaciones.models import Notificacion
+            qs = Notificacion.objects.filter(
+                usuario=user,
+                activo=True
+            ).order_by('-fecha_creacion')
+
+            solo_no_leidas = request.query_params.get('solo_no_leidas', 'false').lower() == 'true'
+            fecha_desde    = request.query_params.get('fecha_desde')
+
+            if solo_no_leidas:
+                qs = qs.filter(leida=False)
+            if fecha_desde:
+                qs = qs.filter(fecha_creacion__date__gte=fecha_desde)
+
+            from apps.notificaciones.serializers import NotificacionSerializer
+            return Response({
+                'count':        qs.count(),
+                'no_leidas':    qs.filter(leida=False).count(),
+                'results':      NotificacionSerializer(qs, many=True).data
+            })
+
+        except Exception as e:
+            return self.error_response(
+                message='Error al obtener notificaciones',
+                errors=str(e),
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )        
+        
 # ============================================
 # VIEWSET: EVIDENCIAS
 # ============================================
