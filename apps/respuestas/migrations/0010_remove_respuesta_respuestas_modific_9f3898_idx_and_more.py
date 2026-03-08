@@ -15,34 +15,34 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RemoveIndex(
-            model_name='respuesta',
-            name='respuestas_modific_9f3898_idx',
-        ),
-        migrations.RemoveField(
-            model_name='respuesta',
-            name='justificacion_madurez',
-        ),
-        migrations.AddField(
-            model_name='respuesta',
-            name='auditado_por',
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='respuestas_auditadas', to=settings.AUTH_USER_MODEL, verbose_name='Auditado Por'),
-        ),
-        migrations.AddField(
-            model_name='respuesta',
-            name='calificacion_auditor',
-            field=models.CharField(blank=True, choices=[('SI_CUMPLE', 'Sí Cumple'), ('CUMPLE_PARCIAL', 'Cumple Parcialmente'), ('NO_CUMPLE', 'No Cumple')], help_text='SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE — asignado por el Auditor', max_length=20, null=True, verbose_name='Calificación del Auditor'),
-        ),
-        migrations.AddField(
-            model_name='respuesta',
-            name='comentarios_auditor',
-            field=models.TextField(blank=True, default='', help_text='Observaciones del auditor sobre la respuesta', verbose_name='Comentarios del Auditor'),
-        ),
-        migrations.AddField(
-            model_name='respuesta',
-            name='fecha_auditoria',
-            field=models.DateTimeField(blank=True, help_text='Fecha en que el auditor calificó esta respuesta', null=True, verbose_name='Fecha de Auditoría'),
-        ),
+        #migrations.RemoveIndex(
+        #    model_name='respuesta',
+        #    name='respuestas_modific_9f3898_idx',
+        #),
+        #migrations.RemoveField(
+        #    model_name='respuesta',
+        #    name='justificacion_madurez',
+        #),
+        #migrations.AddField(
+        #    model_name='respuesta',
+        #    name='auditado_por',
+        #    field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='respuestas_auditadas', to=settings.AUTH_USER_MODEL, verbose_name='Auditado Por'),
+        #),
+        #migrations.AddField(
+        #    model_name='respuesta',
+        #    name='calificacion_auditor',
+        #    field=models.CharField(blank=True, choices=[('SI_CUMPLE', 'Sí Cumple'), ('CUMPLE_PARCIAL', 'Cumple Parcialmente'), ('NO_CUMPLE', 'No Cumple')], help_text='SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE — asignado por el Auditor', max_length=20, null=True, verbose_name='Calificación del Auditor'),
+        #),
+        #migrations.AddField(
+        #    model_name='respuesta',
+        #    name='comentarios_auditor',
+        #    field=models.TextField(blank=True, default='', help_text='Observaciones del auditor sobre la respuesta', verbose_name='Comentarios del Auditor'),
+        #),
+        #migrations.AddField(
+        #    model_name='respuesta',
+        #    name='fecha_auditoria',
+        #    field=models.DateTimeField(blank=True, help_text='Fecha en que el auditor calificó esta respuesta', null=True, verbose_name='Fecha de Auditoría'),
+        #),
         migrations.AddField(
             model_name='respuesta',
             name='recomendaciones_auditor',
