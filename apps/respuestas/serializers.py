@@ -6,17 +6,37 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import (
-    TipoDocumento,
     Respuesta,
     HistorialRespuesta,
     Evidencia,
     CalculoNivel,
-    #Iniciativa
 )
+# Importamos TipoDocumento desde documentos para asegurar consistencia
+from apps.documentos.models import TipoDocumento
+from apps.documentos.serializers import DocumentoSerializer 
 from apps.encuestas.models import Pregunta, Dimension
 from apps.asignaciones.models import Asignacion
 from apps.usuarios.models import Usuario
-from drf_spectacular.utils import extend_schema_field
+
+
+# ============================================
+# UTILITY FUNCTIONS
+# ============================================
+
+def _get_client_ip(request):
+    if not request:
+        return None
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded_for:
+        return x_forwarded_for.split(',')[0]
+    return request.META.get('REMOTE_ADDR')
+
+
+def _get_user_agent(request):
+    if not request:
+        return ''
+    return request.META.get('HTTP_USER_AGENT', '')[:255]
+
 
 # ============================================
 # SERIALIZERS DE TIPOS DE DOCUMENTO
@@ -29,7 +49,11 @@ class TipoDocumentoSerializer(serializers.ModelSerializer):
         model = TipoDocumento
         fields = [
             'id', 'empresa', 'nombre', 'descripcion', 
-            'requiere_fecha', 'activo'
+            'requiere_fecha', 'activo',
+            # Campos nuevos del módulo
+            'abreviatura', 'nivel_jerarquico', 'categoria', 
+            'requiere_word_y_pdf'
+            # 'configuracion_campos' <- ELIMINADO porque no existe en el modelo actual
         ]
         read_only_fields = ['id']
 
@@ -39,7 +63,7 @@ class TipoDocumentoListSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = TipoDocumento
-        fields = ['id', 'nombre', 'descripcion']
+        fields = ['id', 'nombre', 'descripcion', 'abreviatura']
 
 
 # ============================================
@@ -63,6 +87,11 @@ class EvidenciaSerializer(serializers.ModelSerializer):
         source='get_tipo_documento_enum_display',
         read_only=True
     )
+
+    documento_oficial_detalle = DocumentoSerializer(
+        source='documento_oficial', 
+        read_only=True
+    )
     
     class Meta:
         model = Evidencia
@@ -83,18 +112,18 @@ class EvidenciaSerializer(serializers.ModelSerializer):
             'extension',
             'tamanio_bytes', 
             'tamanio_mb',
-            #'tipo_mime',  # ⭐ NUEVO
             # Auditoría
             'subido_por', 
             'subido_por_nombre',
             'fecha_creacion', 
-            'activo'
+            'activo',
+            'documento_oficial',          # Para enviar el ID desde el front
+            'documento_oficial_detalle', # Para ver los datos del doc en el front
         ]
         read_only_fields = [
             'id', 
             'nombre_archivo_original', 
             'tamanio_bytes',
-            #'tipo_mime',
             'url_archivo', 
             'tamanio_mb',
             'extension',
@@ -134,17 +163,23 @@ class EvidenciaSerializer(serializers.ModelSerializer):
 class EvidenciaCreateSerializer(serializers.Serializer):
     """
     ⭐ SERIALIZER PARA CREAR EVIDENCIAS
-    Maneja la subida de archivos a Supabase
+    Maneja la subida de archivos a Supabase O la vinculación
     """
     
     # Campos requeridos
     respuesta_id = serializers.UUIDField(required=True)
-    archivo = serializers.FileField(required=True)
+    
+    # Opcional: Archivo físico
+    archivo = serializers.FileField(required=False)
+
+    # Opcional: ID del documento maestro (Vinculación)
+    documento_id = serializers.UUIDField(required=False, allow_null=True)
     
     # Metadatos del documento
+    # ⭐ CORRECCIÓN: required=False para permitir que vengan vacíos si se está vinculando
     codigo_documento = serializers.CharField(
         max_length=50,
-        required=True,
+        required=False, 
         help_text='Código único del documento (ej: POL-SEG-001)'
     )
     tipo_documento_enum = serializers.ChoiceField(
@@ -153,25 +188,28 @@ class EvidenciaCreateSerializer(serializers.Serializer):
     )
     titulo_documento = serializers.CharField(
         max_length=60,
+        required=False,
         default='Documento sin título'
     )
     objetivo_documento = serializers.CharField(
         max_length=180,
+        required=False,
         default='Sin objetivo especificado'
     )
     
     def validate_codigo_documento(self, value):
-        """Validar código de documento"""
-        if not value or len(value.strip()) == 0:
-            raise serializers.ValidationError('El código de documento es obligatorio')
-        
-        # Limpiar espacios y convertir a mayúsculas
-        return value.strip().upper()
+        """Validar código de documento si viene"""
+        if value:
+            return value.strip().upper()
+        return value
     
     def validate_archivo(self, value):
         """
         ⭐ VALIDAR ARCHIVO ANTES DE SUBIRLO
         """
+        if not value:
+            return value
+
         # Validar extensión
         ext = os.path.splitext(value.name)[1].lower()
         if ext not in Evidencia.EXTENSIONES_PERMITIDAS:
@@ -189,13 +227,27 @@ class EvidenciaCreateSerializer(serializers.Serializer):
         return value
     
     def validate(self, attrs):
-        """Validaciones adicionales"""
-        # Validar que titulo_documento no esté vacío
-        titulo = attrs.get('titulo_documento', '').strip()
-        if not titulo or titulo == 'Documento sin título':
+        """Validaciones adicionales lógicas"""
+        archivo = attrs.get('archivo')
+        documento_id = attrs.get('documento_id')
+        codigo_documento = attrs.get('codigo_documento')
+        titulo_documento = attrs.get('titulo_documento')
+
+        # CASO 1: Si NO hay archivo Y NO hay documento_id -> Error
+        if not archivo and not documento_id:
             raise serializers.ValidationError({
-                'titulo_documento': 'Debes proporcionar un título descriptivo para el documento'
+                'archivo': 'Debe subir un archivo nuevo o seleccionar un documento existente del Maestro de Documentos.'
             })
+        
+        # CASO 2: Si es subida manual (NO hay documento_id), validamos campos de texto
+        if not documento_id:
+            if not codigo_documento:
+                raise serializers.ValidationError({'codigo_documento': 'El código de documento es obligatorio para subidas manuales.'})
+            
+            # Validar título si es subida manual
+            if not titulo_documento or titulo_documento.strip() == 'Documento sin título':
+                 # Si el usuario no mandó título, podríamos dejarlo pasar o exigir
+                 pass 
         
         return attrs
 
@@ -231,6 +283,8 @@ class HistorialRespuestaSerializer(serializers.ModelSerializer):
         read_only=True
     )
     
+    ip_address = serializers.CharField(read_only=True)
+    
     class Meta:
         model = HistorialRespuesta
         fields = [
@@ -250,212 +304,179 @@ class HistorialRespuestaSerializer(serializers.ModelSerializer):
 # ============================================
 
 class RespuestaListSerializer(serializers.ModelSerializer):
-    """Serializer simplificado para listados"""
-    
-    pregunta_codigo = serializers.CharField(source='pregunta.codigo', read_only=True)
-    pregunta_texto = serializers.CharField(source='pregunta.texto', read_only=True)
-    respuesta_display = serializers.CharField(
-        source='get_respuesta_display',
-        read_only=True
+    pregunta_codigo       = serializers.CharField(source='pregunta.codigo',  read_only=True)
+    pregunta_texto        = serializers.CharField(source='pregunta.texto',   read_only=True)
+    estado_display        = serializers.CharField(source='get_estado_display', read_only=True)
+    respondido_por_nombre = serializers.CharField(source='respondido_por.nombre_completo', read_only=True)
+    auditado_por_nombre   = serializers.CharField(source='auditado_por.nombre_completo',   read_only=True)
+    total_evidencias      = serializers.SerializerMethodField()
+
+    # El usuario ya no tiene "respuesta_display" con SI/NO, sino calificacion_auditor
+    calificacion_display  = serializers.CharField(
+        source='get_calificacion_auditor_display', read_only=True
     )
-    estado_display = serializers.CharField(
-        source='get_estado_display',
-        read_only=True
-    )
-    respondido_por_nombre = serializers.CharField(
-        source='respondido_por.nombre_completo',
-        read_only=True
-    )
-    # ⭐ NUEVOS CAMPOS
-    nivel_madurez_display = serializers.CharField(
-        source='get_nivel_madurez_display_verbose',
-        read_only=True
-    )
-    total_evidencias = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Respuesta
         fields = [
             'id', 'asignacion', 'pregunta', 'pregunta_codigo', 'pregunta_texto',
-            'respuesta', 'respuesta_display', 'justificacion',
-            # ⭐ NUEVOS CAMPOS
-            'nivel_madurez', 'nivel_madurez_display',
-            'estado', 'estado_display', 'respondido_por', 'respondido_por_nombre',
-            'respondido_at', 'total_evidencias', 'version'
+            # Respuesta del usuario
+            'respuesta', 'justificacion',
+            # Calificación del auditor
+            'calificacion_auditor', 'calificacion_display',
+            'comentarios_auditor', 'recomendaciones_auditor', 'fecha_auditoria',
+            'auditado_por', 'auditado_por_nombre',
+            # Nivel
+            'nivel_madurez',
+            # Estado y auditoría
+            'estado', 'estado_display',
+            'respondido_por', 'respondido_por_nombre', 'respondido_at',
+            'total_evidencias', 'version'
         ]
-    
+
     def get_total_evidencias(self, obj):
-        """Total de evidencias"""
         return obj.evidencias.filter(activo=True).count()
 
 
 class RespuestaDetailSerializer(serializers.ModelSerializer):
-    """Serializer detallado con evidencias e historial"""
-    
-    pregunta_codigo = serializers.CharField(source='pregunta.codigo', read_only=True)
-    pregunta_texto = serializers.CharField(source='pregunta.texto', read_only=True)
-    pregunta_objetivo = serializers.CharField(source='pregunta.objetivo', read_only=True)
-    respuesta_display = serializers.CharField(source='get_respuesta_display', read_only=True)
-    estado_display = serializers.CharField(source='get_estado_display', read_only=True)
-    respondido_por_nombre = serializers.CharField(
-        source='respondido_por.nombre_completo',
-        read_only=True
+    from .serializers import EvidenciaSerializer, HistorialRespuestaSerializer  # evitar circular
+
+    pregunta_codigo       = serializers.CharField(source='pregunta.codigo', read_only=True)
+    pregunta_texto        = serializers.CharField(source='pregunta.texto',  read_only=True)
+    estado_display        = serializers.CharField(source='get_estado_display', read_only=True)
+    respondido_por_nombre = serializers.CharField(source='respondido_por.nombre_completo', read_only=True)
+    modificado_por_nombre = serializers.CharField(source='modificado_por.nombre_completo', read_only=True)
+    auditado_por_nombre   = serializers.CharField(source='auditado_por.nombre_completo',   read_only=True)
+    calificacion_display  = serializers.CharField(
+        source='get_calificacion_auditor_display', read_only=True
     )
-    modificado_por_nombre = serializers.CharField(
-        source='modificado_por.nombre_completo',
-        read_only=True
-    )
-    # ⭐ NUEVOS CAMPOS
-    nivel_madurez_display = serializers.CharField(
-        source='get_nivel_madurez_display_verbose',
-        read_only=True
-    )
-    
-    evidencias = EvidenciaSerializer(many=True, read_only=True)
-    historial = HistorialRespuestaSerializer(many=True, read_only=True)
-    
+
+    # Relaciones anidadas — se importan inline para evitar circulares
+    evidencias = serializers.SerializerMethodField()
+    historial  = serializers.SerializerMethodField()
+
     class Meta:
         model = Respuesta
         fields = [
             'id', 'asignacion', 'pregunta', 'pregunta_codigo', 'pregunta_texto',
-            'pregunta_objetivo', 'respuesta', 'respuesta_display',
-            'justificacion', 'comentarios_adicionales',
-            # ⭐ NUEVOS CAMPOS
-            'nivel_madurez', 'nivel_madurez_display',
+            'respuesta', 'justificacion', 'comentarios_adicionales',
+            'calificacion_auditor', 'calificacion_display',
+            'comentarios_auditor', 'recomendaciones_auditor',
+            'fecha_auditoria', 'auditado_por', 'auditado_por_nombre',
+            'nivel_madurez',
             'estado', 'estado_display',
             'respondido_por', 'respondido_por_nombre', 'respondido_at',
             'modificado_por', 'modificado_por_nombre', 'modificado_at',
             'version', 'evidencias', 'historial'
         ]
 
+    def get_evidencias(self, obj):
+        from .serializers import EvidenciaSerializer
+        return EvidenciaSerializer(obj.evidencias.filter(activo=True), many=True).data
+
+    def get_historial(self, obj):
+        from .serializers import HistorialRespuestaSerializer
+        return HistorialRespuestaSerializer(obj.historial.all(), many=True).data
+
+
 
 
 class RespuestaCreateSerializer(serializers.ModelSerializer):
-    """Serializer para crear respuestas"""
-    
+    """
+    El usuario crea una respuesta.
+    Solo puede marcar NO_APLICA (con justificación) o dejar respuesta=null
+    y subir evidencias. Las evidencias son siempre obligatorias excepto
+    cuando marca NO_APLICA.
+    """
+
     class Meta:
         model = Respuesta
         fields = [
-            'asignacion', 'pregunta', 'respuesta', 
-            'justificacion', 'comentarios_adicionales',
-            # ⭐ CAMPOS DE NIVEL DE MADUREZ
-            'nivel_madurez'
+            'asignacion', 'pregunta',
+            'respuesta',           # null o 'NO_APLICA'
+            'justificacion',       # obligatorio siempre ≥10 chars
+            'comentarios_adicionales',
         ]
-    
+
+    def validate_respuesta(self, value):
+        # ⭐ Ahora el usuario puede marcar NO_APLICA o NO_CUMPLE (respuesta "No")
+        if value is not None and value not in ['NO_APLICA', 'NO_CUMPLE']:
+            raise serializers.ValidationError(
+                'Solo puedes marcar "No Aplica" o "No". '
+                'SI_CUMPLE y CUMPLE_PARCIAL los asigna el Auditor.'
+            )
+        return value
+
     def validate(self, attrs):
-        """Validaciones"""
         asignacion = attrs.get('asignacion')
-        pregunta = attrs.get('pregunta')
-        respuesta = attrs.get('respuesta')
+        pregunta   = attrs.get('pregunta')
+        respuesta  = attrs.get('respuesta')
         justificacion = attrs.get('justificacion', '')
         nivel_madurez = attrs.get('nivel_madurez', 0)
-        # justificacion_madurez = attrs.get('justificacion_madurez', '')  # ❌ YA NO SE USA
         
         # Validar que la pregunta pertenezca a la dimensión
         if pregunta.dimension != asignacion.dimension:
             raise serializers.ValidationError({
                 'pregunta': 'La pregunta no pertenece a la dimensión de esta asignación'
             })
-        
-        # Validar que no exista ya una respuesta
-        if Respuesta.objects.filter(
-            asignacion=asignacion,
-            pregunta=pregunta
-        ).exists():
+
+        # No duplicar respuesta
+        if Respuesta.objects.filter(asignacion=asignacion, pregunta=pregunta).exists():
             raise serializers.ValidationError({
                 'pregunta': 'Ya existe una respuesta para esta pregunta'
             })
-        
-        # Validar justificación según respuesta
-        if respuesta == 'SI_CUMPLE' and len(justificacion.strip()) < 10:
-            raise serializers.ValidationError({
-                'justificacion': 'Para respuestas "Sí Cumple", la justificación debe tener al menos 10 caracteres'
-            })
-        
+
+        # Justificación siempre requerida
         if len(justificacion.strip()) < 10:
             raise serializers.ValidationError({
                 'justificacion': 'La justificación debe tener al menos 10 caracteres'
             })
-        
-        # ⭐ VALIDACIONES DE NIVEL DE MADUREZ (SIMPLIFICADAS)
-        
-        # 1. Si NO_CUMPLE o NO_APLICA → nivel debe ser 0
-        if respuesta in ['NO_CUMPLE', 'NO_APLICA']:
-            if nivel_madurez != 0:
-                raise serializers.ValidationError({
-                    'nivel_madurez': 'El nivel de madurez debe ser 0 para "No Cumple" o "No Aplica"'
-                })
 
-        # 2. Nivel debe ser múltiplo de 0.5
-        if (nivel_madurez * 2) % 1 != 0:
-            raise serializers.ValidationError({
-                'nivel_madurez': 'El nivel de madurez debe ser en incrementos de 0.5 (ej: 1.0, 1.5, 2.0, etc.)'
-            })
-        
         return attrs
-    
+
     def create(self, validated_data):
-        """Crear respuesta con auditoría"""
         request = self.context.get('request')
-        
         with transaction.atomic():
-            if request and request.user:
-                validated_data['respondido_por'] = request.user
-            
-            validated_data['estado'] = 'borrador'
+            validated_data['respondido_por'] = request.user if request else None
+            validated_data['estado']  = 'borrador'
             validated_data['version'] = 1
-            
+
             respuesta = Respuesta.objects.create(**validated_data)
-            
+
             HistorialRespuesta.objects.create(
                 respuesta=respuesta,
                 tipo_cambio='creacion',
                 usuario=request.user if request else None,
-                valor_nuevo_respuesta=respuesta.respuesta,
                 valor_nuevo_justificacion=respuesta.justificacion,
                 motivo='Creación inicial de respuesta',
-                ip_address=self._get_client_ip(request),
-                user_agent=self._get_user_agent(request)
+                ip_address=_get_client_ip(request),
+                user_agent=_get_user_agent(request),
             )
-            
             return respuesta
-    
-    def _get_client_ip(self, request):
-        if not request:
-            return None
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
-    
-    def _get_user_agent(self, request):
-        if not request:
-            return ''
-        return request.META.get('HTTP_USER_AGENT', '')[:255]
+
 
 
 class RespuestaUpdateSerializer(serializers.ModelSerializer):
-    """Serializer para actualizar respuestas (Usuario)"""
-    
+    """Solo se puede editar en estado borrador."""
+
     class Meta:
         model = Respuesta
-        fields = [
-            'respuesta', 'justificacion', 'comentarios_adicionales',
-            # ⭐ CAMPOS DE NIVEL DE MADUREZ
-            'nivel_madurez'
-        ]
+        fields = ['respuesta', 'justificacion', 'comentarios_adicionales']
+
+    def validate_respuesta(self, value):
+        if value is not None and value not in ['NO_APLICA', 'NO_CUMPLE']:
+            raise serializers.ValidationError(
+                'Solo puedes marcar "No Aplica" o "No".'
+            )
+        return value
 
     def validate(self, attrs):
-        """Validaciones"""
         if self.instance.estado != 'borrador':
             raise serializers.ValidationError({
                 'estado': 'Solo se pueden editar respuestas en estado borrador'
             })
-        
-        respuesta = attrs.get('respuesta', self.instance.respuesta)
         justificacion = attrs.get('justificacion', self.instance.justificacion)
         nivel_madurez = attrs.get('nivel_madurez', self.instance.nivel_madurez)
-        # justificacion_madurez = attrs.get('justificacion_madurez', self.instance.justificacion_madurez)  # ❌ YA NO SE USA
         
         # Validar justificación
         if respuesta == 'SI_CUMPLE' and len(justificacion.strip()) < 10:
@@ -467,106 +488,59 @@ class RespuestaUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'justificacion': 'La justificación debe tener al menos 10 caracteres'
             })
-        
-        # ⭐ VALIDACIONES DE NIVEL DE MADUREZ (SIMPLIFICADAS)
-        
-        # 1. Si NO_CUMPLE o NO_APLICA → nivel debe ser 0
-        if respuesta in ['NO_CUMPLE', 'NO_APLICA']:
-            if nivel_madurez != 0:
-                raise serializers.ValidationError({
-                    'nivel_madurez': 'El nivel de madurez debe ser 0 para "No Cumple" o "No Aplica"'
-                })
-        
-        # 2. Nivel debe ser múltiplo de 0.5
-        if (nivel_madurez * 2) % 1 != 0:
-            raise serializers.ValidationError({
-                'nivel_madurez': 'El nivel de madurez debe ser en incrementos de 0.5'
-            })
-        
         return attrs
-    
+
     def update(self, instance, validated_data):
-        """Actualizar con auditoría"""
         request = self.context.get('request')
-        
         with transaction.atomic():
-            valor_anterior_respuesta = instance.respuesta
             valor_anterior_justificacion = instance.justificacion
-            valor_anterior_comentarios = instance.comentarios_adicionales
-            
             for attr, value in validated_data.items():
                 setattr(instance, attr, value)
-            
             instance.save()
-            
+
             HistorialRespuesta.objects.create(
                 respuesta=instance,
                 tipo_cambio='modificacion_respuesta',
                 usuario=request.user if request else None,
-                valor_anterior_respuesta=valor_anterior_respuesta,
                 valor_anterior_justificacion=valor_anterior_justificacion,
-                valor_anterior_comentarios=valor_anterior_comentarios,
-                valor_nuevo_respuesta=instance.respuesta,
                 valor_nuevo_justificacion=instance.justificacion,
-                valor_nuevo_comentarios=instance.comentarios_adicionales,
                 motivo='Actualización por el usuario',
-                ip_address=self._get_client_ip(request),
-                user_agent=self._get_user_agent(request)
+                ip_address=_get_client_ip(request),
+                user_agent=_get_user_agent(request),
             )
-            
             return instance
-    
-    def _get_client_ip(self, request):
-        if not request:
-            return None
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
-    
-    def _get_user_agent(self, request):
-        if not request:
-            return ''
-        return request.META.get('HTTP_USER_AGENT', '')[:255]
 
 
 class RespuestaEnviarSerializer(serializers.Serializer):
-    """Serializer para enviar respuesta (marcar como enviada)"""
-    
+    """
+    Marcar respuesta como enviada.
+    Validación: si respuesta != NO_APLICA, debe tener al menos 1 evidencia.
+    """
+
     def validate(self, attrs):
-        """Validaciones antes de enviar"""
         respuesta = self.instance
-        
+
         if respuesta.estado != 'borrador':
             raise serializers.ValidationError({
                 'estado': 'Solo se pueden enviar respuestas en estado borrador'
             })
-        
-        # ⭐ ACTUALIZADO: Validar evidencias para SI_CUMPLE y CUMPLE_PARCIAL
-        if respuesta.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL']:
+
+        # ⭐ Evidencias obligatorias SOLO cuando es Sí (respuesta=null)
+        # NO_APLICA y NO_CUMPLE no necesitan evidencias
+        if respuesta.respuesta is None:
             if not respuesta.evidencias.filter(activo=True).exists():
                 raise serializers.ValidationError({
-                    'evidencias': f'Las respuestas "{respuesta.get_respuesta_display()}" requieren al menos una evidencia'
+                    'evidencias': 'Debes subir al menos una evidencia antes de enviar'
                 })
-        
-        # ⭐ NUEVO: Validar nivel de madurez
-        if respuesta.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL']:
-            if respuesta.nivel_madurez == 0:
-                raise serializers.ValidationError({
-                    'nivel_madurez': 'Debes indicar un nivel de madurez mayor a 0 si cumples total o parcialmente'
-                })
-        
+
         return attrs
-    
+
     def save(self):
-        """Enviar respuesta"""
         respuesta = self.instance
-        request = self.context.get('request')
-        
+        request   = self.context.get('request')
         with transaction.atomic():
             respuesta.estado = 'enviado'
             respuesta.save()
-            
             HistorialRespuesta.objects.create(
                 respuesta=respuesta,
                 tipo_cambio='modificacion_respuesta',
@@ -574,25 +548,214 @@ class RespuestaEnviarSerializer(serializers.Serializer):
                 valor_anterior_respuesta='borrador',
                 valor_nuevo_respuesta='enviado',
                 motivo='Respuesta enviada por el usuario',
-                ip_address=self._get_client_ip(request),
-                user_agent=self._get_user_agent(request)
+                ip_address=_get_client_ip(request),
+                user_agent=_get_user_agent(request),
             )
-            
             return respuesta
     
-    def _get_client_ip(self, request):
-        if not request:
-            return None
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
-    
-    def _get_user_agent(self, request):
-        if not request:
-            return ''
-        return request.META.get('HTTP_USER_AGENT', '')[:255]
+        
+class AuditorCalificarSerializer(serializers.ModelSerializer):
+    """
+    El Auditor califica UNA respuesta individual.
+    Solo puede hacerlo si la asignación está en 'pendiente_auditoria'.
+    """
 
+    class Meta:
+        model = Respuesta
+        fields = [
+            'calificacion_auditor',   # SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE
+            'comentarios_auditor',
+            'recomendaciones_auditor',
+            'nivel_madurez',
+        ]
+
+    def validate_calificacion_auditor(self, value):
+        opciones = [c[0] for c in Respuesta.CALIFICACIONES_AUDITOR]
+        if value not in opciones:
+            raise serializers.ValidationError(
+                f'Calificación inválida. Opciones: {", ".join(opciones)}'
+            )
+        return value
+
+    def validate(self, attrs):
+        request       = self.context.get('request')
+        calificacion  = attrs.get('calificacion_auditor', self.instance.calificacion_auditor)
+        nivel_madurez = attrs.get('nivel_madurez', self.instance.nivel_madurez)
+
+        # Solo auditores de la misma empresa
+        if not request or request.user.rol != 'auditor':
+            raise serializers.ValidationError(
+                'Solo el Auditor puede calificar respuestas'
+            )
+
+        if self.instance.asignacion.empresa != request.user.empresa:
+            raise serializers.ValidationError(
+                'No puedes calificar respuestas de otra empresa'
+            )
+
+        # La asignación debe estar en pendiente_auditoria     
+        # Agregar 'auditado' a estados permitidos
+        if self.instance.asignacion.estado not in ['completado', 'pendiente_auditoria', 'auditado']:
+            raise serializers.ValidationError(
+                'La asignación no está disponible para auditoría'
+            )
+
+        # ⭐ No calificar NO_APLICA (también está en el view pero doble seguro)
+        if self.instance.respuesta == 'NO_APLICA':
+            raise serializers.ValidationError(
+                'Las respuestas No Aplica no pueden ser calificadas'
+            )
+
+        # Nivel de madurez: NO_CUMPLE → 0
+        if calificacion == 'NO_CUMPLE' and nivel_madurez != 0:
+            raise serializers.ValidationError({
+                'nivel_madurez': 'Para NO_CUMPLE el nivel de madurez debe ser 0'
+            })
+
+        # Nivel múltiplo de 0.5
+        if (nivel_madurez * 2) % 1 != 0:
+            raise serializers.ValidationError({
+                'nivel_madurez': 'El nivel de madurez debe ser múltiplo de 0.5'
+            })
+
+        return attrs
+
+    def update(self, instance, validated_data):
+        request = self.context.get('request')
+        with transaction.atomic():
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.auditado_por   = request.user
+            instance.fecha_auditoria = timezone.now()
+            instance.estado         = 'auditado'
+            # Evitar full_clean al guardar directamente
+            super(Respuesta, instance).save()
+
+            HistorialRespuesta.objects.create(
+                respuesta=instance,
+                tipo_cambio='modificacion_respuesta',
+                usuario=request.user,
+                valor_nuevo_respuesta=instance.calificacion_auditor,
+                motivo=f'Calificado por auditor: {instance.calificacion_auditor}',
+                ip_address=_get_client_ip(request),
+                user_agent=_get_user_agent(request),
+            )
+            return instance
+        
+
+class AuditorCerrarRevisionSerializer(serializers.Serializer):
+    """
+    El Auditor cierra la revisión de una asignación completa.
+
+    Lógica al cerrar:
+    1. Todas las respuestas que quedaron sin calificar → NO_CUMPLE automático.
+    2. Estado de la asignación → 'completado'.
+    3. Se calcula el GAP automáticamente.
+    4. Se notifica al administrador / usuario.
+    """
+    comentario_cierre = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='Comentario general del auditor al cerrar la revisión'
+    )
+
+    def validate(self, attrs):
+        request    = self.context.get('request')
+        asignacion = self.context.get('asignacion')
+
+        if not request or request.user.rol != 'auditor':
+            raise serializers.ValidationError(
+                'Solo el Auditor puede cerrar revisiones'
+            )
+        if asignacion.empresa != request.user.empresa:
+            raise serializers.ValidationError(
+                'No puedes cerrar revisiones de otra empresa'
+            )
+        if asignacion.estado not in ['completado', 'pendiente_auditoria']:
+            raise serializers.ValidationError(
+                'La asignación no está disponible para cerrar revisión'
+            )
+        return attrs
+
+    def save(self):
+        request           = self.context.get('request')
+        asignacion        = self.context.get('asignacion')
+        comentario_cierre = self.validated_data.get('comentario_cierre', '')
+
+        with transaction.atomic():
+            # 1. Marcar sin calificar → NO_CUMPLE automático
+            respuestas_pendientes = asignacion.respuestas.filter(
+                estado__in=['enviado', 'pendiente_auditoria'],
+                calificacion_auditor__isnull=True,
+                activo=True
+            ).exclude(respuesta__in=['NO_APLICA', 'NO_CUMPLE'])
+
+            # ⭐ Marcar NO_CUMPLE del usuario como auditadas automáticamente
+            respuestas_no_cumple_usuario = asignacion.respuestas.filter(
+                estado__in=['enviado', 'pendiente_auditoria'],
+                respuesta='NO_CUMPLE',
+                calificacion_auditor__isnull=True,
+                activo=True
+            )
+            for resp in respuestas_no_cumple_usuario:
+                resp.calificacion_auditor = 'NO_CUMPLE'
+                resp.nivel_madurez = 0.0
+                resp.comentarios_auditor = 'Usuario respondió No — confirmado automáticamente.'
+                resp.estado = 'auditado'
+                resp.fecha_auditoria = timezone.now()
+                super(Respuesta, resp).save()
+    
+            pendientes_count = respuestas_pendientes.count()
+
+            for resp in respuestas_pendientes:
+                resp.marcar_no_cumple_automatico()
+
+            # 2. Actualizar estado de la asignación
+            asignacion.estado           = 'auditado'
+            asignacion.fecha_completado = timezone.now()
+            if comentario_cierre:
+                asignacion.observaciones += f'\n[AUDITOR] {comentario_cierre}'
+            asignacion.save()
+
+            # 3. Calcular GAP
+            gap_info = None
+            try:
+                from apps.respuestas.services import CalculoNivelService
+                calculo  = CalculoNivelService.calcular_gap_asignacion(asignacion)
+                gap_info = {
+                    'nivel_deseado':           float(calculo.nivel_deseado),
+                    'nivel_actual':            float(calculo.nivel_actual),
+                    'gap':                     float(calculo.gap),
+                    'clasificacion':           calculo.get_clasificacion_gap_display(),
+                    'porcentaje_cumplimiento': float(calculo.porcentaje_cumplimiento),
+                }
+            except Exception as e:
+                print(f'⚠️  Error al calcular GAP: {e}')
+
+            # 4. Actualizar progreso de la evaluación
+            if asignacion.evaluacion_empresa_id:
+                try:
+                    asignacion.evaluacion_empresa.actualizar_progreso()
+                except Exception as e:
+                    print(f'⚠️  Error al actualizar progreso: {e}')
+
+            # 5. Notificar al administrador y al usuario
+            try:
+                from apps.notificaciones.services import NotificacionAsignacionService
+                NotificacionAsignacionService.notificar_revision_completada(
+                    asignacion=asignacion,
+                    auditado_por=request.user,
+                    gap_info=gap_info,
+                )
+            except Exception as e:
+                print(f'⚠️  Error al enviar notificación de cierre: {e}')
+
+            return {
+                'asignacion_id':      str(asignacion.id),
+                'estado':             asignacion.estado,
+                'gap_info':           gap_info,
+                'pendientes_auto_nc': pendientes_count,
+            }
 
 
 class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
@@ -633,9 +796,6 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'estado': 'Solo se pueden modificar respuestas enviadas'
             })
-        
-        # ⭐ SIN VALIDACIONES DE justificacion_madurez
-        # El admin puede modificar el nivel sin necesidad de justificarlo
         
         return attrs
     
@@ -721,9 +881,6 @@ class CalculoNivelSerializer(serializers.ModelSerializer):
             'respuestas_cumple_parcial', 
             'respuestas_no_cumple', 
             'respuestas_no_aplica',
-            #'respuestas_yes', 
-            #'respuestas_no', 
-            #'respuestas_na',
             'porcentaje_cumplimiento', 
             'clasificacion_gap', 
             'clasificacion_gap_display',
@@ -731,4 +888,3 @@ class CalculoNivelSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'calculado_at']
         depth = 0
-

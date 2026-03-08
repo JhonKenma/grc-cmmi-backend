@@ -9,61 +9,54 @@ from django.core.exceptions import ValidationError
 import uuid
 import os
 
-
-class TipoDocumento(BaseModel):
-    """
-    Catálogo de tipos de documentos para evidencias
-    Configurable por empresa
-    """
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    empresa = models.ForeignKey(
-        'empresas.Empresa',
-        on_delete=models.CASCADE,
-        related_name='tipos_documento',
-        verbose_name='Empresa'
-    )
-    nombre = models.CharField(max_length=100, verbose_name='Nombre del Tipo')
-    descripcion = models.TextField(blank=True, verbose_name='Descripción')
-    requiere_fecha = models.BooleanField(
-        default=True,
-        verbose_name='Requiere Fecha de Creación'
-    )
-    
-    class Meta:
-        db_table = 'tipos_documento'
-        verbose_name = 'Tipo de Documento'
-        verbose_name_plural = 'Tipos de Documento'
-        ordering = ['empresa', 'nombre']
-        unique_together = [['empresa', 'nombre']]
-        indexes = [
-            models.Index(fields=['empresa', 'activo']),
-        ]
-    
-    def __str__(self):
-        return f"{self.nombre} ({self.empresa.nombre})"
+# =============================================================================
+# IMPORTANTE: Importamos TipoDocumento desde la nueva app 'documentos'
+# =============================================================================
+from apps.documentos.models import TipoDocumento
 
 
 class Respuesta(BaseModel):
     """
-    Respuesta de un usuario a una pregunta específica
-    ⭐ ACTUALIZADO: Con 4 opciones de respuesta según puntaje CMMI + Nivel de Madurez
+    Respuesta de un usuario a una pregunta.
+
+    NUEVO FLUJO:
+    - El usuario SOLO puede marcar NO_APLICA (con justificación obligatoria)
+      O dejar respuesta=None y subir evidencias + justificación.
+    - Las opciones SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE
+      SOLO las asigna el Auditor después de revisar.
+    - Estados del ciclo de vida:
+        borrador            → El usuario está respondiendo
+        enviado             → El usuario envió, esperando revisión del auditor
+        pendiente_auditoria → Notificación enviada al auditor (alias de enviado)
+        auditado            → El auditor calificó todas las preguntas
+        modificado_admin    → El administrador hizo ajustes
     """
-    
-    # ⭐ ACTUALIZADO: 4 opciones de respuesta
-    OPCIONES_RESPUESTA = [
-        ('SI_CUMPLE', 'Sí Cumple'),              # 1.0 punto
-        ('CUMPLE_PARCIAL', 'Cumple Parcialmente'), # 0.5 puntos
-        ('NO_CUMPLE', 'No Cumple'),              # 0.0 puntos
-        ('NO_APLICA', 'No Aplica'),              # Excluido del cálculo
+
+    # ── Opciones que SOLO usa el Auditor ────────────────────────────────────
+    CALIFICACIONES_AUDITOR = [
+        ('SI_CUMPLE',      'Sí Cumple'),           # 1.0 punto
+        ('CUMPLE_PARCIAL', 'Cumple Parcialmente'),  # 0.5 puntos
+        ('NO_CUMPLE',      'No Cumple'),            # 0.0 puntos
     ]
-    
+
+    # ── Opción que usa el Usuario ────────────────────────────────────────────
+    OPCIONES_USUARIO = [
+        ('NO_APLICA', 'No Aplica'),   # Excluido del cálculo; requiere justificación
+    ]
+
+    # ── Todas las opciones posibles (para el campo respuesta) ────────────────
+    OPCIONES_RESPUESTA = OPCIONES_USUARIO + CALIFICACIONES_AUDITOR
+
     ESTADOS = [
-        ('borrador', 'Borrador'),
-        ('enviado', 'Enviado'),
-        ('modificado_admin', 'Modificado por Admin'),
+        ('borrador',            'Borrador'),
+        ('enviado',             'Enviado'),
+        ('pendiente_auditoria', 'Pendiente de Auditoría'),
+        ('auditado',            'Auditado'),
+        ('modificado_admin',    'Modificado por Admin'),
     ]
-    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
     asignacion = models.ForeignKey(
         Asignacion,
         on_delete=models.CASCADE,
@@ -76,49 +69,91 @@ class Respuesta(BaseModel):
         related_name='respuestas',
         verbose_name='Pregunta'
     )
+
+    # ── Campo de respuesta del USUARIO ───────────────────────────────────────
+    # null=True → cuando el usuario sube evidencias sin marcar NO_APLICA
+    # Solo valor permitido para el usuario: 'NO_APLICA'
     respuesta = models.CharField(
         max_length=20,
         choices=OPCIONES_RESPUESTA,
-        verbose_name='Respuesta',
-        help_text='Nivel de cumplimiento: Sí (1.0), Parcial (0.5), No (0.0), N/A (excluido)'
+        null=True,
+        blank=True,
+        verbose_name='Respuesta del Usuario',
+        help_text='El usuario solo puede marcar NO_APLICA. '
+                  'Si deja vacío, sube evidencias para que el auditor califique.'
     )
+
     justificacion = models.TextField(
-        verbose_name='Justificación',
+        verbose_name='Justificación del Usuario',
         blank=True,
         default='',
-        help_text='Obligatorio para "Sí Cumple" (mínimo 10 caracteres)'
+        help_text='Obligatorio siempre (mínimo 10 caracteres). '
+                  'Para NO_APLICA: explica por qué no aplica.'
     )
-    
-    # ⭐ NUEVOS CAMPOS DE NIVEL DE MADUREZ
+
+    comentarios_adicionales = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Comentarios Adicionales del Usuario'
+    )
+
+    # ── Campos de AUDITORÍA (solo los rellena el Auditor) ───────────────────
+    calificacion_auditor = models.CharField(
+        max_length=20,
+        choices=CALIFICACIONES_AUDITOR,
+        null=True,
+        blank=True,
+        verbose_name='Calificación del Auditor',
+        help_text='SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE — asignado por el Auditor'
+    )
+
+    comentarios_auditor = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Comentarios del Auditor',
+        help_text='Observaciones del auditor sobre la respuesta'
+    )
+
+    recomendaciones_auditor = models.TextField(
+        blank=True,
+        default='',
+        verbose_name='Recomendaciones del Auditor',
+        help_text='Qué debe mejorar la empresa para subir de nivel'
+    )
+
+    fecha_auditoria = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Fecha de Auditoría',
+        help_text='Fecha en que el auditor calificó esta respuesta'
+    )
+
+    auditado_por = models.ForeignKey(
+        'usuarios.Usuario',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='respuestas_auditadas',
+        verbose_name='Auditado Por'
+    )
+
+    # ── Nivel de madurez (lo asigna el Auditor, no el usuario) ──────────────
     nivel_madurez = models.DecimalField(
         max_digits=2,
         decimal_places=1,
         default=0.0,
         verbose_name='Nivel de Madurez',
-        help_text='Nivel de madurez de implementación (0 a 5 en incrementos de 0.5). Representa qué tan maduro está el proceso implementado.'
+        help_text='Asignado por el auditor (0–5 en incrementos de 0.5)'
     )
-    
-    justificacion_madurez = models.TextField(
-        blank=True,
-        default='',
-        verbose_name='Justificación del Nivel de Madurez',
-        help_text='Explicación de por qué se considera ese nivel de madurez (OPCIONAL)'
-    )
-    
-    comentarios_adicionales = models.TextField(
-        blank=True,
-        default='',
-        verbose_name='Comentarios Adicionales'
-    )
-    
+
+    # ── Auditoría de registro ────────────────────────────────────────────────
     estado = models.CharField(
-        max_length=20,
+        max_length=25,
         choices=ESTADOS,
         default='borrador',
         verbose_name='Estado'
     )
-    
-    # CAMPOS DE AUDITORÍA
+
     respondido_por = models.ForeignKey(
         'usuarios.Usuario',
         on_delete=models.SET_NULL,
@@ -126,11 +161,8 @@ class Respuesta(BaseModel):
         related_name='respuestas_creadas',
         verbose_name='Respondido por'
     )
-    respondido_at = models.DateTimeField(
-        auto_now_add=True, 
-        verbose_name='Fecha de Respuesta'
-    )
-    
+    respondido_at = models.DateTimeField(auto_now_add=True, verbose_name='Fecha de Respuesta')
+
     modificado_por = models.ForeignKey(
         'usuarios.Usuario',
         on_delete=models.SET_NULL,
@@ -139,17 +171,10 @@ class Respuesta(BaseModel):
         related_name='respuestas_modificadas',
         verbose_name='Última modificación por'
     )
-    modificado_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        verbose_name='Fecha de última modificación'
-    )
-    
-    version = models.IntegerField(
-        default=1,
-        verbose_name='Versión'
-    )
-    
+    modificado_at = models.DateTimeField(null=True, blank=True, verbose_name='Fecha de última modificación')
+
+    version = models.IntegerField(default=1, verbose_name='Versión')
+
     class Meta:
         db_table = 'respuestas'
         verbose_name = 'Respuesta'
@@ -160,19 +185,24 @@ class Respuesta(BaseModel):
             models.Index(fields=['asignacion', 'estado']),
             models.Index(fields=['pregunta']),
             models.Index(fields=['respondido_por']),
-            models.Index(fields=['modificado_por']),
+            models.Index(fields=['auditado_por']),
         ]
-    
+
     def __str__(self):
-        return f"{self.pregunta.codigo} - {self.get_respuesta_display()}"
+        # Usamos getattr para evitar error si pregunta no está cargada
+        codigo = getattr(self.pregunta, 'codigo', 'SIN-COD') if self.pregunta_id else 'SIN-PREG'
+        return f"{codigo} - {self.get_respuesta_display()}"
     
     def clean(self):
         """Validaciones personalizadas"""
-        # Validar que pregunta pertenezca a dimensión
-        if self.pregunta.dimension != self.asignacion.dimension:
-            raise ValidationError({
-                'pregunta': 'La pregunta no pertenece a la dimensión de esta asignación'
-            })
+        # Validar que pregunta pertenezca a dimensión (si los objetos están cargados)
+        if self.asignacion_id and self.pregunta_id:
+            # Nota: Accedemos solo si existen para evitar errores en creación
+            if hasattr(self.pregunta, 'dimension') and hasattr(self.asignacion, 'dimension'):
+                if self.pregunta.dimension != self.asignacion.dimension:
+                    raise ValidationError({
+                        'pregunta': 'La pregunta no pertenece a la dimensión de esta asignación'
+                    })
         
         # ⭐ VALIDACIÓN 1: Para "Sí Cumple", justificación mínima 10 caracteres
         if self.respuesta == 'SI_CUMPLE':
@@ -181,7 +211,7 @@ class Respuesta(BaseModel):
                     'justificacion': 'Para respuestas "Sí Cumple", la justificación debe tener al menos 10 caracteres'
                 })
         
-        # Validación general de justificación (para todas las respuestas)
+        # Validación general de justificación (para todas las respuestas) cuando se envía
         if self.estado in ['enviado', 'modificado_admin']:
             if not self.justificacion or len(self.justificacion.strip()) < 10:
                 raise ValidationError({
@@ -206,10 +236,11 @@ class Respuesta(BaseModel):
         # ⭐ VALIDACIÓN 5: Nivel de madurez debe ser múltiplo de 0.5
         if (self.nivel_madurez * 2) % 1 != 0:
             raise ValidationError({
-                'nivel_madurez': 'El nivel de madurez debe ser en incrementos de 0.5 (ej: 1.0, 1.5, 2.0, etc.)'
+                'calificacion_auditor': 'Una respuesta NO_APLICA no puede ser calificada por el auditor'
             })
         
         # ⭐ VALIDACIÓN 6: Para "Sí Cumple" o "Cumple Parcial" enviado, debe tener evidencias
+        # Nota: Esta validación requiere que la instancia ya tenga PK para consultar la relación inversa
         if self.pk and self.respuesta in ['SI_CUMPLE', 'CUMPLE_PARCIAL'] and self.estado in ['enviado', 'modificado_admin']:
             if not self.evidencias.filter(activo=True).exists():
                 raise ValidationError({
@@ -219,43 +250,59 @@ class Respuesta(BaseModel):
         # Máximo 3 evidencias
         if self.pk and self.evidencias.count() > 3:
             raise ValidationError({
-                'evidencias': 'Se permiten máximo 3 archivos de evidencia por respuesta'
+                'respuesta': 'SI_CUMPLE y CUMPLE_PARCIAL solo los asigna el Auditor.'
             })
-    
+
+        # 4. Nivel de madurez: solo el auditor lo asigna
+        #    Solo se valida si ya hay calificación de auditor
+        if self.calificacion_auditor:
+            if self.calificacion_auditor == 'NO_CUMPLE' and self.nivel_madurez != 0:
+                raise ValidationError({
+                    'nivel_madurez': 'El nivel de madurez debe ser 0 para NO_CUMPLE'
+                })
+            if (self.nivel_madurez * 2) % 1 != 0:
+                raise ValidationError({
+                    'nivel_madurez': 'El nivel de madurez debe ser múltiplo de 0.5'
+                })
+
     def save(self, *args, **kwargs):
-        if self.pk:
-            self.full_clean()
+        self.full_clean()  # Siempre validar
         super().save(*args, **kwargs)
         
-        # Actualizar contador de preguntas respondidas en asignación
+        # Actualizar contador en asignación si se envía
         if self.estado in ['enviado', 'modificado_admin']:
-            asignacion = self.asignacion
-            asignacion.preguntas_respondidas = asignacion.respuestas.filter(
-                estado__in=['enviado', 'modificado_admin']
-            ).count()
-            asignacion.save()
+            try:
+                asignacion = self.asignacion
+                asignacion.preguntas_respondidas = asignacion.respuestas.filter(
+                    estado__in=['enviado', 'modificado_admin']
+                ).count()
+                asignacion.save()
+            except Exception:
+                pass # Evitar romper save si falla la actualización del contador
     
     def get_puntaje(self):
         """
-        ⭐ Retorna el puntaje según la respuesta
-        - SI_CUMPLE: 1.0
-        - CUMPLE_PARCIAL: 0.5
-        - NO_CUMPLE: 0.0
-        - NO_APLICA: None (se excluye del cálculo)
+        Puntaje basado en la calificación del auditor.
+        - SI_CUMPLE      → 1.0
+        - CUMPLE_PARCIAL → 0.5
+        - NO_CUMPLE      → 0.0
+        - NO_APLICA      → None (excluido del cálculo)
+        - Sin calificar  → None
         """
+        if self.respuesta == 'NO_APLICA':
+            return None
         puntajes = {
-            'SI_CUMPLE': 1.0,
+            'SI_CUMPLE':      1.0,
             'CUMPLE_PARCIAL': 0.5,
-            'NO_CUMPLE': 0.0,
-            'NO_APLICA': None,  # Excluido
+            'NO_CUMPLE':      0.0,
         }
         return puntajes.get(self.respuesta, 0.0)
     
     def get_nivel_madurez_display_verbose(self):
         """Retorna solo el número del nivel de madurez"""
         return str(self.nivel_madurez)
-    
-    
+
+
 class HistorialRespuesta(models.Model):
     """
     Registro de auditoría para cambios en respuestas
@@ -363,6 +410,7 @@ class HistorialRespuesta(models.Model):
     def __str__(self):
         return f"{self.tipo_cambio} por {self.usuario} - {self.timestamp}"
 
+
 def evidencia_upload_path(instance, filename):
     """
     Función legacy para migraciones antiguas
@@ -370,7 +418,14 @@ def evidencia_upload_path(instance, filename):
     """
     ext = os.path.splitext(filename)[1]
     nuevo_nombre = f"{uuid.uuid4()}{ext}"
-    return f"evidencias/{instance.respuesta.asignacion.empresa_id}/{instance.respuesta.asignacion_id}/{nuevo_nombre}"
+    try:
+        # Intentamos obtener IDs de forma segura
+        empresa_id = instance.respuesta.asignacion.empresa_id
+        asignacion_id = instance.respuesta.asignacion_id
+        return f"evidencias/{empresa_id}/{asignacion_id}/{nuevo_nombre}"
+    except:
+        return f"evidencias/temp/{nuevo_nombre}"
+
 
 class Evidencia(BaseModel):
     """
@@ -392,14 +447,28 @@ class Evidencia(BaseModel):
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
     respuesta = models.ForeignKey(
         Respuesta,
         on_delete=models.CASCADE,
+        null=True,  # ⭐ AÑADIR
+        blank=True,  # ⭐ AÑADIR
         related_name='evidencias',
         verbose_name='Respuesta'
     )
+
+    # NUEVO CAMPO: Vínculo al Maestro de Documentos
+    documento_oficial = models.ForeignKey(
+        'documentos.Documento', 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name='evidencias_utilizadas',
+        verbose_name='Documento del Maestro',
+        help_text='Si selecciona un documento del Módulo de Gestión Documental, se vinculará aquí.'
+    )
     
-    # ⭐ CAMPO 1: Código de Documento (PRIMERO)
+    # ⭐ CAMPO 1: Código de Documento
     codigo_documento = models.CharField(
         max_length=50,
         default='SIN-CODIGO',
@@ -440,7 +509,7 @@ class Evidencia(BaseModel):
         blank=True,
         default=''
     )
-    # COFIGURACIÓN DEL CAMPO archivo PARA UPLOAD A SUPABASE
+    # CONFIGURACIÓN DEL CAMPO archivo PARA UPLOAD A SUPABASE
     archivo = models.CharField(
         max_length=500,
         verbose_name='Ruta del Archivo en Supabase',
@@ -460,7 +529,7 @@ class Evidencia(BaseModel):
         related_name='evidencias_subidas',
         verbose_name='Subido por'
     )
-    
+
     class Meta:
         db_table = 'evidencias'
         verbose_name = 'Evidencia'
@@ -470,22 +539,66 @@ class Evidencia(BaseModel):
             models.Index(fields=['respuesta']),
             models.Index(fields=['tipo_documento_enum']),
             models.Index(fields=['subido_por']),
-            models.Index(fields=['codigo_documento']),  # ⭐ Solo campos propios
-            # ❌ ELIMINAR: models.Index(fields=['codigo_documento', 'respuesta__asignacion__empresa'])
-            # Los índices NO pueden usar lookups de relaciones
+            models.Index(fields=['codigo_documento']), 
         ]
     
     def __str__(self):
         return f"{self.codigo_documento} - {self.titulo_documento}"
 
     def clean(self):
-        """Validaciones"""
-        # Máximo 3 evidencias por respuesta
-        if self.respuesta and not self.pk:
-            if self.respuesta.evidencias.count() >= 3:
+         """Validaciones"""
+         # Máximo 3 evidencias por respuesta
+         if self.respuesta and not self.pk:
+             if self.respuesta.evidencias.count() >= 3:
+                 raise ValidationError({
+                     'respuesta': 'Solo se permiten máximo 3 archivos por respuesta'
+                 })
+                
+    def clean(self):
+        """Validaciones avanzadas"""
+
+        super().clean()
+
+        # ==========================================
+        # 1️⃣ Máximo 3 evidencias por respuesta
+        # ==========================================
+        if self.respuesta_id and not self.pk:
+            # Usamos filter count para evitar error de acceso antes de guardar
+            count = Evidencia.objects.filter(respuesta_id=self.respuesta_id).count()
+            if count >= 3:
                 raise ValidationError({
                     'respuesta': 'Solo se permiten máximo 3 archivos por respuesta'
                 })
+
+        # ==========================================
+        # 2️⃣ Si se vincula Documento Maestro
+        # ==========================================
+        if self.documento_oficial:
+
+            doc = self.documento_oficial
+
+            # 🔄 Sincronizar datos automáticamente
+            self.codigo_documento = doc.codigo
+            self.titulo_documento = doc.titulo
+            self.objetivo_documento = doc.objetivo
+
+            # ==========================================
+            # 3️⃣ Validar si requiere Word + PDF (AJUSTE 2)
+            # ==========================================
+            # Verificamos si doc.tipo existe y tiene el flag
+            if doc.tipo and doc.tipo.requiere_word_y_pdf:
+                # Verificamos los campos del modelo Documento
+                if not doc.archivo_pdf or not doc.archivo_editable:
+                    raise ValidationError(
+                        f"El documento maestro '{doc.codigo}' está incompleto. "
+                        "Este tipo de documento requiere archivo PDF y Editable en el Maestro."
+                    )
+
+            # ==========================================
+            # 4️⃣ Validación dinámica (ELIMINADA)
+            # ==========================================
+            # NOTA: Se eliminó el bloque que validaba 'configuracion_campos' 
+            # porque ese campo JSON ya no existe en el modelo TipoDocumento actual.
     
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -497,9 +610,24 @@ class Evidencia(BaseModel):
         ⭐ OBTENER URL FIRMADA TEMPORAL DEL ARCHIVO
         """
         if self.archivo:
-            from apps.core.services.storage_service import StorageService
-            storage = StorageService()
-            return storage.get_file_url(self.archivo, expires_in=3600)  # 1 hora
+            # 1. Determinar la ruta real del archivo
+            ruta_a_buscar = self.archivo
+            
+            # Si es vinculado, sacamos la ruta del PDF del documento maestro
+            if self.archivo == 'VINCULADO_MAESTRO':
+                if self.documento_oficial and self.documento_oficial.archivo_pdf:
+                    ruta_a_buscar = str(self.documento_oficial.archivo_pdf)
+                else:
+                    return None # No hay archivo físico para generar URL
+                    
+            # 2. Pedir URL a Supabase
+            try:
+                from apps.core.services.storage_service import StorageService
+                storage = StorageService()
+                return storage.get_file_url(ruta_a_buscar, expires_in=3600)  # 1 hora
+            except Exception as e:
+                print(f"Error generando URL: {e}")
+                return None
         return None
     
     @property
@@ -519,11 +647,14 @@ class Evidencia(BaseModel):
         ⭐ ELIMINAR ARCHIVO DE SUPABASE ANTES DE ELIMINAR REGISTRO
         """
         if self.archivo:
-            from apps.core.services.storage_service import StorageService
-            storage = StorageService()
-            result = storage.delete_file(self.archivo)
-            if not result['success']:
-                print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase: {result.get('error')}")
+            try:
+                from apps.core.services.storage_service import StorageService
+                storage = StorageService()
+                result = storage.delete_file(self.archivo)
+                if not result['success']:
+                    print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase: {result.get('error')}")
+            except Exception as e:
+                print(f"Error al eliminar archivo: {e}")
         
         super().delete(*args, **kwargs)
     
@@ -557,6 +688,7 @@ class Evidencia(BaseModel):
         MAX_SIZE = 10 * 1024 * 1024  # 10MB
         return file_size <= MAX_SIZE
 
+
 class CalculoNivel(BaseModel):
     """
     Almacena el cálculo del nivel de madurez alcanzado vs deseado por dimensión
@@ -579,14 +711,16 @@ class CalculoNivel(BaseModel):
         on_delete=models.CASCADE,
         related_name='calculos_nivel',
         verbose_name='Evaluación Empresa',
-        null=True,          # ⭐ AGREGAR
-        blank=True,         # ⭐ AGREGAR
+        null=True,           # ⭐ AGREGAR
+        blank=True,          # ⭐ AGREGAR
     )
     
-    asignacion = models.OneToOneField(
+    # ⭐ CORRECCIÓN CRÍTICA: Cambiado de OneToOneField a ForeignKey
+    # Porque una asignación puede tener varios cálculos (uno por cada dimensión)
+    asignacion = models.ForeignKey(
         'asignaciones.Asignacion',
         on_delete=models.CASCADE,
-        related_name='calculo_nivel',
+        related_name='calculos_nivel',
         verbose_name='Asignación'
     )
     
@@ -713,6 +847,3 @@ class CalculoNivel(BaseModel):
             self.clasificacion_gap = 'superado'
         
         super().save(*args, **kwargs)
-
-
-

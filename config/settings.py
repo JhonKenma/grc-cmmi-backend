@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     
     # Third party
     'rest_framework',
+    'django_filters',
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
@@ -56,7 +57,9 @@ INSTALLED_APPS = [
     'apps.notificaciones',
     'apps.proyectos_remediacion',
     'apps.proveedores',
+    'apps.documentos', #Nuevo
     'django_extensions',
+    
 
     'drf_spectacular',
     'drf_spectacular_sidecar',
