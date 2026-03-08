@@ -9,38 +9,10 @@ from django.core.exceptions import ValidationError
 import uuid
 import os
 
-
-class TipoDocumento(BaseModel):
-    """
-    Catálogo de tipos de documentos para evidencias
-    Configurable por empresa
-    """
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    empresa = models.ForeignKey(
-        'empresas.Empresa',
-        on_delete=models.CASCADE,
-        related_name='tipos_documento',
-        verbose_name='Empresa'
-    )
-    nombre = models.CharField(max_length=100, verbose_name='Nombre del Tipo')
-    descripcion = models.TextField(blank=True, verbose_name='Descripción')
-    requiere_fecha = models.BooleanField(
-        default=True,
-        verbose_name='Requiere Fecha de Creación'
-    )
-    
-    class Meta:
-        db_table = 'tipos_documento'
-        verbose_name = 'Tipo de Documento'
-        verbose_name_plural = 'Tipos de Documento'
-        ordering = ['empresa', 'nombre']
-        unique_together = [['empresa', 'nombre']]
-        indexes = [
-            models.Index(fields=['empresa', 'activo']),
-        ]
-    
-    def __str__(self):
-        return f"{self.nombre} ({self.empresa.nombre})"
+# =============================================================================
+# IMPORTANTE: Importamos TipoDocumento desde la nueva app 'documentos'
+# =============================================================================
+from apps.documentos.models import TipoDocumento
 
 
 class Respuesta(BaseModel):
@@ -106,6 +78,7 @@ class Respuesta(BaseModel):
         choices=OPCIONES_RESPUESTA,
         null=True,
         blank=True,
+        default=None,
         verbose_name='Respuesta del Usuario',
         help_text='El usuario solo puede marcar NO_APLICA. '
                   'Si deja vacío, sube evidencias para que el auditor califique.'
@@ -231,6 +204,9 @@ class Respuesta(BaseModel):
                 'justificacion': 'La justificación debe tener al menos 10 caracteres'
             })
 
+        # Nota de negocio: en flujo "SI" la respuesta puede ir nula incluso en
+        # estado enviado, siempre que existan evidencias para revisión del auditor.
+
         # 2. Si el usuario marcó NO_APLICA, no puede tener calificación de auditor
         if self.respuesta == 'NO_APLICA' and self.calificacion_auditor:
             raise ValidationError({
@@ -256,8 +232,7 @@ class Respuesta(BaseModel):
                 })
 
     def save(self, *args, **kwargs):
-        if self.pk:
-            self.full_clean()
+        self.full_clean()  # Siempre validar
         super().save(*args, **kwargs)
 
         # Actualizar preguntas respondidas en la asignación
@@ -271,7 +246,6 @@ class Respuesta(BaseModel):
     # ────────────────────────────────────────────────────────────────────────
     # HELPERS
     # ────────────────────────────────────────────────────────────────────────
-
     def get_puntaje(self):
         """
         Puntaje basado en la calificación del auditor.
@@ -303,8 +277,8 @@ class Respuesta(BaseModel):
         self.fecha_auditoria = timezone.now()
         # No llamar full_clean para evitar loop; guardar directamente
         super().save()
-    
-    
+
+
 class HistorialRespuesta(models.Model):
     """
     Registro de auditoría para cambios en respuestas
@@ -412,6 +386,7 @@ class HistorialRespuesta(models.Model):
     def __str__(self):
         return f"{self.tipo_cambio} por {self.usuario} - {self.timestamp}"
 
+
 def evidencia_upload_path(instance, filename):
     """
     Función legacy para migraciones antiguas
@@ -419,7 +394,14 @@ def evidencia_upload_path(instance, filename):
     """
     ext = os.path.splitext(filename)[1]
     nuevo_nombre = f"{uuid.uuid4()}{ext}"
-    return f"evidencias/{instance.respuesta.asignacion.empresa_id}/{instance.respuesta.asignacion_id}/{nuevo_nombre}"
+    try:
+        # Intentamos obtener IDs de forma segura
+        empresa_id = instance.respuesta.asignacion.empresa_id
+        asignacion_id = instance.respuesta.asignacion_id
+        return f"evidencias/{empresa_id}/{asignacion_id}/{nuevo_nombre}"
+    except:
+        return f"evidencias/temp/{nuevo_nombre}"
+
 
 class Evidencia(BaseModel):
     """
@@ -450,8 +432,19 @@ class Evidencia(BaseModel):
         related_name='evidencias',
         verbose_name='Respuesta'
     )
+
+    # NUEVO CAMPO: Vínculo al Maestro de Documentos
+    documento_oficial = models.ForeignKey(
+        'documentos.Documento', 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name='evidencias_utilizadas',
+        verbose_name='Documento del Maestro',
+        help_text='Si selecciona un documento del Módulo de Gestión Documental, se vinculará aquí.'
+    )
     
-    # ⭐ CAMPO 1: Código de Documento (PRIMERO)
+    # ⭐ CAMPO 1: Código de Documento
     codigo_documento = models.CharField(
         max_length=50,
         default='SIN-CODIGO',
@@ -492,7 +485,7 @@ class Evidencia(BaseModel):
         blank=True,
         default=''
     )
-    # COFIGURACIÓN DEL CAMPO archivo PARA UPLOAD A SUPABASE
+    # CONFIGURACIÓN DEL CAMPO archivo PARA UPLOAD A SUPABASE
     archivo = models.CharField(
         max_length=500,
         verbose_name='Ruta del Archivo en Supabase',
@@ -521,7 +514,6 @@ class Evidencia(BaseModel):
         related_name='evidencias',
         verbose_name='Respuesta IQ'
     )
-
     class Meta:
         db_table = 'evidencias'
         verbose_name = 'Evidencia'
@@ -531,9 +523,7 @@ class Evidencia(BaseModel):
             models.Index(fields=['respuesta']),
             models.Index(fields=['tipo_documento_enum']),
             models.Index(fields=['subido_por']),
-            models.Index(fields=['codigo_documento']),  # ⭐ Solo campos propios
-            # ❌ ELIMINAR: models.Index(fields=['codigo_documento', 'respuesta__asignacion__empresa'])
-            # Los índices NO pueden usar lookups de relaciones
+            models.Index(fields=['codigo_documento']), 
         ]
     
     def __str__(self):
@@ -550,22 +540,35 @@ class Evidencia(BaseModel):
                 
     def clean(self):
         """Validaciones"""
-        # ⭐ ACTUALIZAR: Debe tener UNA de las dos respuestas
+        super().clean()
+
+        # Debe estar asociada a una única respuesta (normal o IQ).
         if not self.respuesta and not self.respuesta_iq:
             raise ValidationError('Debe estar asociada a una respuesta')
-        
+
         if self.respuesta and self.respuesta_iq:
             raise ValidationError('No puede estar asociada a ambos tipos de respuesta')
-        
-        # Máximo 3 evidencias por respuesta
+
+        # Máximo 3 evidencias por respuesta.
         if not self.pk:
-            if self.respuesta:
-                if self.respuesta.evidencias.count() >= 3:
-                    raise ValidationError({'respuesta': 'Solo se permiten máximo 3 archivos'})
-            elif self.respuesta_iq:
-                if Evidencia.objects.filter(respuesta_iq=self.respuesta_iq, activo=True).count() >= 3:
-                    raise ValidationError({'respuesta_iq': 'Solo se permiten máximo 3 archivos'})
-                
+            if self.respuesta and self.respuesta.evidencias.count() >= 3:
+                raise ValidationError({'respuesta': 'Solo se permiten máximo 3 archivos'})
+
+            if self.respuesta_iq and Evidencia.objects.filter(respuesta_iq=self.respuesta_iq, activo=True).count() >= 3:
+                raise ValidationError({'respuesta_iq': 'Solo se permiten máximo 3 archivos'})
+
+        # Si se vincula un documento oficial, sincronizar metadatos y validar integridad.
+        if self.documento_oficial:
+            doc = self.documento_oficial
+            self.codigo_documento = doc.codigo
+            self.titulo_documento = doc.titulo
+            self.objetivo_documento = doc.objetivo
+
+            if doc.tipo and doc.tipo.requiere_word_y_pdf and (not doc.archivo_pdf or not doc.archivo_editable):
+                raise ValidationError(
+                    f"El documento maestro '{doc.codigo}' está incompleto. "
+                    'Este tipo de documento requiere archivo PDF y Editable en el Maestro.'
+                )
     
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -577,9 +580,24 @@ class Evidencia(BaseModel):
         ⭐ OBTENER URL FIRMADA TEMPORAL DEL ARCHIVO
         """
         if self.archivo:
-            from apps.core.services.storage_service import StorageService
-            storage = StorageService()
-            return storage.get_file_url(self.archivo, expires_in=3600)  # 1 hora
+            # 1. Determinar la ruta real del archivo
+            ruta_a_buscar = self.archivo
+            
+            # Si es vinculado, sacamos la ruta del PDF del documento maestro
+            if self.archivo == 'VINCULADO_MAESTRO':
+                if self.documento_oficial and self.documento_oficial.archivo_pdf:
+                    ruta_a_buscar = str(self.documento_oficial.archivo_pdf)
+                else:
+                    return None # No hay archivo físico para generar URL
+                    
+            # 2. Pedir URL a Supabase
+            try:
+                from apps.core.services.storage_service import StorageService
+                storage = StorageService()
+                return storage.get_file_url(ruta_a_buscar, expires_in=3600)  # 1 hora
+            except Exception as e:
+                print(f"Error generando URL: {e}")
+                return None
         return None
     
     @property
@@ -599,11 +617,14 @@ class Evidencia(BaseModel):
         ⭐ ELIMINAR ARCHIVO DE SUPABASE ANTES DE ELIMINAR REGISTRO
         """
         if self.archivo:
-            from apps.core.services.storage_service import StorageService
-            storage = StorageService()
-            result = storage.delete_file(self.archivo)
-            if not result['success']:
-                print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase: {result.get('error')}")
+            try:
+                from apps.core.services.storage_service import StorageService
+                storage = StorageService()
+                result = storage.delete_file(self.archivo)
+                if not result['success']:
+                    print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase: {result.get('error')}")
+            except Exception as e:
+                print(f"Error al eliminar archivo: {e}")
         
         super().delete(*args, **kwargs)
     
@@ -637,6 +658,7 @@ class Evidencia(BaseModel):
         MAX_SIZE = 10 * 1024 * 1024  # 10MB
         return file_size <= MAX_SIZE
 
+
 class CalculoNivel(BaseModel):
     """
     Almacena el cálculo del nivel de madurez alcanzado vs deseado por dimensión
@@ -659,14 +681,16 @@ class CalculoNivel(BaseModel):
         on_delete=models.CASCADE,
         related_name='calculos_nivel',
         verbose_name='Evaluación Empresa',
-        null=True,          # ⭐ AGREGAR
-        blank=True,         # ⭐ AGREGAR
+        null=True,           # ⭐ AGREGAR
+        blank=True,          # ⭐ AGREGAR
     )
     
-    asignacion = models.OneToOneField(
+    # ⭐ CORRECCIÓN CRÍTICA: Cambiado de OneToOneField a ForeignKey
+    # Porque una asignación puede tener varios cálculos (uno por cada dimensión)
+    asignacion = models.ForeignKey(
         'asignaciones.Asignacion',
         on_delete=models.CASCADE,
-        related_name='calculo_nivel',
+        related_name='calculos_nivel',
         verbose_name='Asignación'
     )
     
@@ -793,6 +817,3 @@ class CalculoNivel(BaseModel):
             self.clasificacion_gap = 'superado'
         
         super().save(*args, **kwargs)
-
-
-

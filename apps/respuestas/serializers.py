@@ -6,17 +6,37 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import (
-    TipoDocumento,
     Respuesta,
     HistorialRespuesta,
     Evidencia,
     CalculoNivel,
-    #Iniciativa
 )
+# Importamos TipoDocumento desde documentos para asegurar consistencia
+from apps.documentos.models import TipoDocumento
+from apps.documentos.serializers import DocumentoSerializer 
 from apps.encuestas.models import Pregunta, Dimension
 from apps.asignaciones.models import Asignacion
 from apps.usuarios.models import Usuario
-from drf_spectacular.utils import extend_schema_field
+
+
+# ============================================
+# UTILITY FUNCTIONS
+# ============================================
+
+def _get_client_ip(request):
+    if not request:
+        return None
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded_for:
+        return x_forwarded_for.split(',')[0]
+    return request.META.get('REMOTE_ADDR')
+
+
+def _get_user_agent(request):
+    if not request:
+        return ''
+    return request.META.get('HTTP_USER_AGENT', '')[:255]
+
 
 
 # ============================================
@@ -49,7 +69,11 @@ class TipoDocumentoSerializer(serializers.ModelSerializer):
         model = TipoDocumento
         fields = [
             'id', 'empresa', 'nombre', 'descripcion', 
-            'requiere_fecha', 'activo'
+            'requiere_fecha', 'activo',
+            # Campos nuevos del módulo
+            'abreviatura', 'nivel_jerarquico', 'categoria', 
+            'requiere_word_y_pdf'
+            # 'configuracion_campos' <- ELIMINADO porque no existe en el modelo actual
         ]
         read_only_fields = ['id']
 
@@ -59,7 +83,7 @@ class TipoDocumentoListSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = TipoDocumento
-        fields = ['id', 'nombre', 'descripcion']
+        fields = ['id', 'nombre', 'descripcion', 'abreviatura']
 
 
 # ============================================
@@ -83,6 +107,11 @@ class EvidenciaSerializer(serializers.ModelSerializer):
         source='get_tipo_documento_enum_display',
         read_only=True
     )
+
+    documento_oficial_detalle = DocumentoSerializer(
+        source='documento_oficial', 
+        read_only=True
+    )
     
     class Meta:
         model = Evidencia
@@ -103,18 +132,18 @@ class EvidenciaSerializer(serializers.ModelSerializer):
             'extension',
             'tamanio_bytes', 
             'tamanio_mb',
-            #'tipo_mime',  # ⭐ NUEVO
             # Auditoría
             'subido_por', 
             'subido_por_nombre',
             'fecha_creacion', 
-            'activo'
+            'activo',
+            'documento_oficial',          # Para enviar el ID desde el front
+            'documento_oficial_detalle', # Para ver los datos del doc en el front
         ]
         read_only_fields = [
             'id', 
             'nombre_archivo_original', 
             'tamanio_bytes',
-            #'tipo_mime',
             'url_archivo', 
             'tamanio_mb',
             'extension',
@@ -154,17 +183,23 @@ class EvidenciaSerializer(serializers.ModelSerializer):
 class EvidenciaCreateSerializer(serializers.Serializer):
     """
     ⭐ SERIALIZER PARA CREAR EVIDENCIAS
-    Maneja la subida de archivos a Supabase
+    Maneja la subida de archivos a Supabase O la vinculación
     """
     
     # Campos requeridos
     respuesta_id = serializers.UUIDField(required=True)
-    archivo = serializers.FileField(required=True)
+    
+    # Opcional: Archivo físico
+    archivo = serializers.FileField(required=False)
+
+    # Opcional: ID del documento maestro (Vinculación)
+    documento_id = serializers.UUIDField(required=False, allow_null=True)
     
     # Metadatos del documento
+    # ⭐ CORRECCIÓN: required=False para permitir que vengan vacíos si se está vinculando
     codigo_documento = serializers.CharField(
         max_length=50,
-        required=True,
+        required=False, 
         help_text='Código único del documento (ej: POL-SEG-001)'
     )
     tipo_documento_enum = serializers.ChoiceField(
@@ -173,25 +208,28 @@ class EvidenciaCreateSerializer(serializers.Serializer):
     )
     titulo_documento = serializers.CharField(
         max_length=60,
+        required=False,
         default='Documento sin título'
     )
     objetivo_documento = serializers.CharField(
         max_length=180,
+        required=False,
         default='Sin objetivo especificado'
     )
     
     def validate_codigo_documento(self, value):
-        """Validar código de documento"""
-        if not value or len(value.strip()) == 0:
-            raise serializers.ValidationError('El código de documento es obligatorio')
-        
-        # Limpiar espacios y convertir a mayúsculas
-        return value.strip().upper()
+        """Validar código de documento si viene"""
+        if value:
+            return value.strip().upper()
+        return value
     
     def validate_archivo(self, value):
         """
         ⭐ VALIDAR ARCHIVO ANTES DE SUBIRLO
         """
+        if not value:
+            return value
+
         # Validar extensión
         ext = os.path.splitext(value.name)[1].lower()
         if ext not in Evidencia.EXTENSIONES_PERMITIDAS:
@@ -209,13 +247,27 @@ class EvidenciaCreateSerializer(serializers.Serializer):
         return value
     
     def validate(self, attrs):
-        """Validaciones adicionales"""
-        # Validar que titulo_documento no esté vacío
-        titulo = attrs.get('titulo_documento', '').strip()
-        if not titulo or titulo == 'Documento sin título':
+        """Validaciones adicionales lógicas"""
+        archivo = attrs.get('archivo')
+        documento_id = attrs.get('documento_id')
+        codigo_documento = attrs.get('codigo_documento')
+        titulo_documento = attrs.get('titulo_documento')
+
+        # CASO 1: Si NO hay archivo Y NO hay documento_id -> Error
+        if not archivo and not documento_id:
             raise serializers.ValidationError({
-                'titulo_documento': 'Debes proporcionar un título descriptivo para el documento'
+                'archivo': 'Debe subir un archivo nuevo o seleccionar un documento existente del Maestro de Documentos.'
             })
+        
+        # CASO 2: Si es subida manual (NO hay documento_id), validamos campos de texto
+        if not documento_id:
+            if not codigo_documento:
+                raise serializers.ValidationError({'codigo_documento': 'El código de documento es obligatorio para subidas manuales.'})
+            
+            # Validar título si es subida manual
+            if not titulo_documento or titulo_documento.strip() == 'Documento sin título':
+                 # Si el usuario no mandó título, podríamos dejarlo pasar o exigir
+                 pass 
         
         return attrs
 
@@ -250,6 +302,8 @@ class HistorialRespuestaSerializer(serializers.ModelSerializer):
         source='get_tipo_cambio_display',
         read_only=True
     )
+    
+    ip_address = serializers.CharField(read_only=True)
     
     class Meta:
         model = HistorialRespuesta
@@ -355,6 +409,12 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
     cuando marca NO_APLICA.
     """
 
+    respuesta = serializers.ChoiceField(
+        choices=Respuesta.OPCIONES_RESPUESTA,
+        required=False,
+        allow_null=True,
+    )
+
     class Meta:
         model = Respuesta
         fields = [
@@ -378,6 +438,7 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
         pregunta   = attrs.get('pregunta')
         respuesta  = attrs.get('respuesta')
         justificacion = attrs.get('justificacion', '')
+        estado = 'borrador'
 
         # Pregunta debe pertenecer a la dimensión de la asignación
         if pregunta.dimension != asignacion.dimension:
@@ -395,6 +456,12 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
         if len(justificacion.strip()) < 10:
             raise serializers.ValidationError({
                 'justificacion': 'La justificación debe tener al menos 10 caracteres'
+            })
+
+        # Solo en estados finales se exige respuesta no nula.
+        if estado != 'borrador' and respuesta is None:
+            raise serializers.ValidationError({
+                'respuesta': 'La respuesta es obligatoria cuando no está en borrador.'
             })
 
         return attrs
@@ -424,6 +491,12 @@ class RespuestaCreateSerializer(serializers.ModelSerializer):
 class RespuestaUpdateSerializer(serializers.ModelSerializer):
     """Solo se puede editar en estado borrador."""
 
+    respuesta = serializers.ChoiceField(
+        choices=Respuesta.OPCIONES_RESPUESTA,
+        required=False,
+        allow_null=True,
+    )
+
     class Meta:
         model = Respuesta
         fields = ['respuesta', 'justificacion', 'comentarios_adicionales']
@@ -436,11 +509,16 @@ class RespuestaUpdateSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        if self.instance.estado != 'borrador':
-            raise serializers.ValidationError({
-                'estado': 'Solo se pueden editar respuestas en estado borrador'
-            })
+        # En guardado parcial desde frontend siempre se fuerza borrador.
+        estado = 'borrador'
+        respuesta = attrs.get('respuesta', self.instance.respuesta)
         justificacion = attrs.get('justificacion', self.instance.justificacion)
+
+        if estado != 'borrador' and respuesta is None:
+            raise serializers.ValidationError({
+                'respuesta': 'La respuesta es obligatoria cuando no está en borrador.'
+            })
+
         if len(justificacion.strip()) < 10:
             raise serializers.ValidationError({
                 'justificacion': 'La justificación debe tener al menos 10 caracteres'
@@ -453,6 +531,8 @@ class RespuestaUpdateSerializer(serializers.ModelSerializer):
             valor_anterior_justificacion = instance.justificacion
             for attr, value in validated_data.items():
                 setattr(instance, attr, value)
+            # Guardado parcial: siempre vuelve a borrador.
+            instance.estado = 'borrador'
             instance.save()
 
             HistorialRespuesta.objects.create(
@@ -482,13 +562,19 @@ class RespuestaEnviarSerializer(serializers.Serializer):
                 'estado': 'Solo se pueden enviar respuestas en estado borrador'
             })
 
-        # ⭐ Evidencias obligatorias SOLO cuando es Sí (respuesta=null)
-        # NO_APLICA y NO_CUMPLE no necesitan evidencias
-        if respuesta.respuesta is None:
-            if not respuesta.evidencias.filter(activo=True).exists():
-                raise serializers.ValidationError({
-                    'evidencias': 'Debes subir al menos una evidencia antes de enviar'
-                })
+        tiene_evidencias = respuesta.evidencias.filter(activo=True).exists()
+
+        # Flujo SI: respuesta puede ser null, pero debe tener evidencias.
+        if respuesta.respuesta is None and not tiene_evidencias:
+            raise serializers.ValidationError({
+                'evidencias': 'Para enviar con respuesta vacía (flujo SI), debes subir al menos una evidencia.'
+            })
+
+        # Para respuestas distintas de NO_APLICA/NO_CUMPLE también exigimos evidencia.
+        if respuesta.respuesta not in [None, 'NO_APLICA', 'NO_CUMPLE'] and not tiene_evidencias:
+            raise serializers.ValidationError({
+                'evidencias': 'Debes subir al menos una evidencia antes de enviar'
+            })
 
         return attrs
 
@@ -754,9 +840,6 @@ class RespuestaModificarAdminSerializer(serializers.ModelSerializer):
                 'estado': 'Solo se pueden modificar respuestas enviadas'
             })
         
-        # ⭐ SIN VALIDACIONES DE justificacion_madurez
-        # El admin puede modificar el nivel sin necesidad de justificarlo
-        
         return attrs
     
     def update(self, instance, validated_data):
@@ -841,9 +924,6 @@ class CalculoNivelSerializer(serializers.ModelSerializer):
             'respuestas_cumple_parcial', 
             'respuestas_no_cumple', 
             'respuestas_no_aplica',
-            #'respuestas_yes', 
-            #'respuestas_no', 
-            #'respuestas_na',
             'porcentaje_cumplimiento', 
             'clasificacion_gap', 
             'clasificacion_gap_display',
@@ -851,4 +931,3 @@ class CalculoNivelSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'calculado_at']
         depth = 0
-

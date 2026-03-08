@@ -1,28 +1,32 @@
-# apps/respuestas/views.py
-
+import os
 from rest_framework import viewsets, status
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
-from django.db.models import Q, Count
+from django.db import IntegrityError
+from django.db.models import Q, Count, Avg
 from django.utils import timezone
+from django.core.exceptions import ValidationError as DjangoValidationError
 from apps.core.permissions import EsAuditor
 from apps.core.services.storage_service import StorageService
 from apps.respuestas.services import CalculoNivelService 
-
+from apps.documentos.models import Documento  # <--- Importante para vincular documentos
 from apps.asignaciones.models import Asignacion
 from apps.core.mixins import ResponseMixin
 
+# Modelos Locales
 from .models import (
     TipoDocumento,
     Respuesta,
     HistorialRespuesta,
     Evidencia,
     CalculoNivel,
-    #Iniciativa
 )
+
+# Serializers
 from .serializers import (
     AuditorCalificarSerializer,
     AuditorCerrarRevisionSerializer,
@@ -38,9 +42,6 @@ from .serializers import (
     EvidenciaCreateSerializer,
     HistorialRespuestaSerializer,
     CalculoNivelSerializer,
-    #IniciativaListSerializer,
-    #IniciativaDetailSerializer,
-    #IniciativaCreateSerializer,
     VerificarCodigoDocumentoSerializer,
 )
 
@@ -80,15 +81,6 @@ class TipoDocumentoViewSet(ResponseMixin, viewsets.ModelViewSet):
 class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para gestionar respuestas
-    
-    Endpoints:
-    - GET /api/respuestas/ - Listar respuestas
-    - GET /api/respuestas/{id}/ - Detalle de respuesta
-    - POST /api/respuestas/ - Crear respuesta
-    - PATCH /api/respuestas/{id}/ - Actualizar respuesta (solo borrador)
-    - POST /api/respuestas/{id}/enviar/ - Enviar respuesta
-    - POST /api/respuestas/{id}/modificar_admin/ - Admin modifica respuesta
-    - GET /api/respuestas/{id}/historial/ - Historial de cambios
     """
     permission_classes = [IsAuthenticated]
     
@@ -136,20 +128,34 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         """
         Crear nueva respuesta
-        POST /api/respuestas/
-        
-        ⭐ SOBRESCRITO para devolver el objeto completo con todos los campos
         """
         # Validar datos de entrada
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        # Crear la respuesta
-        respuesta = serializer.save(
-            respondido_por=request.user  # ⭐ SOLO respondido_por, NO creado_por
-        )
+        try:
+            # Crear la respuesta
+            respuesta = serializer.save(
+                respondido_por=request.user,
+                estado='borrador',
+            )
+        except DjangoValidationError as e:
+            return self.error_response(
+                message='No se pudo guardar la respuesta en borrador.',
+                errors=getattr(e, 'message_dict', {'non_field_errors': e.messages}),
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        except IntegrityError as e:
+            return self.error_response(
+                message='No se pudo guardar la respuesta. Verifica los campos obligatorios para este estado.',
+                errors={
+                    'respuesta': ['Valor inválido o faltante para el estado actual.'],
+                    'detalle': str(e),
+                },
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
         
-        # ⭐ IMPORTANTE: Devolver el objeto COMPLETO con RespuestaDetailSerializer
+        # Devolver el objeto COMPLETO con RespuestaDetailSerializer
         output_serializer = RespuestaDetailSerializer(respuesta)
         
         return self.success_response(
@@ -169,7 +175,45 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
                 status_code=status.HTTP_403_FORBIDDEN
             )
         
-        serializer.save()
+        serializer.save(estado='borrador')
+
+    def update(self, request, *args, **kwargs):
+        try:
+            return super().update(request, *args, **kwargs)
+        except DjangoValidationError as e:
+            return self.error_response(
+                message='No se pudo actualizar la respuesta en borrador.',
+                errors=getattr(e, 'message_dict', {'non_field_errors': e.messages}),
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        except IntegrityError as e:
+            return self.error_response(
+                message='No se pudo actualizar la respuesta. Verifica los campos obligatorios para este estado.',
+                errors={
+                    'respuesta': ['Valor inválido o faltante para el estado actual.'],
+                    'detalle': str(e),
+                },
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+    def partial_update(self, request, *args, **kwargs):
+        try:
+            return super().partial_update(request, *args, **kwargs)
+        except DjangoValidationError as e:
+            return self.error_response(
+                message='No se pudo actualizar la respuesta en borrador.',
+                errors=getattr(e, 'message_dict', {'non_field_errors': e.messages}),
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        except IntegrityError as e:
+            return self.error_response(
+                message='No se pudo actualizar la respuesta. Verifica los campos obligatorios para este estado.',
+                errors={
+                    'respuesta': ['Valor inválido o faltante para el estado actual.'],
+                    'detalle': str(e),
+                },
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
 
     @action(detail=True, methods=['post'])
     def enviar(self, request, pk=None):
@@ -253,6 +297,12 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
                     status_code=status.HTTP_200_OK
                 )
 
+        except DRFValidationError as e:
+            return self.error_response(
+                message='No se pudo enviar la respuesta. Corrige los campos requeridos.',
+                errors=e.detail,
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -261,12 +311,12 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
                 errors=str(e),
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
     
     @action(detail=True, methods=['post'])
     def modificar_admin(self, request, pk=None):
         """
         Administrador modifica respuesta del usuario
-        POST /api/respuestas/{id}/modificar_admin/
         """
         respuesta = self.get_object()
         
@@ -300,7 +350,6 @@ class RespuestaViewSet(ResponseMixin, viewsets.ModelViewSet):
                 message='Se requiere el parámetro asignacion',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-
         try:
             from apps.asignaciones.models import Asignacion
             asignacion = Asignacion.objects.get(id=asignacion_id)
@@ -552,16 +601,9 @@ class AuditorViewSet(ResponseMixin, viewsets.GenericViewSet):
 class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
     """
     ViewSet para gestionar evidencias con Supabase Storage
-    
-    Endpoints:
-    - GET /api/evidencias/ - Listar evidencias
-    - GET /api/evidencias/{id}/ - Detalle de evidencia
-    - POST /api/evidencias/ - Subir evidencia a Supabase
-    - DELETE /api/evidencias/{id}/ - Eliminar evidencia
-    - POST /api/evidencias/verificar_codigo/ - Verificar código duplicado
     """
     permission_classes = [IsAuthenticated]
-    parser_classes = [JSONParser, MultiPartParser, FormParser]  # ⭐ Para archivos
+    parser_classes = [JSONParser, MultiPartParser, FormParser] 
     
     def get_queryset(self):
         user = self.request.user
@@ -569,7 +611,8 @@ class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
             'respuesta',
             'respuesta__asignacion',
             'respuesta__pregunta',
-            'subido_por'
+            'subido_por',
+            'documento_oficial'
         )
         
         # Filtrar por respuesta si se proporciona
@@ -594,168 +637,175 @@ class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
             return VerificarCodigoDocumentoSerializer
         return EvidenciaSerializer
     
-    def get_serializer_class(self):
-        if self.action == 'create':
-            return EvidenciaCreateSerializer
-        elif self.action == 'verificar_codigo':
-            return VerificarCodigoDocumentoSerializer
-        return EvidenciaSerializer
-    
-    # ⭐ MODIFICAR: Subir a Supabase
+    # ⭐ CREAR: Subir a Supabase o Vincular Documento
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         """
-        Subir evidencia a Supabase Storage
-        
-        POST /api/evidencias/
-        Body (multipart/form-data):
-        - respuesta_id: UUID
-        - archivo: File
-        - codigo_documento: String
-        - tipo_documento_enum: String (politica, norma, procedimiento, formato_interno, otro)
-        - titulo_documento: String
-        - objetivo_documento: String
+        Subir evidencia o vincular documento maestro
         """
         # ===== 1. OBTENER Y VALIDAR DATOS =====
         respuesta_id = request.data.get('respuesta_id')
         archivo = request.FILES.get('archivo')
+        documento_id = request.data.get('documento_id') # <--- NUEVO: ID del documento existente
+        
+        # Metadatos
         codigo_documento = request.data.get('codigo_documento', 'SIN-CODIGO')
         tipo_documento_enum = request.data.get('tipo_documento_enum', 'otro')
         titulo_documento = request.data.get('titulo_documento', 'Documento sin título')
         objetivo_documento = request.data.get('objetivo_documento', 'Sin objetivo especificado')
         
-        # Validar campos requeridos
         if not respuesta_id:
+            return self.error_response(message='respuesta_id es requerido', status_code=status.HTTP_400_BAD_REQUEST)
+        
+        # --- LÓGICA PRINCIPAL: Archivo Físico vs Documento Vinculado ---
+        if not archivo and not documento_id:
             return self.error_response(
-                message='respuesta_id es requerido',
+                message='Debe subir un archivo o seleccionar un documento existente',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
+            
+        # --- VARIABLES INICIALES ---
+        path_supabase = None
+        tamanio_bytes = 0
+        nombre_original = ''
+        doc_oficial_obj = None
+
+        # CASO A: VINCULAR DOCUMENTO EXISTENTE
+        if documento_id:
+            try:
+                doc_oficial_obj = Documento.objects.get(id=documento_id)
+                
+                # ⭐ NUEVO: Validación solicitada por el jefe (Solo VIGENTES)
+                if doc_oficial_obj.estado != 'vigente':
+                    return self.error_response(
+                        message=f'No se puede vincular. El documento debe estar VIGENTE (Actual: {doc_oficial_obj.get_estado_display()}).',
+                        status_code=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Si el usuario no mandó datos específicos, heredamos del documento oficial
+                if codigo_documento == 'SIN-CODIGO': 
+                    codigo_documento = doc_oficial_obj.codigo
+                if titulo_documento == 'Documento sin título': 
+                    titulo_documento = doc_oficial_obj.titulo
+                
+                # Asignamos nombre original para referencia
+                nombre_base = os.path.basename(str(doc_oficial_obj.archivo_pdf)) if doc_oficial_obj.archivo_pdf else f"{doc_oficial_obj.codigo}.pdf"
+                nombre_original = f"VINCULADO: {nombre_base}"
+                
+            except Documento.DoesNotExist:
+                 return self.error_response(message='El documento seleccionado no existe', status_code=404)
+
+        # CASO B: SUBIR ARCHIVO NUEVO
+        if archivo:
+            # Validaciones de archivo
+            if not Evidencia.validar_extension(archivo.name):
+                return self.error_response(
+                    message=f'Extensión no permitida. Válidas: {", ".join(Evidencia.EXTENSIONES_PERMITIDAS)}',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+            if not Evidencia.validar_tamanio(archivo.size):
+                return self.error_response(
+                    message='El archivo no puede superar los 10MB',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
         
-        if not archivo:
-            return self.error_response(
-                message='archivo es requerido',
-                status_code=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # ===== 2. VALIDAR EXTENSIÓN =====
-        if not Evidencia.validar_extension(archivo.name):
-            return self.error_response(
-                message=f'Extensión no permitida. Válidas: {", ".join(Evidencia.EXTENSIONES_PERMITIDAS)}',
-                status_code=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # ===== 3. VALIDAR TAMAÑO (10MB) =====
-        if not Evidencia.validar_tamanio(archivo.size):
-            return self.error_response(
-                message='El archivo no puede superar los 10MB',
-                status_code=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # ===== 4. VALIDAR QUE LA RESPUESTA EXISTE =====
+        # ===== 3. VALIDAR QUE LA RESPUESTA EXISTE =====
         try:
             respuesta = Respuesta.objects.select_related(
                 'asignacion__empresa',
-                'asignacion__usuario_asignado',
-                'pregunta__dimension'
+                'asignacion__usuario_asignado'
             ).get(id=respuesta_id)
         except Respuesta.DoesNotExist:
-            return self.error_response(
-                message='Respuesta no encontrada',
-                status_code=status.HTTP_404_NOT_FOUND
-            )
+            return self.error_response(message='Respuesta no encontrada', status_code=status.HTTP_404_NOT_FOUND)
         
-        # ===== 5. VALIDAR PERMISOS =====
+        # ===== 4. VALIDAR PERMISOS =====
         if respuesta.respondido_por != request.user:
-            return self.error_response(
-                message='No tienes permiso para subir evidencias a esta respuesta',
-                status_code=status.HTTP_403_FORBIDDEN
-            )
+            return self.error_response(message='No tienes permiso', status_code=status.HTTP_403_FORBIDDEN)
         
-        # ===== 6. VALIDAR ESTADO (SOLO EN BORRADOR) =====
         if respuesta.estado != 'borrador':
-            return self.error_response(
-                message='Solo se pueden agregar evidencias a respuestas en borrador',
-                status_code=status.HTTP_400_BAD_REQUEST
-            )
+            return self.error_response(message='Solo se pueden agregar evidencias en borrador', status_code=status.HTTP_400_BAD_REQUEST)
         
-        # ===== 7. VALIDAR MÁXIMO 3 EVIDENCIAS =====
         if respuesta.evidencias.filter(activo=True).count() >= 3:
+            return self.error_response(message='Máximo 3 evidencias por respuesta', status_code=status.HTTP_400_BAD_REQUEST)
+        
+        # ===== 5. SUBIR A SUPABASE (Solo si hay archivo físico) =====
+        if archivo:
+            storage = StorageService()
+            folder = (
+                f"evidencias/"
+                f"empresa_{respuesta.asignacion.empresa.id}/"
+                f"usuario_{respuesta.asignacion.usuario_asignado.id}/"
+                f"respuesta_{respuesta_id}"
+            )
+            
+            upload_result = storage.upload_file(file=archivo, folder=folder)
+            
+            if not upload_result['success']:
+                return self.error_response(
+                    message=f"Error en Supabase: {upload_result.get('error')}",
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
+            path_supabase = upload_result.get('path')
+            tamanio_bytes = archivo.size
+            nombre_original = archivo.name
+
+        # ===== 6. CREAR REGISTRO EN BASE DE DATOS =====
+        try:
+            # Instanciamos primero para poder validar con full_clean()
+            evidencia = Evidencia(
+                respuesta=respuesta,
+                archivo=path_supabase if path_supabase else 'VINCULADO_MAESTRO', 
+                documento_oficial=doc_oficial_obj, 
+                nombre_archivo_original=nombre_original,
+                tamanio_bytes=tamanio_bytes,
+                codigo_documento=codigo_documento,
+                tipo_documento_enum=tipo_documento_enum,
+                titulo_documento=titulo_documento,
+                objetivo_documento=objetivo_documento,
+                subido_por=request.user
+            )
+            # Forzamos la validación del modelo (esto verifica que no pase de 3 evidencias o le falten PDFs)
+            evidencia.full_clean() 
+            evidencia.save()
+            
+            # ===== 7. REGISTRAR EN HISTORIAL =====
+            HistorialRespuesta.objects.create(
+                respuesta=respuesta,
+                tipo_cambio='agregado_evidencia',
+                usuario=request.user,
+                motivo=f'Evidencia agregada: {codigo_documento} - {titulo_documento}',
+                ip_address=self._get_client_ip(),
+                user_agent=self._get_user_agent()
+            )
+            
+            # ===== 8. RETORNAR RESPUESTA =====
+            serializer = EvidenciaSerializer(evidencia)
+            return self.success_response(
+                data=serializer.data,
+                message='Evidencia agregada exitosamente',
+                status_code=status.HTTP_201_CREATED
+            )
+            
+        except DjangoValidationError as e:
+            # ⭐ AQUÍ ESTÁ LA SOLUCIÓN AL ERROR: Ahora devolvemos el mensaje exacto al frontend
+            errores = e.message_dict if hasattr(e, 'message_dict') else str(e)
             return self.error_response(
-                message='Solo se permiten máximo 3 archivos por respuesta',
+                message='Error de validación al vincular el documento',
+                errors=errores,
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-        
-        # ===== 8. SUBIR A SUPABASE STORAGE =====
-        storage = StorageService()
-        
-        # Organizar en carpetas jerárquicas
-        folder = (
-            f"evidencias/"
-            f"empresa_{respuesta.asignacion.empresa.id}/"
-            f"usuario_{respuesta.asignacion.usuario_asignado.id}/"
-            f"respuesta_{respuesta_id}"
-        )
-        
-        print(f"📤 Subiendo archivo a Supabase: {archivo.name}")
-        print(f"📁 Carpeta destino: {folder}")
-        
-        upload_result = storage.upload_file(
-            file=archivo,
-            folder=folder
-        )
-        
-        if not upload_result['success']:
+        except Exception as e:
             return self.error_response(
-                message=f"Error al subir archivo a Supabase: {upload_result.get('error')}",
+                message='Error interno al procesar la evidencia',
+                errors=str(e),
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-        
-        print(f"✅ Archivo subido exitosamente a: {upload_result.get('path')}")
-
-        
-        # ===== 9. CREAR REGISTRO EN BASE DE DATOS =====
-        evidencia = Evidencia.objects.create(
-            respuesta=respuesta,
-            archivo=upload_result.get('path'),  # ⭐ Ruta en Supabase
-            nombre_archivo_original=archivo.name,
-            tamanio_bytes=archivo.size,
-            codigo_documento=codigo_documento,
-            tipo_documento_enum=tipo_documento_enum,
-            titulo_documento=titulo_documento,
-            objetivo_documento=objetivo_documento,
-            subido_por=request.user
-        )
-        
-        # ===== 10. REGISTRAR EN HISTORIAL =====
-        HistorialRespuesta.objects.create(
-            respuesta=respuesta,
-            tipo_cambio='agregado_evidencia',
-            usuario=request.user,
-            motivo=f'Evidencia agregada: {codigo_documento} - {titulo_documento}',
-            ip_address=self._get_client_ip(),
-            user_agent=self._get_user_agent()
-        )
-        
-        print(f"✅ Evidencia creada en BD: {evidencia.id}")
-        
-        # ===== 11. RETORNAR RESPUESTA =====
-        serializer = EvidenciaSerializer(evidencia)
-        return self.success_response(
-            data=serializer.data,
-            message='Evidencia subida exitosamente',
-            status_code=status.HTTP_201_CREATED
-        )
     
-    # ⭐ NUEVO: Endpoint para verificar código duplicado
     @action(detail=False, methods=['post'])
     def verificar_codigo(self, request):
         """
         Verificar si un código de documento ya existe
-        POST /api/evidencias/verificar_codigo/
-        Body (JSON):
-        {
-            "codigo_documento": "POL-SEG-001"
-        }
         """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -763,7 +813,6 @@ class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
         codigo_documento = serializer.validated_data['codigo_documento']
         user = request.user
         
-        # Buscar evidencias con el mismo código en la empresa
         evidencias_existentes = Evidencia.buscar_por_codigo(
             codigo_documento,
             user.empresa
@@ -773,101 +822,82 @@ class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
             return Response({
                 'existe': False,
                 'evidencias_encontradas': [],
-                'total_encontradas': 0,
                 'mensaje': 'No se encontraron documentos con este código'
             })
         
-        # Serializar evidencias encontradas
         evidencias_data = []
         for evidencia in evidencias_existentes:
             evidencias_data.append({
                 'id': str(evidencia.id),
                 'codigo_documento': evidencia.codigo_documento,
-                'tipo_documento': evidencia.tipo_documento_enum,
-                'tipo_documento_display': evidencia.get_tipo_documento_enum_display(),
                 'titulo_documento': evidencia.titulo_documento,
-                'objetivo_documento': evidencia.objetivo_documento,
-                'pregunta_codigo': evidencia.respuesta.pregunta.codigo,
-                'pregunta_texto': evidencia.respuesta.pregunta.texto,
-                'dimension_nombre': evidencia.respuesta.pregunta.dimension.nombre,
+                'tipo_documento_display': evidencia.get_tipo_documento_enum_display(),
                 'subido_por': evidencia.subido_por.nombre_completo if evidencia.subido_por else 'Desconocido',
                 'fecha_creacion': evidencia.fecha_creacion.strftime('%Y-%m-%d'),
-                'url_archivo': evidencia.url_archivo,
-                'puede_reutilizar': True
             })
         
         return Response({
             'existe': True,
             'evidencias_encontradas': evidencias_data,
-            'total_encontradas': len(evidencias_data),
-            'mensaje': f'Se {"encontró" if len(evidencias_data) == 1 else "encontraron"} {len(evidencias_data)} documento{"" if len(evidencias_data) == 1 else "s"} con este código'
+            'mensaje': f'Se encontraron {len(evidencias_data)} documentos con este código'
         })
     
-    # ⭐ MODIFICAR: Eliminar de Supabase también
     @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         """
-        Eliminar evidencia de Supabase y BD
-        DELETE /api/evidencias/{id}/
+        Eliminar evidencia
         """
         instance = self.get_object()
         respuesta = instance.respuesta
         
-        # ===== VALIDAR ESTADO =====
         if respuesta.estado != 'borrador':
             return self.error_response(
                 message='Solo se pueden eliminar evidencias de respuestas en borrador',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
-        # ===== VALIDAR PERMISOS =====
         if respuesta.respondido_por != request.user:
             return self.error_response(
                 message='Solo puedes eliminar evidencias de tus propias respuestas',
                 status_code=status.HTTP_403_FORBIDDEN
             )
         
-        # ===== ELIMINAR DE SUPABASE =====
-        if instance.archivo:
+        # Eliminar de Supabase (solo si tiene archivo físico y NO es un documento vinculado)
+        if instance.archivo and not instance.documento_oficial and instance.archivo != 'VINCULADO_MAESTRO':
             storage = StorageService()
-            print(f"🗑️ Eliminando archivo de Supabase: {instance.archivo}")
-            
             delete_result = storage.delete_file(instance.archivo)
-            
             if not delete_result['success']:
-                print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase: {delete_result.get('error')}")
-                # Continuar de todos modos para eliminar el registro
+                print(f"⚠️ Advertencia: No se pudo eliminar archivo de Supabase")
         
-        # ===== REGISTRAR EN HISTORIAL =====
         HistorialRespuesta.objects.create(
             respuesta=respuesta,
             tipo_cambio='eliminado_evidencia',
             usuario=request.user,
-            motivo=f'Evidencia eliminada: {instance.codigo_documento} - {instance.titulo_documento}',
+            motivo=f'Evidencia eliminada: {instance.codigo_documento}',
             ip_address=self._get_client_ip(),
             user_agent=self._get_user_agent()
         )
         
-        # ===== ELIMINAR DE BD =====
         instance.delete()
-        print(f"✅ Evidencia eliminada: {instance.id}")
         
         return self.success_response(
             message='Evidencia eliminada exitosamente',
             status_code=status.HTTP_204_NO_CONTENT
         )
     
-    # ===== MÉTODOS AUXILIARES =====
-    def _get_client_ip(self):
-        """Obtener IP del cliente"""
-        x_forwarded_for = self.request.META.get('HTTP_X_FORWARDED_FOR')
+    # ===== MÉTODOS AUXILIARES ESTANDARIZADOS =====
+    def _get_client_ip(self, request=None):
+        if not request:
+            request = self.request
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
         if x_forwarded_for:
             return x_forwarded_for.split(',')[0]
-        return self.request.META.get('REMOTE_ADDR')
+        return request.META.get('REMOTE_ADDR')
     
-    def _get_user_agent(self):
-        """Obtener User Agent del cliente"""
-        return self.request.META.get('HTTP_USER_AGENT', '')[:255]
+    def _get_user_agent(self, request=None):
+        if not request:
+            request = self.request
+        return request.META.get('HTTP_USER_AGENT', '')[:255]
 
 
 # ============================================
@@ -876,11 +906,7 @@ class EvidenciaViewSet(ResponseMixin, viewsets.ModelViewSet):
 
 class HistorialRespuestaViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
     """
-    ViewSet para ver historial de cambios (solo lectura)
-    
-    Endpoints:
-    - GET /api/historial-respuestas/ - Listar historial
-    - GET /api/historial-respuestas/{id}/ - Detalle de cambio
+    ViewSet para ver historial de cambios
     """
     permission_classes = [IsAuthenticated]
     serializer_class = HistorialRespuestaSerializer
@@ -892,12 +918,10 @@ class HistorialRespuestaViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
             'usuario'
         )
         
-        # Filtrar por respuesta si se proporciona
         respuesta_id = self.request.query_params.get('respuesta')
         if respuesta_id:
             queryset = queryset.filter(respuesta_id=respuesta_id)
         
-        # Permisos por rol
         if user.rol == 'superadmin':
             return queryset
         elif user.rol == 'administrador':
@@ -914,13 +938,7 @@ class HistorialRespuestaViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
 
 class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
     """
-    ViewSet para cálculos de nivel de madurez (solo lectura)
-    
-    Endpoints:
-    - GET /api/calculos-nivel/ - Listar cálculos
-    - GET /api/calculos-nivel/{id}/ - Detalle de cálculo
-    - GET /api/calculos-nivel/por_empresa/ - Cálculos por empresa
-    - GET /api/calculos-nivel/por_dimension/ - Cálculos por dimensión
+    ViewSet para cálculos de nivel de madurez
     """
     permission_classes = [IsAuthenticated]
     serializer_class = CalculoNivelSerializer
@@ -932,7 +950,6 @@ class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
             'dimension'
         )
         
-        # Permisos por rol
         if user.rol == 'superadmin':
             return queryset
         elif user.rol == 'administrador':
@@ -946,7 +963,6 @@ class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
     def por_empresa(self, request):
         """
         Obtener cálculos agrupados por empresa
-        GET /api/calculos-nivel/por_empresa/
         """
         user = request.user
         
@@ -958,8 +974,6 @@ class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
         
         calculos = self.get_queryset()
         
-        # Agrupar por empresa
-        from django.db.models import Avg, Count
         resumen = calculos.values(
             'asignacion__empresa__nombre'
         ).annotate(
@@ -974,12 +988,9 @@ class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
     def por_dimension(self, request):
         """
         Obtener cálculos agrupados por dimensión
-        GET /api/calculos-nivel/por_dimension/
         """
         calculos = self.get_queryset()
         
-        # Agrupar por dimensión
-        from django.db.models import Avg, Count
         resumen = calculos.values(
             'dimension__nombre',
             'dimension__codigo'
