@@ -333,129 +333,124 @@ class ReporteViewSet(viewsets.ViewSet):
         })
     
     def _agrupar_por_dimension_evaluacion(self, calculos, evaluacion):
-        """Agrupa cálculos por dimensión para una evaluación incluyendo usuarios individuales"""
-        from apps.encuestas.models import ConfigNivelDeseado
-        from django.db.models import Avg, Count
-        from apps.proyectos_remediacion.models import ProyectoCierreBrecha
-        from apps.respuestas.models import Respuesta
-        
-        dimensiones_ids = calculos.values_list('dimension_id', flat=True).distinct()
-        dimensiones = evaluacion.encuesta.dimensiones.filter(id__in=dimensiones_ids, activo=True)
-        
-        resultado = []
-        
-        for dimension in dimensiones:
-            calculos_dim = calculos.filter(dimension=dimension).select_related('usuario', 'asignacion')
+            """Agrupa cálculos por dimensión para una evaluación incluyendo usuarios individuales"""
+            from apps.encuestas.models import ConfigNivelDeseado
+            from django.db.models import Avg, Count
+            from apps.proyectos_remediacion.models import ProyectoCierreBrecha
+            from apps.respuestas.models import Respuesta
             
-            if not calculos_dim.exists():
-                continue
+            dimensiones_ids = calculos.values_list('dimension_id', flat=True).distinct()
+            dimensiones = evaluacion.encuesta.dimensiones.filter(id__in=dimensiones_ids, activo=True)
             
-            # --- ✅ CONTEO CORRECTO: Proyectos de TODOS los usuarios ---
-            # Obtener IDs de todos los cálculos de esta dimensión
-            calculos_ids = list(calculos_dim.values_list('id', flat=True))
+            resultado = []
             
-            # Contar proyectos asociados a CUALQUIER cálculo de esta dimensión
-            total_proyectos = ProyectoCierreBrecha.objects.filter(
-                calculo_nivel_id__in=calculos_ids,  # ← TODOS los cálculos
-                activo=True
-            ).count()
-            
-            # Verificar si hay algún proyecto activo
-            proyecto_activo = ProyectoCierreBrecha.objects.filter(
-                calculo_nivel_id__in=calculos_ids,
-                estado__in=['planificado', 'en_ejecucion', 'en_validacion'],
-                activo=True
-            ).first()
-            
-            # --- ESTADÍSTICAS AGREGADAS ---
-            stats = calculos_dim.aggregate(
-                nivel_actual_avg=Avg('nivel_actual'),
-                gap_avg=Avg('gap'),
-                cumplimiento_avg=Avg('porcentaje_cumplimiento'),
-                total_usuarios=Count('usuario', distinct=True),
-            )
-            
-            # --- NIVEL DESEADO ---
-            try:
-                config = ConfigNivelDeseado.objects.get(
-                    evaluacion_empresa=evaluacion,
-                    dimension=dimension,
+            for dimension in dimensiones:
+                calculos_dim = calculos.filter(dimension=dimension).select_related('usuario', 'asignacion')
+                
+                if not calculos_dim.exists():
+                    continue
+                
+                # --- ✅ CONTEO CORRECTO: Proyectos de TODOS los usuarios ---
+                calculos_ids = list(calculos_dim.values_list('id', flat=True))
+                
+                total_proyectos = ProyectoCierreBrecha.objects.filter(
+                    calculo_nivel_id__in=calculos_ids,
                     activo=True
+                ).count()
+                
+                proyecto_activo = ProyectoCierreBrecha.objects.filter(
+                    calculo_nivel_id__in=calculos_ids,
+                    estado__in=['planificado', 'en_ejecucion', 'en_validacion'],
+                    activo=True
+                ).first()
+                
+                # --- ESTADÍSTICAS AGREGADAS ---
+                stats = calculos_dim.aggregate(
+                    nivel_actual_avg=Avg('nivel_actual'),
+                    gap_avg=Avg('gap'),
+                    cumplimiento_avg=Avg('porcentaje_cumplimiento'),
+                    total_usuarios=Count('usuario', distinct=True),
                 )
-                nivel_deseado = float(config.nivel_deseado)
-            except ConfigNivelDeseado.DoesNotExist:
-                nivel_deseado = 3.0
-            
-            # --- ⭐ CALCULAR CLASIFICACIÓN DEL GAP PROMEDIO ---
-            gap_promedio = float(stats['gap_avg'] or 0)
-            
-            if gap_promedio >= 2:
-                clasificacion_gap = 'critico'
-            elif gap_promedio >= 1:
-                clasificacion_gap = 'alto'
-            elif gap_promedio >= 0.5:
-                clasificacion_gap = 'medio'
-            elif gap_promedio > 0:
-                clasificacion_gap = 'bajo'
-            elif gap_promedio == 0:
-                clasificacion_gap = 'cumplido'
-            else:  # gap_promedio < 0 (nivel actual > nivel deseado)
-                clasificacion_gap = 'superado'
-            
-            # --- ✅ CONSTRUIR ARRAY DE USUARIOS ---
-            usuarios_data = []
-            
-            for calculo in calculos_dim:
-                # Obtener respuestas del usuario
-                respuestas = Respuesta.objects.filter(
-                    asignacion=calculo.asignacion,
-                    pregunta__dimension=dimension,
-                    estado__in=['enviado', 'modificado_admin'],
-                    activo=True
-                ).select_related('pregunta')
                 
-                # Contar tipos de respuesta
-                respuestas_resumen = {
-                    'si_cumple': respuestas.filter(respuesta='SI_CUMPLE').count(),
-                    'cumple_parcial': respuestas.filter(respuesta='CUMPLE_PARCIAL').count(),
-                    'no_cumple': respuestas.filter(respuesta='NO_CUMPLE').count(),
-                    'no_aplica': respuestas.filter(respuesta='NO_APLICA').count(),
-                }
+                # --- NIVEL DESEADO ---
+                try:
+                    config = ConfigNivelDeseado.objects.get(
+                        evaluacion_empresa=evaluacion,
+                        dimension=dimension,
+                        activo=True
+                    )
+                    nivel_deseado = float(config.nivel_deseado)
+                except ConfigNivelDeseado.DoesNotExist:
+                    nivel_deseado = 3.0
                 
-                usuarios_data.append({
-                    'usuario_id': calculo.usuario.id,
-                    'usuario_nombre': calculo.usuario.nombre_completo or calculo.usuario.email,
-                    'nivel_actual': float(calculo.nivel_actual),
-                    'gap': float(calculo.gap),
-                    'clasificacion_gap': calculo.clasificacion_gap,
-                    'clasificacion_gap_display': calculo.get_clasificacion_gap_display(),
-                    'porcentaje_cumplimiento': float(calculo.porcentaje_cumplimiento),
-                    'total_preguntas': calculo.total_preguntas,
-                    'calculo_nivel_id': str(calculo.id),  # ← CRÍTICO
-                    'respuestas': respuestas_resumen,
+                # --- CLASIFICACIÓN DEL GAP PROMEDIO ---
+                gap_promedio = float(stats['gap_avg'] or 0)
+                
+                if gap_promedio >= 2:
+                    clasificacion_gap = 'critico'
+                elif gap_promedio >= 1:
+                    clasificacion_gap = 'alto'
+                elif gap_promedio >= 0.5:
+                    clasificacion_gap = 'medio'
+                elif gap_promedio > 0:
+                    clasificacion_gap = 'bajo'
+                elif gap_promedio == 0:
+                    clasificacion_gap = 'cumplido'
+                else:
+                    clasificacion_gap = 'superado'
+                
+                # --- CONSTRUIR ARRAY DE USUARIOS ---
+                usuarios_data = []
+                
+                for calculo in calculos_dim:
+                    respuestas = Respuesta.objects.filter(
+                        asignacion=calculo.asignacion,
+                        pregunta__dimension=dimension,
+                        estado__in=['enviado', 'modificado_admin', 'auditado'],
+                        activo=True
+                    ).select_related('pregunta')
+                    
+                    respuestas_resumen = {
+                        'si_cumple': respuestas.filter(respuesta='SI_CUMPLE').count(),
+                        'cumple_parcial': respuestas.filter(respuesta='CUMPLE_PARCIAL').count(),
+                        'no_cumple': respuestas.filter(respuesta='NO_CUMPLE').count(),
+                        'no_aplica': respuestas.filter(respuesta='NO_APLICA').count(),
+                    }
+                    
+                    usuarios_data.append({
+                        'usuario_id': calculo.usuario.id,
+                        'usuario_nombre': calculo.usuario.nombre_completo or calculo.usuario.email,
+                        'nivel_actual': float(calculo.nivel_actual),
+                        'gap': float(calculo.gap),
+                        'clasificacion_gap': calculo.clasificacion_gap,
+                        'clasificacion_gap_display': calculo.get_clasificacion_gap_display(),
+                        'porcentaje_cumplimiento': float(calculo.porcentaje_cumplimiento),
+                        'total_preguntas': calculo.total_preguntas,
+                        'calculo_nivel_id': str(calculo.id),
+                        'asignacion_id': str(calculo.asignacion.id),  # ⭐ NUEVO: requerido para modal auditoría
+                        'respuestas': respuestas_resumen,
+                    })
+                
+                resultado.append({
+                    'dimension': {
+                        'id': str(dimension.id),
+                        'codigo': dimension.codigo,
+                        'nombre': dimension.nombre,
+                        'orden': dimension.orden,
+                    },
+                    'nivel_deseado': nivel_deseado,
+                    'nivel_actual_promedio': float(stats['nivel_actual_avg'] or 0),
+                    'gap_promedio': gap_promedio,
+                    'clasificacion_gap': clasificacion_gap,
+                    'porcentaje_cumplimiento_promedio': float(stats['cumplimiento_avg'] or 0),
+                    'total_usuarios_evaluados': stats['total_usuarios'],
+                    'tiene_proyecto_activo': proyecto_activo is not None,
+                    'proyecto_id': str(proyecto_activo.id) if proyecto_activo else None,
+                    'total_proyectos': total_proyectos,
+                    'usuarios': usuarios_data,
                 })
             
-            # --- ✅ RESULTADO FINAL CON CLASIFICACIÓN ---
-            resultado.append({
-                'dimension': {
-                    'id': str(dimension.id),
-                    'codigo': dimension.codigo,
-                    'nombre': dimension.nombre,
-                    'orden': dimension.orden,
-                },
-                'nivel_deseado': nivel_deseado,
-                'nivel_actual_promedio': float(stats['nivel_actual_avg'] or 0),
-                'gap_promedio': gap_promedio,  # ⭐ Usar la variable calculada
-                'clasificacion_gap': clasificacion_gap,  # ⭐ NUEVO CAMPO CRÍTICO
-                'porcentaje_cumplimiento_promedio': float(stats['cumplimiento_avg'] or 0),
-                'total_usuarios_evaluados': stats['total_usuarios'],
-                'tiene_proyecto_activo': proyecto_activo is not None,
-                'proyecto_id': str(proyecto_activo.id) if proyecto_activo else None,
-                'total_proyectos': total_proyectos,  # ← Conteo correcto
-                'usuarios': usuarios_data,  # ← Array de usuarios
-            })
-        
-        return sorted(resultado, key=lambda x: x['dimension']['orden'])
+            return sorted(resultado, key=lambda x: x['dimension']['orden'])
 
     def _contar_clasificaciones_por_dimension(self, calculos, evaluacion):
         """
