@@ -1,440 +1,336 @@
 # apps/asignaciones_iq/views.py
 """
 Views para Asignación de Evaluaciones Inteligentes
+Flujo: Usuario responde → Auditor califica → GAP calculado → Reporte → Remediar
 """
-
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.utils import timezone
-from django.db.models import Q, Count, Avg
+from django.db.models import Avg, Count
+
 from apps.core.permissions import EsAdminOSuperAdmin
 from apps.core.services.storage_service import StorageService
 from apps.respuestas.models import Evidencia
-from .models import AsignacionEvaluacionIQ, ProgresoAsignacion, RespuestaEvaluacionIQ
+
+from .models import AsignacionEvaluacionIQ, RespuestaEvaluacionIQ, CalculoNivelIQ
 from .serializers import (
-    AsignacionEvaluacionListSerializer,
-    AsignacionEvaluacionDetailSerializer,
-    CrearAsignacionSerializer,
-    ActualizarEstadoAsignacionSerializer,
-    CrearRespuestaSerializer,
-    PreguntaConRespuestaSerializer,
-    ProgresoAsignacionSerializer,
-    RespuestaEvaluacionIQSerializer,
+    AsignacionIQListSerializer,
+    AsignacionIQDetailSerializer,
+    CrearAsignacionIQSerializer,
+    RespuestaIQDetailSerializer,
+    CrearRespuestaIQSerializer,
+    EnviarRespuestaIQSerializer,
+    CalificarRespuestaIQSerializer,
+    PreguntaConRespuestaIQSerializer,
+    CalculoNivelIQSerializer,
+    EvidenciaIQSerializer,
 )
 from .services import NotificacionAsignacionIQService
 
 
-class AsignacionEvaluacionViewSet(viewsets.ModelViewSet):
-    """ViewSet para gestión de asignaciones de evaluaciones"""
-    
+# ─────────────────────────────────────────────────────────────────────────────
+# ASIGNACIONES
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AsignacionEvaluacionIQViewSet(viewsets.ModelViewSet):
+    """ViewSet para gestión de asignaciones IQ."""
+
     permission_classes = [IsAuthenticated]
-    
+
     def get_queryset(self):
         user = self.request.user
-        
+        qs = AsignacionEvaluacionIQ.objects.select_related(
+            'evaluacion', 'usuario_asignado', 'empresa',
+            'asignado_por', 'auditado_por', 'revisado_por'
+        )
         if user.rol == 'superadmin':
-            return AsignacionEvaluacionIQ.objects.select_related(
-                'evaluacion', 'usuario_asignado', 'empresa', 'asignado_por', 'revisado_por'
-            ).all()
+            return qs.all()
         elif user.rol == 'administrador':
-            return AsignacionEvaluacionIQ.objects.select_related(
-                'evaluacion', 'usuario_asignado', 'empresa', 'asignado_por', 'revisado_por'
-            ).filter(empresa=user.empresa)
+            return qs.filter(empresa=user.empresa)
+        elif user.rol == 'auditor':
+            return qs.filter(empresa=user.empresa)
         else:
-            return AsignacionEvaluacionIQ.objects.select_related(
-                'evaluacion', 'usuario_asignado', 'empresa', 'asignado_por', 'revisado_por'
-            ).filter(usuario_asignado=user)
-    
+            return qs.filter(usuario_asignado=user)
+
     def get_serializer_class(self):
         if self.action == 'create':
-            return CrearAsignacionSerializer
+            return CrearAsignacionIQSerializer
         elif self.action in ['retrieve', 'update', 'partial_update']:
-            return AsignacionEvaluacionDetailSerializer
-        return AsignacionEvaluacionListSerializer
-    
+            return AsignacionIQDetailSerializer
+        return AsignacionIQListSerializer
+
     def create(self, request, *args, **kwargs):
-        """Crear asignación y propagar respuestas previas"""
         if request.user.rol not in ['administrador', 'superadmin']:
             return Response(
                 {'error': 'Solo administradores pueden asignar evaluaciones'},
                 status=status.HTTP_403_FORBIDDEN
             )
-        
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         asignaciones = serializer.save()
-        
-        resultados_propagacion = []
+
         for asignacion in asignaciones:
             if asignacion.notificar_usuario:
-                NotificacionAsignacionIQService.notificar_asignacion(asignacion)
-            
-            if asignacion.evaluacion.usar_respuestas_compartidas:
-                cantidad = asignacion.propagar_respuestas_previas()
-                if cantidad > 0:
-                    resultados_propagacion.append({
-                        'usuario': asignacion.usuario_asignado.nombre_completo,
-                        'respuestas_importadas': cantidad
-                    })
-        
-        output_serializer = AsignacionEvaluacionListSerializer(asignaciones, many=True)
-        
-        response_data = {
-            'asignaciones': output_serializer.data,
-            'total_creadas': len(asignaciones),
-        }
-        
-        if resultados_propagacion:
-            response_data['respuestas_importadas'] = resultados_propagacion
-            response_data['mensaje'] = 'Se importaron respuestas de evaluaciones anteriores'
-        
-        return Response(response_data, status=status.HTTP_201_CREATED)
-    
+                try:
+                    NotificacionAsignacionIQService.notificar_asignacion(asignacion)
+                except Exception as e:
+                    print(f'⚠️  Error al notificar: {e}')
+
+        output = AsignacionIQListSerializer(asignaciones, many=True)
+        return Response(
+            {'asignaciones': output.data, 'total_creadas': len(asignaciones)},
+            status=status.HTTP_201_CREATED
+        )
+
+    # ── Mis asignaciones (usuario) ─────────────────────────────────────────────
+
     @action(detail=False, methods=['get'], url_path='mis-asignaciones')
     def mis_asignaciones(self, request):
-        """GET /api/asignaciones-iq/mis-asignaciones/"""
-        asignaciones = self.get_queryset().filter(usuario_asignado=request.user, activo=True)
-        
+        qs = AsignacionEvaluacionIQ.objects.filter(
+            usuario_asignado=request.user, activo=True
+        )
         estado = request.query_params.get('estado')
         if estado:
-            asignaciones = asignaciones.filter(estado=estado)
-        
-        serializer = AsignacionEvaluacionListSerializer(asignaciones, many=True)
-        
-        stats = {
-            'total': asignaciones.count(),
-            'pendientes': asignaciones.filter(estado='pendiente').count(),
-            'en_progreso': asignaciones.filter(estado='en_progreso').count(),
-            'completadas': asignaciones.filter(estado='completada').count(),
-            'vencidas': sum(1 for a in asignaciones if a.esta_vencida),
-        }
-        
+            qs = qs.filter(estado=estado)
+
+        serializer = AsignacionIQListSerializer(qs, many=True)
         return Response({
             'asignaciones': serializer.data,
-            'estadisticas': stats
+            'estadisticas': {
+                'total':       qs.count(),
+                'pendientes':  qs.filter(estado='pendiente').count(),
+                'en_progreso': qs.filter(estado='en_progreso').count(),
+                'completadas': qs.filter(estado='completada').count(),
+                'auditadas':   qs.filter(estado='auditada').count(),
+            }
         })
-    
+
+    # ── Iniciar (usuario) ──────────────────────────────────────────────────────
+
     @action(detail=True, methods=['post'], url_path='iniciar')
     def iniciar(self, request, pk=None):
-        """POST /api/asignaciones-iq/{id}/iniciar/"""
         asignacion = self.get_object()
-        
         if asignacion.usuario_asignado != request.user:
             return Response(
                 {'error': 'Solo puedes iniciar tus propias asignaciones'},
                 status=status.HTTP_403_FORBIDDEN
             )
-        
         if asignacion.estado != 'pendiente':
             return Response(
-                {'error': f'La asignación ya está {asignacion.get_estado_display()}'},
+                {'error': f'La asignación ya está en estado: {asignacion.get_estado_display()}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
         asignacion.iniciar()
-        
-        serializer = AsignacionEvaluacionDetailSerializer(asignacion)
         return Response({
             'success': True,
-            'message': 'Asignación iniciada correctamente',
-            'asignacion': serializer.data
+            'message': 'Evaluación iniciada',
+            'asignacion': AsignacionIQDetailSerializer(asignacion).data
         })
-    
-    @action(detail=True, methods=['post'], url_path='completar')
-    def completar(self, request, pk=None):
-        """POST /api/asignaciones-iq/{id}/completar/"""
-        asignacion = self.get_object()
-        
-        if asignacion.usuario_asignado != request.user:
+
+    # ── Cerrar revisión de auditoría (auditor) ─────────────────────────────────
+
+    @action(detail=True, methods=['post'], url_path='cerrar-auditoria')
+    def cerrar_auditoria(self, request, pk=None):
+        """
+        El auditor cierra la revisión.
+        - Marca respuestas sin calificar como NO_CUMPLE
+        - Calcula GAP por sección/framework
+        - Cambia estado a 'auditada'
+        """
+        if request.user.rol not in ['auditor', 'administrador', 'superadmin']:
             return Response(
-                {'error': 'Solo puedes completar tus propias asignaciones'},
+                {'error': 'Solo auditores pueden cerrar la revisión'},
                 status=status.HTTP_403_FORBIDDEN
             )
-        
-        if asignacion.estado != 'en_progreso':
+
+        asignacion = self.get_object()
+
+        if asignacion.estado != 'completada':
             return Response(
-                {'error': 'La asignación debe estar en progreso'},
+                {'error': 'Solo se puede auditar una asignación completada'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        asignacion.actualizar_progreso()
-        
-        if asignacion.preguntas_respondidas < asignacion.total_preguntas:
-            return Response(
-                {
-                    'error': 'Aún no has completado todas las preguntas',
-                    'preguntas_respondidas': asignacion.preguntas_respondidas,
-                    'total_preguntas': asignacion.total_preguntas,
-                    'preguntas_faltantes': asignacion.total_preguntas - asignacion.preguntas_respondidas
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        asignacion.completar()
-        
+
+        notas = request.data.get('notas_auditoria', '')
+        asignacion.cerrar_revision_auditoria(request.user, notas)
+
+        # Notificar al admin
         try:
-            NotificacionAsignacionIQService.notificar_completada(asignacion)
+            NotificacionAsignacionIQService.notificar_auditoria_completada(asignacion)
         except Exception as e:
-            print(f"Error al enviar notificación: {str(e)}")
-        
-        serializer = AsignacionEvaluacionDetailSerializer(asignacion)
+            print(f'⚠️  Error al notificar: {e}')
+
         return Response({
             'success': True,
-            'message': 'Asignación completada correctamente',
-            'asignacion': serializer.data
+            'message': 'Auditoría cerrada. GAP calculado correctamente.',
+            'asignacion': AsignacionIQDetailSerializer(asignacion).data,
+            'calculos_gap': CalculoNivelIQSerializer(
+                asignacion.calculos_nivel_iq.all(), many=True
+            ).data
         })
-    
+
+    # ── Aprobar / Rechazar (admin) ─────────────────────────────────────────────
+
     @action(detail=True, methods=['post'], url_path='aprobar')
     def aprobar(self, request, pk=None):
-        """POST /api/asignaciones-iq/{id}/aprobar/"""
         if request.user.rol not in ['administrador', 'superadmin']:
-            return Response(
-                {'error': 'Solo administradores pueden aprobar'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+            return Response({'error': 'Sin permisos'}, status=status.HTTP_403_FORBIDDEN)
         asignacion = self.get_object()
-        
-        if asignacion.estado != 'completada':
+        if asignacion.estado != 'auditada':
             return Response(
-                {'error': 'Solo se pueden aprobar asignaciones completadas'},
+                {'error': 'Solo se pueden aprobar asignaciones auditadas'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        notas = request.data.get('notas_revision', '')
-        asignacion.aprobar(request.user, notas)
-        
-        try:
-            NotificacionAsignacionIQService.notificar_aprobada(asignacion)
-        except Exception as e:
-            print(f"Error al enviar notificación: {str(e)}")
-        
-        serializer = AsignacionEvaluacionDetailSerializer(asignacion)
+        asignacion.aprobar(request.user, request.data.get('notas_revision', ''))
         return Response({
             'success': True,
-            'message': 'Asignación aprobada correctamente',
-            'asignacion': serializer.data
+            'asignacion': AsignacionIQDetailSerializer(asignacion).data
         })
-    
+
     @action(detail=True, methods=['post'], url_path='rechazar')
     def rechazar(self, request, pk=None):
-        """POST /api/asignaciones-iq/{id}/rechazar/"""
         if request.user.rol not in ['administrador', 'superadmin']:
-            return Response(
-                {'error': 'Solo administradores pueden rechazar'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+            return Response({'error': 'Sin permisos'}, status=status.HTTP_403_FORBIDDEN)
         asignacion = self.get_object()
-        
-        if asignacion.estado != 'completada':
-            return Response(
-                {'error': 'Solo se pueden rechazar asignaciones completadas'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
         notas = request.data.get('notas_revision', '')
         if not notas:
             return Response(
                 {'error': 'Debe proporcionar notas al rechazar'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
         asignacion.rechazar(request.user, notas)
-        
-        try:
-            NotificacionAsignacionIQService.notificar_rechazada(asignacion)
-        except Exception as e:
-            print(f"Error al enviar notificación: {str(e)}")
-        
-        serializer = AsignacionEvaluacionDetailSerializer(asignacion)
         return Response({
             'success': True,
-            'message': 'Asignación rechazada',
-            'asignacion': serializer.data
+            'asignacion': AsignacionIQDetailSerializer(asignacion).data
         })
-    
-    @action(detail=True, methods=['get'], url_path='progreso')
-    def progreso(self, request, pk=None):
-        """GET /api/asignaciones-iq/{id}/progreso/"""
-        asignacion = self.get_object()
-        asignacion.actualizar_progreso()
-        
-        progreso_detallado = ProgresoAsignacion.objects.filter(
-            asignacion=asignacion
-        ).select_related('pregunta')
-        
-        return Response({
-            'asignacion_id': asignacion.id,
-            'total_preguntas': asignacion.total_preguntas,
-            'preguntas_respondidas': asignacion.preguntas_respondidas,
-            'porcentaje_completado': float(asignacion.porcentaje_completado),
-            'estado': asignacion.estado,
-            'progreso_detallado': ProgresoAsignacionSerializer(
-                progreso_detallado, many=True
-            ).data if progreso_detallado.exists() else None
-        })
-    
-    @action(detail=False, methods=['get'], permission_classes=[EsAdminOSuperAdmin], url_path='estadisticas')
+
+    # ── Estadísticas ───────────────────────────────────────────────────────────
+
+    @action(detail=False, methods=['get'],
+            permission_classes=[EsAdminOSuperAdmin], url_path='estadisticas')
     def estadisticas(self, request):
-        """GET /api/asignaciones-iq/estadisticas/"""
-        queryset = self.get_queryset()
-        
+        qs = self.get_queryset()
         return Response({
-            'total': queryset.count(),
+            'total': qs.count(),
             'por_estado': {
-                'pendientes': queryset.filter(estado='pendiente').count(),
-                'en_progreso': queryset.filter(estado='en_progreso').count(),
-                'completadas': queryset.filter(estado='completada').count(),
-                'aprobadas': queryset.filter(estado='aprobada').count(),
-                'rechazadas': queryset.filter(estado='rechazada').count(),
-                'vencidas': queryset.filter(estado='vencida').count(),
+                'pendientes':  qs.filter(estado='pendiente').count(),
+                'en_progreso': qs.filter(estado='en_progreso').count(),
+                'completadas': qs.filter(estado='completada').count(),
+                'auditadas':   qs.filter(estado='auditada').count(),
+                'aprobadas':   qs.filter(estado='aprobada').count(),
+                'rechazadas':  qs.filter(estado='rechazada').count(),
+                'vencidas':    qs.filter(estado='vencida').count(),
             },
-            'vencidas_sin_completar': sum(1 for a in queryset if a.esta_vencida),
-            'promedio_completado': queryset.aggregate(
+            'vencidas_sin_completar': sum(1 for a in qs if a.esta_vencida),
+            'promedio_completado': qs.aggregate(
                 Avg('porcentaje_completado')
             )['porcentaje_completado__avg'] or 0,
         })
-    
-    @action(detail=False, methods=['get'], permission_classes=[EsAdminOSuperAdmin], url_path='por-evaluacion/(?P<evaluacion_id>[^/.]+)')
-    def por_evaluacion(self, request, evaluacion_id=None):
-        """GET /api/asignaciones-iq/por-evaluacion/{evaluacion_id}/"""
-        asignaciones = self.get_queryset().filter(evaluacion_id=evaluacion_id)
-        serializer = AsignacionEvaluacionListSerializer(asignaciones, many=True)
-        
-        return Response({
-            'evaluacion_id': evaluacion_id,
-            'total': asignaciones.count(),
-            'asignaciones': serializer.data
-        })
-    
-    @action(detail=False, methods=['get'], permission_classes=[EsAdminOSuperAdmin], url_path='por-usuario/(?P<usuario_id>[^/.]+)')
-    def por_usuario(self, request, usuario_id=None):
-        """GET /api/asignaciones-iq/por-usuario/{usuario_id}/"""
-        asignaciones = self.get_queryset().filter(usuario_asignado_id=usuario_id)
-        serializer = AsignacionEvaluacionListSerializer(asignaciones, many=True)
-        
-        return Response({
-            'usuario_id': usuario_id,
-            'total': asignaciones.count(),
-            'asignaciones': serializer.data
-        })
-    
-    @action(detail=True, methods=['get'], url_path='estadisticas-propagacion')
-    def estadisticas_propagacion(self, request, pk=None):
-        """GET /api/asignaciones-iq/{id}/estadisticas-propagacion/"""
+
+    # ── GAP de una asignación ──────────────────────────────────────────────────
+
+    @action(detail=True, methods=['get'], url_path='gap')
+    def gap(self, request, pk=None):
         asignacion = self.get_object()
-        
-        total = RespuestaEvaluacionIQ.objects.filter(asignacion=asignacion).count()
-        originales = RespuestaEvaluacionIQ.objects.filter(
-            asignacion=asignacion, es_respuesta_original=True
-        ).count()
-        propagadas = total - originales
-        
-        propagadas_previas = RespuestaEvaluacionIQ.objects.filter(
-            asignacion=asignacion,
-            es_respuesta_original=False,
-            propagada_desde__asignacion__evaluacion__isnull=False
-        ).exclude(
-            propagada_desde__asignacion__evaluacion=asignacion.evaluacion
-        ).count()
-        
+        calculos = CalculoNivelIQ.objects.filter(asignacion=asignacion)
         return Response({
             'asignacion_id': asignacion.id,
             'evaluacion': asignacion.evaluacion.nombre,
-            'usuario': asignacion.usuario_asignado.nombre_completo,
-            'total_preguntas': asignacion.total_preguntas,
-            'estadisticas': {
-                'total_respuestas': total,
-                'respuestas_originales': originales,
-                'respuestas_propagadas': propagadas,
-                'desglose_propagadas': {
-                    'de_evaluaciones_anteriores': propagadas_previas,
-                    'dentro_de_esta_evaluacion': propagadas - propagadas_previas
-                }
-            },
-            'porcentaje_completado': float(asignacion.porcentaje_completado),
+            'usuario': asignacion.usuario_asignado.get_full_name(),
+            'estado': asignacion.estado,
+            'calculos': CalculoNivelIQSerializer(calculos, many=True).data,
         })
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RESPUESTAS IQ
+# ─────────────────────────────────────────────────────────────────────────────
+
 class RespuestaEvaluacionIQViewSet(viewsets.ModelViewSet):
-    """ViewSet para gestión de respuestas"""
-    
+    """ViewSet para respuestas de evaluaciones IQ."""
+
     permission_classes = [IsAuthenticated]
-    serializer_class = RespuestaEvaluacionIQSerializer
-    
+
     def get_queryset(self):
-        qs = RespuestaEvaluacionIQ.objects.select_related(
-            'asignacion', 'pregunta', 'pregunta__framework', 'respondido_por'
-        ).prefetch_related('evidencias')
-        
         user = self.request.user
+        qs = RespuestaEvaluacionIQ.objects.select_related(
+            'asignacion', 'pregunta', 'pregunta__framework',
+            'respondido_por', 'auditado_por'
+        ).prefetch_related('evidencias')
+
         if user.rol == 'superadmin':
             pass
-        elif user.rol == 'administrador':
-            qs = qs.filter(asignacion__asignado_por__empresa=user.empresa)
+        elif user.rol in ['administrador', 'auditor']:
+            qs = qs.filter(asignacion__empresa=user.empresa)
         else:
             qs = qs.filter(asignacion__usuario_asignado=user)
-        
+
         asignacion_id = self.request.query_params.get('asignacion')
         if asignacion_id:
             qs = qs.filter(asignacion_id=asignacion_id)
-        
+
         return qs
-    
+
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
-            return CrearRespuestaSerializer
-        return RespuestaEvaluacionIQSerializer
-    
+            return CrearRespuestaIQSerializer
+        return RespuestaIQDetailSerializer
+
     def perform_create(self, serializer):
         serializer.save(respondido_por=self.request.user)
-    
+
     def create(self, request, *args, **kwargs):
-        """Crear respuesta - ASEGURAR QUE RETORNE ID"""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
-        
-        # ⭐ IMPORTANTE: Usar el serializer completo para la respuesta
-        instance = serializer.instance
-        response_serializer = RespuestaEvaluacionIQSerializer(instance)
-        
-        headers = self.get_success_headers(response_serializer.data)
-        return Response(
-            response_serializer.data,
-            status=status.HTTP_201_CREATED,
-            headers=headers
+        output = RespuestaIQDetailSerializer(serializer.instance)
+        return Response(output.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+
+        if instance.respondido_por != request.user:
+            return Response(
+                {'error': 'Solo puedes editar tus propias respuestas'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = CrearRespuestaIQSerializer(
+            instance, data=request.data, partial=partial,
+            context={'request': request}
         )
-    
-    @action(detail=False, methods=['get'], url_path='preguntas-asignacion/(?P<asignacion_id>[^/.]+)')
+        serializer.is_valid(raise_exception=True)
+        serializer.save(modificado_por=request.user)
+        return Response(RespuestaIQDetailSerializer(instance).data)
+
+    # ── Preguntas con respuestas (para el formulario) ──────────────────────────
+
+    @action(
+        detail=False, methods=['get'],
+        url_path='preguntas-asignacion/(?P<asignacion_id>[^/.]+)'
+    )
     def preguntas_asignacion(self, request, asignacion_id=None):
         """GET /api/respuestas-iq/preguntas-asignacion/{asignacion_id}/"""
         try:
             asignacion = AsignacionEvaluacionIQ.objects.get(id=asignacion_id)
         except AsignacionEvaluacionIQ.DoesNotExist:
-            return Response(
-                {'error': 'Asignación no encontrada'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        if request.user.rol not in ['superadmin', 'administrador']:
+            return Response({'error': 'Asignación no encontrada'}, status=404)
+
+        # Permisos
+        if request.user.rol not in ['superadmin', 'administrador', 'auditor']:
             if asignacion.usuario_asignado != request.user:
-                return Response(
-                    {'error': 'No tienes permiso'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-        
+                return Response({'error': 'Sin permisos'}, status=403)
+
         preguntas = asignacion.evaluacion.get_preguntas_a_responder()
-        
-        serializer = PreguntaConRespuestaSerializer(
+        serializer = PreguntaConRespuestaIQSerializer(
             preguntas, many=True,
             context={'asignacion_id': asignacion_id, 'request': request}
         )
-        
+
         return Response({
             'asignacion': {
                 'id': asignacion.id,
@@ -446,118 +342,175 @@ class RespuestaEvaluacionIQViewSet(viewsets.ModelViewSet):
             },
             'preguntas': serializer.data
         })
-        
+
+    # ── Enviar respuesta (usuario: borrador → enviado) ─────────────────────────
+
+    @action(detail=True, methods=['post'], url_path='enviar')
+    def enviar(self, request, pk=None):
+        """
+        POST /api/respuestas-iq/{id}/enviar/
+        Cambia estado de borrador a enviado.
+        Si todas las preguntas quedan enviadas → asignación pasa a 'completada'
+        y se notifica al auditor.
+        """
+        respuesta = self.get_object()
+
+        if respuesta.respondido_por != request.user:
+            return Response(
+                {'error': 'Solo puedes enviar tus propias respuestas'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = EnviarRespuestaIQSerializer(
+            respuesta, data={}, context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        respuesta_actualizada = serializer.save()
+
+        # Verificar si la asignación quedó completa
+        asignacion = respuesta_actualizada.asignacion
+        asignacion_completa = asignacion.estado == 'completada'
+
+        mensaje = (
+            '¡Has completado todas las preguntas! El auditor fue notificado.'
+            if asignacion_completa
+            else f'Respuesta enviada. Faltan '
+                 f'{asignacion.total_preguntas - asignacion.preguntas_respondidas} preguntas.'
+        )
+
+        return Response({
+            'success': True,
+            'message': mensaje,
+            'respuesta': RespuestaIQDetailSerializer(respuesta_actualizada).data,
+            'asignacion': AsignacionIQListSerializer(asignacion).data,
+            'asignacion_completa': asignacion_completa,
+        })
+
+    # ── Calificar respuesta (auditor) ──────────────────────────────────────────
+
+    @action(detail=True, methods=['post'], url_path='calificar')
+    def calificar(self, request, pk=None):
+        """
+        POST /api/respuestas-iq/{id}/calificar/
+        El auditor asigna SI_CUMPLE / CUMPLE_PARCIAL / NO_CUMPLE + nivel_madurez.
+        """
+        if request.user.rol not in ['auditor', 'administrador', 'superadmin']:
+            return Response(
+                {'error': 'Solo auditores pueden calificar respuestas'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        respuesta = self.get_object()
+
+        if respuesta.estado != 'enviado':
+            return Response(
+                {'error': 'Solo se pueden calificar respuestas enviadas'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = CalificarRespuestaIQSerializer(
+            respuesta, data=request.data, context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        respuesta_calificada = serializer.save()
+
+        return Response({
+            'success': True,
+            'message': 'Respuesta calificada correctamente',
+            'respuesta': RespuestaIQDetailSerializer(respuesta_calificada).data,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVIDENCIAS IQ
+# ─────────────────────────────────────────────────────────────────────────────
+
 class EvidenciaIQViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet para gestión de evidencias de evaluaciones IQ.
-    Usa el modelo Evidencia existente pero para RespuestaEvaluacionIQ.
-    """
-    
+    """Evidencias para respuestas de evaluaciones IQ."""
+
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
-    
+
     def get_queryset(self):
         user = self.request.user
         qs = Evidencia.objects.filter(
-            respuesta_iq__isnull=False,  # Solo evidencias IQ
-            activo=True
+            respuesta_iq__isnull=False, activo=True
         ).select_related('respuesta_iq', 'subido_por')
-        
-        # Filtrar por permisos
+
         if user.rol == 'superadmin':
             pass
-        elif user.rol == 'administrador':
+        elif user.rol in ['administrador', 'auditor']:
             qs = qs.filter(respuesta_iq__asignacion__empresa=user.empresa)
         else:
             qs = qs.filter(respuesta_iq__respondido_por=user)
-        
-        # Filtrar por respuesta_iq si se proporciona
-        respuesta_iq_id = self.request.query_params.get('respuesta_iq')
-        if respuesta_iq_id:
-            qs = qs.filter(respuesta_iq_id=respuesta_iq_id)
-        
+
+        respuesta_id = self.request.query_params.get('respuesta_iq')
+        if respuesta_id:
+            qs = qs.filter(respuesta_iq_id=respuesta_id)
+
         return qs
-    
+
     def get_serializer_class(self):
-        from apps.asignaciones_iq.serializers import EvidenciaSerializer
-        return EvidenciaSerializer
-    
+        return EvidenciaIQSerializer
+
     def create(self, request, *args, **kwargs):
-        """Crear evidencia para respuesta IQ"""
+        """POST /api/evidencias-iq/  — sube un archivo para una respuesta IQ."""
+
         respuesta_iq_id = request.data.get('respuesta_iq_id')
-        
         if not respuesta_iq_id:
             return Response(
                 {'error': 'respuesta_iq_id es requerido'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Verificar que la respuesta existe y pertenece al usuario
+
         try:
             respuesta_iq = RespuestaEvaluacionIQ.objects.get(id=respuesta_iq_id)
         except RespuestaEvaluacionIQ.DoesNotExist:
-            return Response(
-                {'error': 'Respuesta no encontrada'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
+            return Response({'error': 'Respuesta no encontrada'}, status=404)
+
         if respuesta_iq.respondido_por != request.user:
+            return Response({'error': 'Sin permisos'}, status=403)
+
+        if respuesta_iq.estado != 'borrador':
             return Response(
-                {'error': 'No tienes permiso para añadir evidencias a esta respuesta'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        # Validar máximo 3 evidencias
-        evidencias_count = Evidencia.objects.filter(
-            respuesta_iq=respuesta_iq,
-            activo=True
-        ).count()
-        
-        if evidencias_count >= 3:
-            return Response(
-                {'error': 'Máximo 3 evidencias por respuesta'},
+                {'error': 'Solo se pueden agregar evidencias a respuestas en borrador'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Obtener archivo
+
+        if Evidencia.objects.filter(respuesta_iq=respuesta_iq, activo=True).count() >= 3:
+            return Response({'error': 'Máximo 3 evidencias por respuesta'}, status=400)
+
         archivo = request.FILES.get('archivo')
         if not archivo:
-            return Response(
-                {'error': 'El archivo es requerido'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Validar extensión
+            return Response({'error': 'El archivo es requerido'}, status=400)
+
         if not Evidencia.validar_extension(archivo.name):
-            return Response(
-                {'error': 'Tipo de archivo no permitido'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Validar tamaño
+            return Response({'error': 'Tipo de archivo no permitido'}, status=400)
+
         if not Evidencia.validar_tamanio(archivo.size):
-            return Response(
-                {'error': 'El archivo no debe superar 10MB'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
+            return Response({'error': 'El archivo no debe superar 10MB'}, status=400)
+
+        # Sanitizar nombre del archivo (sin espacios, emojis ni caracteres especiales)
+        import re
+        import uuid as uuid_lib
+        extension = archivo.name.rsplit('.', 1)[-1].lower() if '.' in archivo.name else 'bin'
+        nombre_seguro = f"{uuid_lib.uuid4().hex}.{extension}"
+
         # Subir a Supabase
-        storage = StorageService()
+        storage    = StorageService()
         empresa_id = respuesta_iq.asignacion.empresa_id
-        ruta_archivo = f"evidencias/iq/{empresa_id}/{respuesta_iq_id}/{archivo.name}"
-        
-        resultado = storage.upload_file(archivo, ruta_archivo)
-        
+        ruta       = f"evidencias/iq/{empresa_id}/{respuesta_iq_id}/{nombre_seguro}"
+        resultado  = storage.upload_file(archivo, ruta)
+
         if not resultado['success']:
             return Response(
-                {'error': 'Error al subir el archivo: ' + resultado.get('error', '')},
+                {'error': 'Error al subir archivo: ' + resultado.get('error', '')},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-        
-        # Crear evidencia
+
         evidencia = Evidencia.objects.create(
             respuesta_iq=respuesta_iq,
-            codigo_documento=request.data.get('codigo_documento', 'DOC-' + str(respuesta_iq_id)),
+            codigo_documento=request.data.get('codigo_documento', f'DOC-{respuesta_iq_id}'),
             tipo_documento_enum=request.data.get('tipo_documento_enum', 'otro'),
             titulo_documento=request.data.get('titulo_documento', archivo.name),
             objetivo_documento=request.data.get('objetivo_documento', 'Evidencia de cumplimiento'),
@@ -566,24 +519,13 @@ class EvidenciaIQViewSet(viewsets.ModelViewSet):
             tamanio_bytes=archivo.size,
             subido_por=request.user
         )
-        
-        from apps.asignaciones_iq.serializers import EvidenciaSerializer
-        serializer = EvidenciaSerializer(evidencia)
-        
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-    
+
+        return Response(EvidenciaIQSerializer(evidencia).data, status=status.HTTP_201_CREATED)
+
     def destroy(self, request, *args, **kwargs):
-        """Eliminar evidencia (soft delete)"""
         evidencia = self.get_object()
-        
-        # Verificar permisos
         if evidencia.respuesta_iq.respondido_por != request.user:
-            return Response(
-                {'error': 'No tienes permiso para eliminar esta evidencia'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+            return Response({'error': 'Sin permisos'}, status=403)
         evidencia.activo = False
         evidencia.save()
-        
         return Response(status=status.HTTP_204_NO_CONTENT)
