@@ -7,13 +7,14 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.utils import timezone
 from django.db.models import Avg, Count
 
 from apps.core.permissions import EsAdminOSuperAdmin
 from apps.core.services.storage_service import StorageService
 from apps.respuestas.models import Evidencia
+from apps.documentos.models import Documento
 
 from .models import AsignacionEvaluacionIQ, RespuestaEvaluacionIQ, CalculoNivelIQ
 from .serializers import (
@@ -321,7 +322,12 @@ class RespuestaEvaluacionIQViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Asignación no encontrada'}, status=404)
 
         # Permisos
-        if request.user.rol not in ['superadmin', 'administrador', 'auditor']:
+        if request.user.rol == 'superadmin':
+            pass
+        elif request.user.rol in ['administrador', 'auditor']:
+            if asignacion.empresa_id != getattr(request.user, 'empresa_id', None):
+                return Response({'error': 'Sin permisos'}, status=403)
+        else:
             if asignacion.usuario_asignado != request.user:
                 return Response({'error': 'Sin permisos'}, status=403)
 
@@ -429,13 +435,15 @@ class EvidenciaIQViewSet(viewsets.ModelViewSet):
     """Evidencias para respuestas de evaluaciones IQ."""
 
     permission_classes = [IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    lookup_field = 'id'
+    lookup_url_kwarg = 'id'
 
     def get_queryset(self):
         user = self.request.user
         qs = Evidencia.objects.filter(
             respuesta_iq__isnull=False, activo=True
-        ).select_related('respuesta_iq', 'subido_por')
+        ).select_related('respuesta_iq', 'respuesta_iq__asignacion__empresa', 'subido_por', 'documento_oficial')
 
         if user.rol == 'superadmin':
             pass
@@ -444,7 +452,7 @@ class EvidenciaIQViewSet(viewsets.ModelViewSet):
         else:
             qs = qs.filter(respuesta_iq__respondido_por=user)
 
-        respuesta_id = self.request.query_params.get('respuesta_iq')
+        respuesta_id = self.request.query_params.get('respuesta_iq_id') or self.request.query_params.get('respuesta_iq')
         if respuesta_id:
             qs = qs.filter(respuesta_iq_id=respuesta_id)
 
@@ -453,8 +461,27 @@ class EvidenciaIQViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         return EvidenciaIQSerializer
 
+    def _can_manage_respuesta_iq(self, user, respuesta_iq):
+        if user.rol == 'superadmin':
+            return True
+        if user.rol in ['administrador', 'auditor']:
+            return respuesta_iq.asignacion.empresa_id == getattr(user, 'empresa_id', None)
+        return respuesta_iq.respondido_por_id == user.id
+
+    def _resolver_tipo_documento_enum(self, documento):
+        nombre = (getattr(documento.tipo, 'nombre', '') or '').lower()
+        if 'polit' in nombre:
+            return 'politica'
+        if 'norma' in nombre:
+            return 'norma'
+        if 'proced' in nombre:
+            return 'procedimiento'
+        if 'formato' in nombre:
+            return 'formato_interno'
+        return 'otro'
+
     def create(self, request, *args, **kwargs):
-        """POST /api/evidencias-iq/  — sube un archivo para una respuesta IQ."""
+        """POST /api/evidencias-iq/  — sube archivo nuevo o vincula documento oficial."""
 
         respuesta_iq_id = request.data.get('respuesta_iq_id')
         if not respuesta_iq_id:
@@ -463,12 +490,29 @@ class EvidenciaIQViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        archivo = request.FILES.get('archivo')
+        documento_id = request.data.get('documento_id')
+
+        modo_archivo = bool(archivo)
+        modo_documento = bool(documento_id)
+
+        if modo_archivo == modo_documento:
+            return Response(
+                {
+                    'error': (
+                        'Debes enviar exactamente un modo: '
+                        '(respuesta_iq_id + archivo + metadata) o (respuesta_iq_id + documento_id).'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
-            respuesta_iq = RespuestaEvaluacionIQ.objects.get(id=respuesta_iq_id)
+            respuesta_iq = RespuestaEvaluacionIQ.objects.select_related('asignacion__empresa', 'respondido_por').get(id=respuesta_iq_id)
         except RespuestaEvaluacionIQ.DoesNotExist:
             return Response({'error': 'Respuesta no encontrada'}, status=404)
 
-        if respuesta_iq.respondido_por != request.user:
+        if not self._can_manage_respuesta_iq(request.user, respuesta_iq):
             return Response({'error': 'Sin permisos'}, status=403)
 
         if respuesta_iq.estado != 'borrador':
@@ -480,52 +524,96 @@ class EvidenciaIQViewSet(viewsets.ModelViewSet):
         if Evidencia.objects.filter(respuesta_iq=respuesta_iq, activo=True).count() >= 3:
             return Response({'error': 'Máximo 3 evidencias por respuesta'}, status=400)
 
-        archivo = request.FILES.get('archivo')
-        if not archivo:
-            return Response({'error': 'El archivo es requerido'}, status=400)
+        if modo_documento:
+            try:
+                documento = Documento.objects.select_related('empresa', 'tipo').get(id=documento_id)
+            except Documento.DoesNotExist:
+                return Response({'error': 'documento_id no existe'}, status=status.HTTP_404_NOT_FOUND)
 
-        if not Evidencia.validar_extension(archivo.name):
-            return Response({'error': 'Tipo de archivo no permitido'}, status=400)
+            if documento.estado != 'vigente':
+                return Response({'error': 'Solo se pueden vincular documentos oficiales vigentes'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not Evidencia.validar_tamanio(archivo.size):
-            return Response({'error': 'El archivo no debe superar 10MB'}, status=400)
+            if documento.empresa_id != respuesta_iq.asignacion.empresa_id:
+                return Response({'error': 'No puedes vincular documentos de otra empresa'}, status=status.HTTP_403_FORBIDDEN)
 
-        # Sanitizar nombre del archivo (sin espacios, emojis ni caracteres especiales)
-        import re
-        import uuid as uuid_lib
-        extension = archivo.name.rsplit('.', 1)[-1].lower() if '.' in archivo.name else 'bin'
-        nombre_seguro = f"{uuid_lib.uuid4().hex}.{extension}"
-
-        # Subir a Supabase
-        storage    = StorageService()
-        empresa_id = respuesta_iq.asignacion.empresa_id
-        ruta       = f"evidencias/iq/{empresa_id}/{respuesta_iq_id}/{nombre_seguro}"
-        resultado  = storage.upload_file(archivo, ruta)
-
-        if not resultado['success']:
-            return Response(
-                {'error': 'Error al subir archivo: ' + resultado.get('error', '')},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            evidencia = Evidencia.objects.create(
+                respuesta_iq=respuesta_iq,
+                documento_oficial=documento,
+                archivo='VINCULADO_MAESTRO',
+                codigo_documento=documento.codigo,
+                tipo_documento_enum=self._resolver_tipo_documento_enum(documento),
+                titulo_documento=documento.titulo,
+                objetivo_documento=documento.objetivo or 'Documento oficial vinculado',
+                nombre_archivo_original=f'VINCULADO: {documento.codigo}',
+                tamanio_bytes=0,
+                subido_por=request.user,
             )
+        else:
+            errores = {}
+            for campo in ['codigo_documento', 'titulo_documento', 'objetivo_documento', 'tipo_documento_enum']:
+                if not request.data.get(campo):
+                    errores[campo] = 'Este campo es requerido cuando se sube un archivo nuevo.'
+            if errores:
+                return Response({'errors': errores}, status=status.HTTP_400_BAD_REQUEST)
 
-        evidencia = Evidencia.objects.create(
-            respuesta_iq=respuesta_iq,
-            codigo_documento=request.data.get('codigo_documento', f'DOC-{respuesta_iq_id}'),
-            tipo_documento_enum=request.data.get('tipo_documento_enum', 'otro'),
-            titulo_documento=request.data.get('titulo_documento', archivo.name),
-            objetivo_documento=request.data.get('objetivo_documento', 'Evidencia de cumplimiento'),
-            nombre_archivo_original=archivo.name,
-            archivo=resultado['path'],
-            tamanio_bytes=archivo.size,
-            subido_por=request.user
-        )
+            if not Evidencia.validar_extension(archivo.name):
+                return Response({'error': 'Tipo de archivo no permitido'}, status=400)
+
+            if not Evidencia.validar_tamanio(archivo.size):
+                return Response({'error': 'El archivo no debe superar 10MB'}, status=400)
+
+            # Sanitizar nombre del archivo
+            import uuid as uuid_lib
+            extension = archivo.name.rsplit('.', 1)[-1].lower() if '.' in archivo.name else 'bin'
+            nombre_seguro = f"{uuid_lib.uuid4().hex}.{extension}"
+
+            storage = StorageService()
+            empresa_id = respuesta_iq.asignacion.empresa_id
+            ruta = f"evidencias/iq/{empresa_id}/{respuesta_iq_id}/{nombre_seguro}"
+            resultado = storage.upload_file(archivo, ruta)
+
+            if not resultado['success']:
+                return Response(
+                    {'error': 'Error al subir archivo: ' + resultado.get('error', '')},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+            evidencia = Evidencia.objects.create(
+                respuesta_iq=respuesta_iq,
+                codigo_documento=request.data.get('codigo_documento'),
+                tipo_documento_enum=request.data.get('tipo_documento_enum'),
+                titulo_documento=request.data.get('titulo_documento'),
+                objetivo_documento=request.data.get('objetivo_documento'),
+                nombre_archivo_original=archivo.name,
+                archivo=resultado['path'],
+                tamanio_bytes=archivo.size,
+                subido_por=request.user
+            )
 
         return Response(EvidenciaIQSerializer(evidencia).data, status=status.HTTP_201_CREATED)
 
     def destroy(self, request, *args, **kwargs):
-        evidencia = self.get_object()
-        if evidencia.respuesta_iq.respondido_por != request.user:
-            return Response({'error': 'Sin permisos'}, status=403)
+        evidencia_id = kwargs.get(self.lookup_url_kwarg) or kwargs.get('pk')
+        evidencia = Evidencia.objects.filter(
+            id=evidencia_id,
+            respuesta_iq__isnull=False,
+            activo=True,
+        ).select_related('respuesta_iq', 'respuesta_iq__asignacion__empresa').first()
+
+        if not evidencia:
+            return Response({'detail': 'Evidencia IQ no encontrada.'}, status=status.HTTP_404_NOT_FOUND)
+
+        respuesta_iq = evidencia.respuesta_iq
+
+        if not self._can_manage_respuesta_iq(request.user, respuesta_iq):
+            return Response({'detail': 'No tienes permisos para eliminar esta evidencia IQ.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if request.user.rol != 'superadmin' and getattr(request.user, 'empresa_id', None) != respuesta_iq.asignacion.empresa_id:
+            return Response({'detail': 'No puedes eliminar evidencias IQ de otra empresa.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if respuesta_iq.estado != 'borrador':
+            return Response({'detail': 'Solo se pueden eliminar evidencias de respuestas IQ en borrador.'}, status=status.HTTP_400_BAD_REQUEST)
+
         evidencia.activo = False
-        evidencia.save()
+        evidencia.save(update_fields=['activo', 'fecha_actualizacion'])
         return Response(status=status.HTTP_204_NO_CONTENT)
