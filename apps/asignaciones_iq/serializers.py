@@ -17,19 +17,28 @@ from apps.respuestas.models import Evidencia
 
 class EvidenciaIQSerializer(serializers.ModelSerializer):
     url_archivo = serializers.SerializerMethodField()
+    documento_maestro_id = serializers.UUIDField(source='documento_oficial_id', read_only=True)
+    es_documento_oficial = serializers.SerializerMethodField()
+    nombre_documento_maestro = serializers.CharField(source='documento_oficial.titulo', read_only=True)
+    codigo_documento_maestro = serializers.CharField(source='documento_oficial.codigo', read_only=True)
 
     class Meta:
         model = Evidencia
         fields = [
-            'id', 'codigo_documento', 'tipo_documento_enum',
+            'id', 'respuesta_iq', 'codigo_documento', 'tipo_documento_enum',
             'titulo_documento', 'objetivo_documento',
             'nombre_archivo_original', 'archivo', 'url_archivo',
             'tamanio_mb', 'fecha_creacion',
+            'documento_maestro_id', 'es_documento_oficial',
+            'nombre_documento_maestro', 'codigo_documento_maestro',
         ]
         read_only_fields = ['id', 'fecha_creacion']
 
     def get_url_archivo(self, obj):
         return obj.url_archivo
+
+    def get_es_documento_oficial(self, obj):
+        return bool(obj.documento_oficial_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,7 +48,7 @@ class EvidenciaIQSerializer(serializers.ModelSerializer):
 class RespuestaIQDetailSerializer(serializers.ModelSerializer):
     """Serializer completo para leer una respuesta (incluye calificación del auditor)."""
 
-    evidencias          = EvidenciaIQSerializer(many=True, read_only=True)
+    evidencias          = serializers.SerializerMethodField()
     estado_display      = serializers.CharField(source='get_estado_display', read_only=True)
     respondido_por_nombre = serializers.CharField(
         source='respondido_por.get_full_name', read_only=True
@@ -86,6 +95,13 @@ class RespuestaIQDetailSerializer(serializers.ModelSerializer):
 
     def get_total_evidencias(self, obj):
         return obj.evidencias.filter(activo=True).count()
+
+    def get_evidencias(self, obj):
+        evidencias_activas = obj.evidencias.filter(
+            activo=True,
+            respuesta_iq_id=obj.id,
+        ).select_related('documento_oficial').order_by('-fecha_creacion')
+        return EvidenciaIQSerializer(evidencias_activas, many=True).data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,7 +195,10 @@ class EnviarRespuestaIQSerializer(serializers.Serializer):
         # "Sí" (respuesta=null) → requiere evidencias
         if respuesta.respuesta is None and not tiene_evidencias:
             raise serializers.ValidationError({
-                'evidencias': 'Para enviar con respuesta vacía debes subir al menos una evidencia.'
+                'evidencias': (
+                    'Para enviar con respuesta vacía debes registrar al menos una evidencia '
+                    '(archivo nuevo o documento oficial vinculado).'
+                )
             })
 
         return attrs
