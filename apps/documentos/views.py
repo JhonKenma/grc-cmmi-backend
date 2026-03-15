@@ -145,11 +145,10 @@ class ProcesoViewSet(MultiEmpresaCatalogViewSet):
     pagination_class = None
 
 
-class NormaViewSet(viewsets.ReadOnlyModelViewSet):
+class NormaViewSet(MultiEmpresaCatalogViewSet):
     queryset = Norma.objects.all().order_by('nombre')
     serializer_class = NormaSerializer
     pagination_class = None
-    permission_classes = [IsAuthenticated]
 
 # =============================================================================
 # VIEWSET PRINCIPAL
