@@ -6,6 +6,7 @@ from apps.core.services.storage_service import StorageService
 from apps.asignaciones.models import Asignacion
 from apps.encuestas.models import Pregunta, Dimension
 from django.core.exceptions import ValidationError
+from django.db.models import Q
 import uuid
 import os
 
@@ -415,13 +416,13 @@ class Evidencia(BaseModel):
         ('formato_interno', 'Formato Interno'),
         ('otro', 'Otro'),
     ]
-    
+
     EXTENSIONES_PERMITIDAS = [
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', 
-        '.ppt', '.pptx', '.jpg', '.jpeg', '.png', 
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx',
+        '.ppt', '.pptx', '.jpg', '.jpeg', '.png',
         '.zip', '.rar', '.txt'
     ]
-    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     respuesta = models.ForeignKey(
@@ -523,9 +524,18 @@ class Evidencia(BaseModel):
             models.Index(fields=['respuesta']),
             models.Index(fields=['tipo_documento_enum']),
             models.Index(fields=['subido_por']),
-            models.Index(fields=['codigo_documento']), 
+            models.Index(fields=['codigo_documento']),
         ]
-    
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    (Q(respuesta_id__isnull=False) & Q(respuesta_iq_id__isnull=True))
+                    | (Q(respuesta_id__isnull=True) & Q(respuesta_iq_id__isnull=False))
+                ),
+                name='evidencia_exactly_one_respuesta_chk',
+            ),
+        ]
+
     def __str__(self):
         return f"{self.codigo_documento} - {self.titulo_documento}"
 
@@ -544,10 +554,16 @@ class Evidencia(BaseModel):
 
         # Debe estar asociada a una única respuesta (normal o IQ).
         if not self.respuesta and not self.respuesta_iq:
-            raise ValidationError('Debe estar asociada a una respuesta')
+            raise ValidationError({
+                'respuesta': 'Debes asociar la evidencia a una respuesta normal o IQ.',
+                'respuesta_iq': 'Debes asociar la evidencia a una respuesta normal o IQ.',
+            })
 
         if self.respuesta and self.respuesta_iq:
-            raise ValidationError('No puede estar asociada a ambos tipos de respuesta')
+            raise ValidationError({
+                'respuesta': 'Solo puedes asociar la evidencia a un tipo de respuesta.',
+                'respuesta_iq': 'Solo puedes asociar la evidencia a un tipo de respuesta.',
+            })
 
         # Máximo 3 evidencias por respuesta.
         if not self.pk:
