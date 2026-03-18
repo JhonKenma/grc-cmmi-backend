@@ -167,7 +167,7 @@ class NotificacionService:
             return True
             
         except Exception as e:
-            logger.error(f"Error al enviar email: {str(e)}")
+            logger.error(f"Error al enviar email: {str(e)}", exc_info=True)
             return False
     
     @staticmethod
