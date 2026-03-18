@@ -279,6 +279,7 @@ EMAIL_HOST = config('EMAIL_HOST', default='sandbox.smtp.mailtrap.io')
 EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
 EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
 EMAIL_PORT = config('EMAIL_PORT', default=2525, cast=int)
+#EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
 EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
 EMAIL_USE_SSL = config('EMAIL_USE_SSL', default=False, cast=bool)
 
@@ -288,6 +289,17 @@ DEFAULT_FROM_EMAIL = config(
 )
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 EMAIL_TIMEOUT = 10
+ 
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'shieldgrid-cache',
+    }
+}
+
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_TIME = 15 * 60  # 15 minutos
+FRONTEND_URL = 'https://grc-cmmi-frontend.onrender.com'  # Cambiar en producción
 
 # ═══════════════════════════════════════════════════════
 # CELERY CONFIGURATION (⭐ OPCIONAL - Comentar si no usas Celery)
