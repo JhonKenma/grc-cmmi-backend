@@ -7,6 +7,8 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework import serializers as drf_serializers
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.conf import settings
 from .models import Usuario
 from .serializers import (
     UsuarioSerializer,
@@ -21,17 +23,45 @@ from drf_spectacular.utils import extend_schema
 Usuario = get_user_model()
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    """Serializer personalizado para login con EMAIL"""
     username_field = Usuario.USERNAME_FIELD
-    
+
     def validate(self, attrs):
-        data = super().validate(attrs)
-        
-        # Verificar que el usuario esté activo
+        email = attrs.get('email', '').lower().strip()
+
+        # Verificar bloqueo
+        cache_key = f'login_attempts_{email}'
+        attempts = cache.get(cache_key, 0)
+        max_attempts = getattr(settings, 'LOGIN_MAX_ATTEMPTS', 5)
+        lockout_time = getattr(settings, 'LOGIN_LOCKOUT_TIME', 900)
+
+        if attempts >= max_attempts:
+            raise drf_serializers.ValidationError(
+                'Cuenta bloqueada temporalmente. Intenta nuevamente en 15 minutos.'
+            )
+
+        # Intentar autenticación
+        try:
+            data = super().validate(attrs)
+        except Exception:
+            # Incrementar intentos fallidos
+            cache.set(cache_key, attempts + 1, timeout=lockout_time)
+            remaining = max_attempts - (attempts + 1)
+
+            if remaining <= 0:
+                raise drf_serializers.ValidationError(
+                    'Cuenta bloqueada temporalmente. Intenta nuevamente en 15 minutos.'
+                )
+
+            raise drf_serializers.ValidationError(
+                f'Credenciales incorrectas. Te quedan {remaining} intento(s).'
+            )
+
+        # Login exitoso: limpiar intentos
+        cache.delete(cache_key)
+
         if not self.user.activo:
-            raise drf_serializers.ValidationError('Esta cuenta ha sido desactivada')
-        
-        # Información del usuario
+            raise drf_serializers.ValidationError('Esta cuenta ha sido desactivada.')
+
         data['usuario'] = {
             'id': self.user.id,
             'email': self.user.email,
@@ -43,7 +73,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'avatar': self.user.avatar.url if self.user.avatar else None,
             'es_superadmin': self.user.es_superadmin,
         }
-        
+
         return data
 
 class CustomTokenObtainPairView(TokenObtainPairView):
