@@ -4,6 +4,7 @@ from django.contrib.auth.password_validation import validate_password
 from .models import Usuario
 from apps.empresas.serializers import EmpresaSerializer
 from drf_spectacular.utils import extend_schema_field
+from apps.notificaciones.services import NotificacionService
 
 class UsuarioSerializer(serializers.ModelSerializer):
     """Serializer completo de usuario"""
@@ -125,22 +126,14 @@ class UsuarioSerializer(serializers.ModelSerializer):
         return attrs
     
     def create(self, validated_data):
-        password = validated_data.pop('password', None)
-        
-        # Generar username automático desde email
-        if 'username' not in validated_data or not validated_data.get('username'):
-            validated_data['username'] = validated_data['email'].split('@')[0]
-        
+        password = validated_data.pop('password')
+        validated_data['username'] = validated_data['email'].split('@')[0]
+
         usuario = Usuario(**validated_data)
-        
-        if password:
-            usuario.set_password(password)
-        else:
-            # Generar password temporal
-            temp_password = Usuario.objects.make_random_password(length=12)
-            usuario.set_password(temp_password)
-        
+        usuario.set_password(password)
         usuario.save()
+
+        _enviar_bienvenida(usuario, password)
         return usuario
     
     def update(self, instance, validated_data):
@@ -247,10 +240,13 @@ class UsuarioCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         password = validated_data.pop('password')
         validated_data['username'] = validated_data['email'].split('@')[0]
-        
+
         usuario = Usuario(**validated_data)
         usuario.set_password(password)
         usuario.save()
+
+        _enviar_bienvenida(usuario, password)  # ← esto faltaba
+
         return usuario
 
 class CambiarPasswordSerializer(serializers.Serializer):
@@ -271,3 +267,50 @@ class CambiarPasswordSerializer(serializers.Serializer):
         if not user.check_password(value):
             raise serializers.ValidationError("Contraseña actual incorrecta")
         return value
+    
+    
+def _enviar_bienvenida(usuario, password_temporal: str):
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.warning(f'[bienvenida] Iniciando envío para {usuario.email}')
+
+    from django.conf import settings
+
+    empresa_nombre = usuario.empresa.nombre if usuario.empresa else 'ShieldGrid 365'
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173')
+
+    titulo = f'Bienvenido a ShieldGrid 365 — {empresa_nombre}'
+    mensaje = (
+        f'Hola {usuario.get_full_name() or usuario.email},\n\n'
+        f'Tu cuenta ha sido creada en ShieldGrid 365.\n\n'
+        f'Tus credenciales de acceso son:\n'
+        f'  Email:       {usuario.email}\n'
+        f'  Contraseña:  {password_temporal}\n\n'
+        f'Por seguridad, cambia tu contraseña al ingresar por primera vez '
+        f'desde tu perfil.\n\n'
+        f'Accede en: {frontend_url}/login'
+    )
+
+    try:
+        from apps.notificaciones.services import NotificacionService
+        logger.warning(f'[bienvenida] NotificacionService importado OK')
+
+        notif = NotificacionService.crear_notificacion(
+            usuario=usuario,
+            tipo='sistema',
+            titulo=titulo,
+            mensaje=mensaje,
+            prioridad='alta',
+            url_accion='/perfil',
+            datos_adicionales={
+                'tipo_evento': 'cuenta_creada',
+                'empresa': empresa_nombre,
+            },
+            enviar_email=True
+        )
+        logger.warning(f'[bienvenida] Notificación creada: {notif.id}')
+        logger.warning(f'[bienvenida] email_enviado: {notif.email_enviado}')
+
+    except Exception as e:
+        logger.error(f'[bienvenida] ERROR: {type(e).__name__}: {e}', exc_info=True)
