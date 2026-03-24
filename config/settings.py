@@ -1,11 +1,9 @@
-# config/settings.py - VERSIÓN PARA RENDER
+# config/settings.py - VERSIÓN PARA GCP (Cloud Run + Cloud SQL)
 
 from pathlib import Path
 from decouple import config
 from datetime import timedelta
 import os
-import dj_database_url  # ⭐ AGREGAR
-from supabase import create_client, Client
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -14,17 +12,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ═══════════════════════════════════════════════════════
 
 SECRET_KEY = config('SECRET_KEY')
-DEBUG = config('DEBUG', default=True, cast=bool)
+DEBUG = config('DEBUG', default=False, cast=bool)
+ENVIRONMENT = config('ENVIRONMENT', default='local')  # 'local' o 'production'
 
-# ⭐ MEJORAR ALLOWED_HOSTS para Render
 ALLOWED_HOSTS = config(
-    'ALLOWED_HOSTS', 
+    'ALLOWED_HOSTS',
     default='localhost,127.0.0.1'
 ).split(',')
 
-# Agregar .onrender.com si estamos en Render
-if not DEBUG:
-    ALLOWED_HOSTS.append('.onrender.com')
+# Agrega automáticamente el dominio de Cloud Run en producción
+if ENVIRONMENT == 'production':
+    ALLOWED_HOSTS.append('.run.app')
 
 # ═══════════════════════════════════════════════════════
 # APLICACIONES
@@ -37,14 +35,14 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    
+
     # Third party
     'rest_framework',
     'django_filters',
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
-    
+
     # Local apps
     'apps.core',
     'apps.empresas',
@@ -59,9 +57,8 @@ INSTALLED_APPS = [
     'apps.notificaciones',
     'apps.proyectos_remediacion',
     'apps.proveedores',
-    'apps.documentos', #Nuevo
+    'apps.documentos',
     'django_extensions',
-    
 
     'drf_spectacular',
     'drf_spectacular_sidecar',
@@ -73,7 +70,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',  # ⭐ AGREGAR para archivos estáticos
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -104,28 +101,31 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 
 # ═══════════════════════════════════════════════════════
-# BASE DE DATOS (⭐ CONFIGURACIÓN PARA RENDER)
+# BASE DE DATOS
 # ═══════════════════════════════════════════════════════
 
-# Si existe DATABASE_URL (Render/producción), usar esa
-if os.environ.get('DATABASE_URL'):
-    DATABASES = {
-        'default': dj_database_url.config(
-            default=os.environ.get('DATABASE_URL'),
-            conn_max_age=600,
-            conn_health_checks=True,
-        )
-    }
-else:
-    # Configuración local con decouple
+if ENVIRONMENT == 'production':
+    # Cloud SQL via Unix socket (Cloud Run lo conecta automáticamente)
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
             'NAME': config('DB_NAME'),
             'USER': config('DB_USER'),
             'PASSWORD': config('DB_PASSWORD'),
-            'HOST': config('DB_HOST'),
-            'PORT': config('DB_PORT'),
+            'HOST': f"/cloudsql/{config('CLOUD_SQL_CONNECTION_NAME')}",
+            'PORT': '5432',
+        }
+    }
+else:
+    # Local — igual que siempre
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': config('DB_NAME'),
+            'USER': config('DB_USER'),
+            'PASSWORD': config('DB_PASSWORD'),
+            'HOST': config('DB_HOST', default='localhost'),
+            'PORT': config('DB_PORT', default='5432'),
         }
     }
 
@@ -150,13 +150,11 @@ USE_I18N = True
 USE_TZ = True
 
 # ═══════════════════════════════════════════════════════
-# ARCHIVOS ESTÁTICOS (⭐ CONFIGURACIÓN PARA RENDER)
+# ARCHIVOS ESTÁTICOS
 # ═══════════════════════════════════════════════════════
 
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-
-# Whitenoise - Compresión y caché para archivos estáticos
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 # ═══════════════════════════════════════════════════════
@@ -167,7 +165,6 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
 AUTH_USER_MODEL = 'usuarios.Usuario'
 
 # ═══════════════════════════════════════════════════════
@@ -204,17 +201,13 @@ SIMPLE_JWT = {
 }
 
 # ═══════════════════════════════════════════════════════
-# CORS (⭐ ACTUALIZAR PARA RENDER)
+# CORS
 # ═══════════════════════════════════════════════════════
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    # ⭐ Agregar tu frontend de Render después del deploy
-    "https://grc-cmmi-frontend.onrender.com",
-]
+CORS_ALLOWED_ORIGINS = config(
+    'CORS_ALLOWED_ORIGINS',
+    default='http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173'
+).split(',')
 
 CORS_ALLOW_HEADERS = [
     'accept',
@@ -230,13 +223,10 @@ CORS_ALLOW_HEADERS = [
 
 CORS_ALLOW_CREDENTIALS = True
 
-# ⭐ CSRF para producción
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    # ⭐ Agregar tu frontend de Render después del deploy
-    "https://grc-cmmi-frontend.onrender.com",
-]
+CSRF_TRUSTED_ORIGINS = config(
+    'CSRF_TRUSTED_ORIGINS',
+    default='http://localhost:5173,http://127.0.0.1:5173'
+).split(',')
 
 # ═══════════════════════════════════════════════════════
 # LOGGING
@@ -251,45 +241,31 @@ LOGGING = {
         },
     },
     'loggers': {
-        # Esto silencia los detalles excesivos de la conexión de red
-        'httpx': {
-            'handlers': ['console'],
-            'level': 'WARNING', # Solo muestra advertencias o errores
-        },
-        'httpcore': {
-            'handlers': ['console'],
-            'level': 'WARNING',
-        },
-        'supabase': {
-            'handlers': ['console'],
-            'level': 'INFO', # O WARNING si quieres aún menos texto
-        },
+        'httpx': {'handlers': ['console'], 'level': 'WARNING'},
+        'httpcore': {'handlers': ['console'], 'level': 'WARNING'},
+        'supabase': {'handlers': ['console'], 'level': 'INFO'},
     },
 }
+
 # ═══════════════════════════════════════════════════════
-# EMAIL CONFIGURATION
+# EMAIL
 # ═══════════════════════════════════════════════════════
 
-EMAIL_BACKEND = config(
-    'EMAIL_BACKEND', 
-    default='django.core.mail.backends.smtp.EmailBackend'
-)
-
+EMAIL_BACKEND = config('EMAIL_BACKEND', default='django.core.mail.backends.smtp.EmailBackend')
 EMAIL_HOST = config('EMAIL_HOST', default='sandbox.smtp.mailtrap.io')
 EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
 EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
 EMAIL_PORT = config('EMAIL_PORT', default=2525, cast=int)
-#EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
 EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
 EMAIL_USE_SSL = config('EMAIL_USE_SSL', default=False, cast=bool)
-
-DEFAULT_FROM_EMAIL = config(
-    'DEFAULT_FROM_EMAIL', 
-    default='Sistema GRC <noreply@grc.com>'
-)
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='Sistema GRC <noreply@grc.com>')
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 EMAIL_TIMEOUT = 10
- 
+
+# ═══════════════════════════════════════════════════════
+# CACHE
+# ═══════════════════════════════════════════════════════
+
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
@@ -297,74 +273,58 @@ CACHES = {
     }
 }
 
+# ═══════════════════════════════════════════════════════
+# CONFIGURACIONES CUSTOM
+# ═══════════════════════════════════════════════════════
+
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCKOUT_TIME = 15 * 60  # 15 minutos
-FRONTEND_URL = 'https://grc-cmmi-frontend.onrender.com'  # Cambiar en producción
+
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
 
 # ═══════════════════════════════════════════════════════
-# CELERY CONFIGURATION (⭐ OPCIONAL - Comentar si no usas Celery)
+# SUPABASE STORAGE (para evidencias)
 # ═══════════════════════════════════════════════════════
 
-# CELERY_BROKER_URL = config('REDIS_URL', default='redis://localhost:6379/0')
-# CELERY_RESULT_BACKEND = config('REDIS_URL', default='redis://localhost:6379/0')
-# CELERY_ACCEPT_CONTENT = ['json']
-# CELERY_TASK_SERIALIZER = 'json'
-# CELERY_RESULT_SERIALIZER = 'json'
-# CELERY_TIMEZONE = 'America/Lima'
-# CELERY_TASK_TRACK_STARTED = True
-# CELERY_TASK_TIME_LIMIT = 30 * 60
-# CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
-
-# ============================================
-# SUPABASE STORAGE CONFIGURATION
-# ============================================
-
-# 1. Definir credenciales
 SUPABASE_URL = config('SUPABASE_URL', default='')
 SUPABASE_KEY = config('SUPABASE_KEY', default='')
 SUPABASE_BUCKET = 'evidencias'
 
-# 2. Inicializar la variable nula primero
-supabase = None 
-
-# 3. Intentar asignarle el cliente
+supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("Supabase inyectado en settings correctamente")
+        print("Supabase conectado correctamente")
     except Exception as e:
-        print(f"Error critico en settings: {e}")
-        
-        
+        print(f"Error conectando Supabase: {e}")
+
 # ═══════════════════════════════════════════════════════
-# CONFIGURACIÓN DE SEGURIDAD PARA PRODUCCIÓN
+# SPECTACULAR (Swagger)
 # ═══════════════════════════════════════════════════════
+
 SPECTACULAR_SETTINGS = {
-    'TITLE': 'Tu API GRC',
-    'DESCRIPTION': 'Documentación del sistema de gestión',
+    'TITLE': 'ShieldGrid 365 API',
+    'DESCRIPTION': 'Documentación del sistema GRC',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
-    # ESTO ES LO QUE BUSCAS:
-    'SCHEMA_PATH_PREFIX': r'/api/', # Limpia el prefijo común en la doc
+    'SCHEMA_PATH_PREFIX': r'/api/',
     'SORT_OPERATION_PARAMETERS': True,
     'TAGS': [
         {'name': '1. Autenticación y Usuarios', 'description': 'Endpoints de usuarios'},
         {'name': '2. Gestión de Empresas', 'description': 'Gestión de empresas'},
-        {'name': '3. Gestión de Evaluaciones(Encuestas-Excel)', 'description': 'Gestión de Evaluaciones(Encuestas-Excel'},
-        
-        # ... define aquí el orden exacto que quieres
+        {'name': '3. Gestión de Evaluaciones(Encuestas-Excel)', 'description': 'Gestión de Evaluaciones'},
     ],
 }
 
+# ═══════════════════════════════════════════════════════
+# SEGURIDAD EN PRODUCCIÓN
+# ═══════════════════════════════════════════════════════
 
-if not DEBUG:
-    # HTTPS
+if ENVIRONMENT == 'production':
     SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
-    
-    # Seguridad adicional
     SECURE_BROWSER_XSS_FILTER = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     X_FRAME_OPTIONS = 'DENY'
