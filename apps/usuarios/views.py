@@ -308,7 +308,43 @@ class UsuarioViewSet(ResponseMixin, viewsets.ModelViewSet):
         
         serializer = self.get_serializer(queryset, many=True)
         return Response({'results': serializer.data})
-    
+
+    @action(detail=False, methods=['get'])
+    def usuarios_asignables(self, request):
+        """
+        Usuarios con rol 'usuario' de la empresa del admin.
+        Usado en formularios de asignación de dimensiones/evaluaciones IQ.
+        GET /api/auth/usuarios/usuarios_asignables/
+        """
+        user = request.user
+
+        if user.rol == 'superadmin':
+            empresa_id = request.query_params.get('empresa_id')
+            if not empresa_id:
+                return self.error_response(
+                    message='Debes proporcionar empresa_id',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+            queryset = Usuario.objects.filter(
+                empresa_id=empresa_id,
+                rol='usuario',
+                activo=True
+            )
+        elif user.rol == 'administrador':
+            queryset = Usuario.objects.filter(
+                empresa=user.empresa,
+                rol='usuario',
+                activo=True
+            )
+        else:
+            return self.error_response(
+                message='Sin permisos',
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = UsuarioListSerializer(queryset, many=True)
+        return Response({'results': serializer.data})
+
     @action(detail=False, methods=['get'])
     def estadisticas(self, request):
         """

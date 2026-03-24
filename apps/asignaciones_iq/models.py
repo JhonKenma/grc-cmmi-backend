@@ -178,8 +178,8 @@ class AsignacionEvaluacionIQ(models.Model):
 
         # Notificar al Auditor de la empresa
         try:
-            from apps.notificaciones.services import NotificacionAsignacionService
-            NotificacionAsignacionService.notificar_pendiente_auditoria_iq(
+            from apps.asignaciones_iq.services import NotificacionAsignacionIQService
+            NotificacionAsignacionIQService.notificar_pendiente_auditoria_iq(
                 asignacion=self
             )
         except Exception as e:

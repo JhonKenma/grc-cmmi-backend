@@ -337,3 +337,128 @@ class NotificacionAsignacionIQService:
             
         except Exception as e:
             logger.error(f"❌ Error al notificar vencimiento: {str(e)}")
+            
+    @staticmethod
+    def notificar_pendiente_auditoria_iq(asignacion):
+        """
+        Notifica al Auditor de la empresa cuando una asignación IQ
+        queda completada y lista para auditar.
+
+        Args:
+            asignacion: Objeto AsignacionEvaluacionIQ
+        """
+        try:
+            from apps.usuarios.models import Usuario
+
+            # Buscar auditor(es) de la empresa
+            auditores = Usuario.objects.filter(
+                empresa=asignacion.empresa,
+                rol='auditor',
+                activo=True,
+            )
+
+            if not auditores.exists():
+                logger.warning(
+                    f"⚠️  No hay auditores en la empresa {asignacion.empresa} "
+                    f"para notificar asignación IQ {asignacion.id}"
+                )
+                return None
+
+            usuario    = asignacion.usuario_asignado
+            evaluacion = asignacion.evaluacion
+            titulo     = f"🔍 Evaluación IQ lista para auditar: {evaluacion.nombre}"
+            mensaje    = (
+                f"{usuario.get_full_name()} ha completado la evaluación IQ "
+                f"'{evaluacion.nombre}'.\n\n"
+                f"📋 Total de preguntas respondidas: {asignacion.total_preguntas}\n"
+                f"📅 Completada el: {asignacion.fecha_completado.strftime('%d/%m/%Y %H:%M') if asignacion.fecha_completado else 'Ahora'}\n\n"
+                f"Ingresa a la sección de Revisiones IQ para calificar las respuestas."
+            )
+            url_accion = f"/auditor/revisiones-iq/{asignacion.id}"
+            datos_adicionales = {
+                'asignacion_id': str(asignacion.id),
+                'evaluacion_id': str(evaluacion.id),
+                'usuario_id':    str(usuario.id),
+                'tipo_notificacion': 'pendiente_auditoria_iq',
+            }
+
+            notificaciones = []
+            for auditor in auditores:
+                notif = NotificacionService.crear_notificacion(
+                    usuario=auditor,
+                    tipo='revision_pendiente',
+                    titulo=titulo,
+                    mensaje=mensaje,
+                    prioridad='alta',
+                    url_accion=url_accion,
+                    datos_adicionales=datos_adicionales,
+                    enviar_email=True,
+                )
+                notificaciones.append(notif)
+
+            logger.info(
+                f"✅ Notificación IQ pendiente de auditoría enviada a "
+                f"{auditores.count()} auditor(es) — Asignación {asignacion.id}"
+            )
+            return notificaciones
+
+        except Exception as e:
+            logger.error(
+                f"❌ Error al notificar auditoría IQ pendiente {asignacion.id}: {str(e)}"
+            )
+            return None
+
+    @staticmethod
+    def notificar_auditoria_completada(asignacion):
+        """
+        Notifica al Admin y al usuario cuando el auditor cierra la revisión IQ.
+
+        Args:
+            asignacion: Objeto AsignacionEvaluacionIQ (ya en estado 'auditada')
+        """
+        try:
+            evaluacion = asignacion.evaluacion
+            auditor    = asignacion.auditado_por
+
+            # 1. Notificar al usuario evaluado
+            titulo_usuario = f"✅ Tu evaluación IQ fue auditada: {evaluacion.nombre}"
+            mensaje_usuario = (
+                f"El auditor {auditor.get_full_name() if auditor else 'del sistema'} "
+                f"ha revisado tu evaluación '{evaluacion.nombre}'.\n\n"
+                f"Puedes ver los resultados en la sección de Reportes IQ."
+            )
+            NotificacionService.crear_notificacion(
+                usuario=asignacion.usuario_asignado,
+                tipo='evaluacion_completada',
+                titulo=titulo_usuario,
+                mensaje=mensaje_usuario,
+                prioridad='normal',
+                url_accion=f"/reportes/evaluaciones-iq?asignacion_id={asignacion.id}",
+                datos_adicionales={'asignacion_id': str(asignacion.id)},
+                enviar_email=True,
+            )
+
+            # 2. Notificar al Admin que asignó
+            if asignacion.asignado_por:
+                titulo_admin = f"📊 Auditoría IQ completada: {evaluacion.nombre}"
+                mensaje_admin = (
+                    f"La evaluación IQ '{evaluacion.nombre}' de "
+                    f"{asignacion.usuario_asignado.get_full_name()} "
+                    f"fue auditada por {auditor.get_full_name() if auditor else 'el auditor'}.\n\n"
+                    f"El reporte GAP ya está disponible."
+                )
+                NotificacionService.crear_notificacion(
+                    usuario=asignacion.asignado_por,
+                    tipo='evaluacion_completada',
+                    titulo=titulo_admin,
+                    mensaje=mensaje_admin,
+                    prioridad='normal',
+                    url_accion=f"/reportes/evaluaciones-iq?asignacion_id={asignacion.id}",
+                    datos_adicionales={'asignacion_id': str(asignacion.id)},
+                    enviar_email=True,
+                )
+
+            logger.info(f"✅ Notificaciones de auditoría IQ completada enviadas — Asignación {asignacion.id}")
+
+        except Exception as e:
+            logger.error(f"❌ Error al notificar auditoría IQ completada {asignacion.id}: {str(e)}")

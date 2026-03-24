@@ -951,12 +951,17 @@ class CalculoNivelViewSet(ResponseMixin, viewsets.ReadOnlyModelViewSet):
         )
         
         if user.rol == 'superadmin':
-            return queryset
+            pass
         elif user.rol == 'administrador':
-            return queryset.filter(asignacion__empresa=user.empresa)
+            queryset = queryset.filter(asignacion__empresa=user.empresa)
         else:
-            return queryset.filter(asignacion__usuario_asignado=user)
-        
+            queryset = queryset.filter(asignacion__usuario_asignado=user)
+
+        # ⭐ Filtro por dimension_id
+        dimension_id = self.request.query_params.get('dimension')
+        if dimension_id:
+            queryset = queryset.filter(dimension__id=dimension_id)
+
         return queryset.order_by('-calculado_at')
     
     @action(detail=False, methods=['get'])
