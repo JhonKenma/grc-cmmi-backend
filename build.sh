@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
 set -o errexit
 
-echo "🔧 Instalando dependencias..."
-pip install -r requirements.txt
-
 echo "📦 Recolectando archivos estáticos..."
 python manage.py collectstatic --no-input
 
-echo "🔄 Sincronizando estado de todas las migraciones..."
+echo "🔄 Aplicando migraciones..."
 python manage.py migrate --fake-initial
-
-echo "🗄️ Ejecutando migraciones nuevas..."
 python manage.py migrate
 
 echo "👤 Creando superusuario (si no existe)..."
