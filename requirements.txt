@@ -24,7 +24,7 @@ cryptography==46.0.3
 cycler==0.12.1
 deprecation==2.1.0
 dj-database-url==3.1.0
-Django==5.2.11
+Django==5.2.12
 django-celery-beat==2.8.1
 django-cors-headers==4.3.1
 django-extensions==4.1
