@@ -278,7 +278,7 @@ def _enviar_bienvenida(usuario, password_temporal: str):
     from django.conf import settings
 
     empresa_nombre = usuario.empresa.nombre if usuario.empresa else 'ShieldGrid 365'
-    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173')
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'https://app.shieldgrid365.com')
 
     titulo = f'Bienvenido a ShieldGrid 365 — {empresa_nombre}'
     mensaje = (
