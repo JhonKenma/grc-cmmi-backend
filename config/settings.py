@@ -282,6 +282,10 @@ LOGIN_LOCKOUT_TIME = 15 * 60  # 15 minutos
 
 FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
 
+# Microservicio IA (Copilot)
+AI_MICROSERVICE_URL = config('AI_MICROSERVICE_URL', default='http://localhost:8001/api/v1')
+AI_MICROSERVICE_TIMEOUT = config('AI_MICROSERVICE_TIMEOUT', default=45, cast=int)
+
 # ═══════════════════════════════════════════════════════
 # SUPABASE STORAGE (para evidencias)
 # ═══════════════════════════════════════════════════════

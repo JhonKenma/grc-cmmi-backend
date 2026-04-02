@@ -25,6 +25,9 @@ ENV/
 # Media files (si no quieres versionar los uploads)
 media/
 
+# Backups y datos locales
+data/
+
 # Static files
 staticfiles/
 static_root/
