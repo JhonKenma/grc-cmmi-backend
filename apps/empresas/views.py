@@ -3,8 +3,8 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from .models import Empresa
-from .serializers import EmpresaSerializer, EmpresaListSerializer
+from .models import Empresa, PlanEmpresa 
+from .serializers import EmpresaSerializer, EmpresaListSerializer, PlanEmpresaSerializer  
 from apps.core.permissions import EsAdminOSuperAdmin, EsSuperAdmin
 from apps.core.mixins import ResponseMixin
 from drf_spectacular.utils import extend_schema
@@ -167,3 +167,58 @@ class EmpresaViewSet(ResponseMixin, viewsets.ModelViewSet):
             'empresas_inactivas': total_empresas - empresas_activas,
             'total_usuarios': total_usuarios,
         })
+        
+    @action(detail=True, methods=['post'])
+    def asignar_plan(self, request, pk=None):
+        """
+        POST /api/empresas/{id}/asignar_plan/
+        Body:
+        {
+            "tipo": "demo",
+            "max_usuarios": 3,
+            "max_administradores": 1,
+            "max_auditores": 1,
+            "fecha_expiracion": "2026-05-30",  ← fecha ISO, el backend calcula el resto
+            "sin_expiracion": false
+        }
+        """
+        empresa = self.get_object()
+
+        tipo             = request.data.get('tipo', 'demo')
+        max_usuarios     = request.data.get('max_usuarios', 3)
+        max_admins       = request.data.get('max_administradores', 1)
+        max_auditores    = request.data.get('max_auditores', 1)
+        sin_expiracion   = request.data.get('sin_expiracion', False)
+        fecha_exp_str    = request.data.get('fecha_expiracion')  # "YYYY-MM-DD"
+
+        plan, creado = PlanEmpresa.objects.get_or_create(empresa=empresa)
+        plan.tipo                = tipo
+        plan.max_usuarios        = max_usuarios
+        plan.max_administradores = max_admins
+        plan.max_auditores       = max_auditores
+
+        if sin_expiracion:
+            plan.fecha_expiracion = None
+        elif fecha_exp_str:
+            from datetime import datetime, timezone as dt_timezone
+            try:
+                fecha_naive = datetime.strptime(fecha_exp_str, '%Y-%m-%d')
+                fecha_naive = fecha_naive.replace(hour=23, minute=59, second=59)
+                plan.fecha_expiracion = fecha_naive.replace(tzinfo=dt_timezone.utc)
+            except ValueError:
+                return self.error_response(
+                    message='Formato de fecha inválido. Use YYYY-MM-DD',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            return self.error_response(
+                message='Debe proporcionar fecha_expiracion o sin_expiracion=true',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+        plan.save()
+
+        return self.success_response(
+            data=PlanEmpresaSerializer(plan).data,
+            message=f'Plan {"creado" if creado else "actualizado"} exitosamente'
+        )
