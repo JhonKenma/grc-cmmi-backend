@@ -5,6 +5,7 @@ from .models import Usuario
 from apps.empresas.serializers import EmpresaSerializer
 from drf_spectacular.utils import extend_schema_field
 from apps.notificaciones.services import NotificacionService
+from apps.empresas.models import PlanEmpresa
 
 class UsuarioSerializer(serializers.ModelSerializer):
     """Serializer completo de usuario"""
@@ -107,22 +108,29 @@ class UsuarioSerializer(serializers.ModelSerializer):
         return value
     
     def validate(self, attrs):
-        """Validaciones generales"""
-        rol = attrs.get('rol', 'usuario')
+        rol     = attrs.get('rol', 'usuario')
         empresa = attrs.get('empresa')
-        
-        # SuperAdmin no debe tener empresa
+
         if rol == 'superadmin' and empresa:
             raise serializers.ValidationError({
                 'empresa': 'Super administradores no deben tener empresa asignada'
             })
-        
-        # Otros roles deben tener empresa
         if rol != 'superadmin' and not empresa:
             raise serializers.ValidationError({
                 'empresa': 'Este rol requiere una empresa asignada'
             })
-        
+
+        # ← Solo valida límites al CREAR (no al editar)
+        if empresa and rol != 'superadmin' and not self.instance:
+            plan = getattr(empresa, 'plan', None)
+            if plan is None:
+                raise serializers.ValidationError({
+                    'empresa': 'Esta empresa no tiene un plan activo.'
+                })
+            puede, motivo = plan.puede_crear_usuario(rol)
+            if not puede:
+                raise serializers.ValidationError({'rol': motivo})
+
         return attrs
     
     def create(self, validated_data):
@@ -222,19 +230,30 @@ class UsuarioCreateSerializer(serializers.ModelSerializer):
         return value
     
     def validate(self, attrs):
-        rol = attrs.get('rol')
+        rol     = attrs.get('rol', 'usuario')
         empresa = attrs.get('empresa')
-        
+
+        # Superadmin sin empresa
         if rol == 'superadmin' and empresa:
             raise serializers.ValidationError({
                 'empresa': 'Super administradores no deben tener empresa'
             })
-        
         if rol != 'superadmin' and not empresa:
             raise serializers.ValidationError({
                 'empresa': 'Este rol requiere una empresa'
             })
-        
+
+        # ← Validación centralizada en el plan
+        if empresa and rol != 'superadmin':
+            plan = getattr(empresa, 'plan', None)
+            if plan is None:
+                raise serializers.ValidationError({
+                    'empresa': 'Esta empresa no tiene un plan activo. Contacta al administrador.'
+                })
+            puede, motivo = plan.puede_crear_usuario(rol)
+            if not puede:
+                raise serializers.ValidationError({'rol': motivo})
+
         return attrs
     
     def create(self, validated_data):
