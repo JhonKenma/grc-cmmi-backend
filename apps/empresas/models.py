@@ -1,5 +1,7 @@
 # apps/empresas/models.py
 from django.db import models
+from django.utils import timezone      # ← django.utils, NO datetime
+from datetime import timedelta         # ← timedelta sí viene de datetime
 from apps.core.models import BaseModel
 
 class Empresa(BaseModel):
@@ -190,3 +192,119 @@ class Empresa(BaseModel):
     @property
     def sector_nombre(self):
         return self.sector_display
+    
+# ─────────────────────────────────────────────
+# NUEVO: PlanEmpresa
+# ─────────────────────────────────────────────    
+class PlanEmpresa(BaseModel):
+    """
+    Define el plan contratado por cada empresa.
+    Centraliza límites de usuarios, roles y vigencia.
+    """
+
+    TIPOS = [
+        ('demo',        'Demo'),
+        ('basico',      'Básico'),
+        ('profesional', 'Profesional'),
+        ('enterprise',  'Enterprise'),
+    ]
+
+    empresa = models.OneToOneField(
+        Empresa,
+        on_delete=models.CASCADE,
+        related_name='plan',
+        verbose_name='Empresa'
+    )
+    tipo = models.CharField(
+        max_length=20,
+        choices=TIPOS,
+        default='demo',
+        verbose_name='Tipo de Plan'
+    )
+    fecha_inicio     = models.DateTimeField(default=timezone.now, verbose_name='Fecha de Inicio')
+    fecha_expiracion = models.DateTimeField(null=True, blank=True, verbose_name='Fecha de Expiración')
+    max_usuarios     = models.PositiveIntegerField(default=3, verbose_name='Máx. Usuarios')
+    max_administradores = models.PositiveIntegerField(default=1, verbose_name='Máx. Administradores')
+    max_auditores    = models.PositiveIntegerField(default=1, verbose_name='Máx. Auditores')
+
+    class Meta:
+        db_table  = 'planes_empresa'
+        verbose_name = 'Plan de Empresa'
+        verbose_name_plural = 'Planes de Empresa'
+
+    def __str__(self):
+        return f"{self.empresa.nombre} — {self.get_tipo_display()}"
+
+    # ── Propiedades de estado ──────────────────
+
+    @property
+    def esta_activo(self):
+        """Sin fecha de expiración = plan sin límite (enterprise)"""
+        if not self.fecha_expiracion:
+            return True
+        return timezone.now() < self.fecha_expiracion
+
+    @property
+    def dias_restantes(self):
+        if not self.fecha_expiracion:
+            return None
+        delta = self.fecha_expiracion - timezone.now()
+        return max(delta.days, 0)
+
+    # ── Lógica de límites ──────────────────────
+
+    def puede_crear_usuario(self, rol: str) -> tuple:
+        """
+        Verifica si la empresa puede crear un usuario del rol dado.
+        Retorna (True, '') o (False, 'motivo').
+        """
+        if not self.esta_activo:
+            return False, 'El plan de la empresa ha expirado'
+
+        empresa = self.empresa
+        limites = {
+            'usuario':       ('usuario',       self.max_usuarios),
+            'administrador': ('administrador',  self.max_administradores),
+            'auditor':       ('auditor',        self.max_auditores),
+        }
+
+        if rol not in limites:
+            return True, ''  # superadmin u otros sin límite
+
+        rol_filtro, maximo = limites[rol]
+        actuales = empresa.usuarios.filter(rol=rol_filtro, activo=True).count()
+
+        if actuales >= maximo:
+            return False, f'Límite de {maximo} {rol}(s) alcanzado para este plan'
+
+        return True, ''
+
+    # ── Factories ─────────────────────────────
+
+    @classmethod
+    def crear_demo(cls, empresa):
+        """Crea un plan demo: 3 usuarios, 1 admin, 1 auditor, 60 días"""
+        return cls.objects.create(
+            empresa=empresa,
+            tipo='demo',
+            max_usuarios=3,
+            max_administradores=1,
+            max_auditores=1,
+            fecha_expiracion=timezone.now() + timedelta(days=60)
+        )
+
+    @classmethod
+    def crear_plan(cls, empresa, tipo, max_usuarios,
+                   max_administradores, max_auditores, dias_vigencia=None):
+        """Factory genérico para cualquier plan"""
+        expiracion = None
+        if dias_vigencia:
+            expiracion = timezone.now() + timedelta(days=dias_vigencia)
+        return cls.objects.create(
+            empresa=empresa,
+            tipo=tipo,
+            max_usuarios=max_usuarios,
+            max_administradores=max_administradores,
+            max_auditores=max_auditores,
+            fecha_expiracion=expiracion
+        )
