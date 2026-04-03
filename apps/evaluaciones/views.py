@@ -627,6 +627,7 @@ class EvaluacionViewSet(viewsets.ModelViewSet):
                 'success': True,
                 'evaluacion_id': evaluacion.id,
                 'framework': payload['framework'],
+                'criterio': ai_response.get('criterio', ''),
                 'total_candidatas': len(candidatas),
                 'total_sugeridas': len(selected_ids),
                 'selected_question_ids': selected_ids,
