@@ -496,15 +496,23 @@ class EvaluacionViewSet(viewsets.ModelViewSet):
         instruction = str(request.data.get('instruction', '')).strip()
         seccion = str(request.data.get('seccion', '')).strip()
 
-        max_preguntas_raw = request.data.get('max_preguntas', 25)
-        try:
-            max_preguntas = int(max_preguntas_raw)
-        except (TypeError, ValueError):
-            return Response(
-                {'error': 'max_preguntas debe ser un numero entero'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        max_preguntas = max(1, min(max_preguntas, 100))
+        max_preguntas_raw = request.data.get('max_preguntas')
+        max_preguntas: int | None = None
+        if max_preguntas_raw not in (None, ''):
+            try:
+                max_preguntas = int(max_preguntas_raw)
+            except (TypeError, ValueError):
+                return Response(
+                    {'error': 'max_preguntas debe ser un numero entero'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if max_preguntas < 1:
+                return Response(
+                    {'error': 'max_preguntas debe ser mayor o igual a 1'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        max_preguntas_permitidas = 60
 
         nivel_madurez_raw = request.data.get('nivel_madurez')
         nivel_madurez = None
@@ -546,11 +554,20 @@ class EvaluacionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_200_OK
             )
 
+        # Evita preselecciones masivas por defecto y aplica un tope de seguridad.
+        default_max_preguntas = min(25, len(candidatas))
+        max_questions_requested = max_preguntas or default_max_preguntas
+        max_questions_allowed = min(
+            max_questions_requested,
+            len(candidatas),
+            max_preguntas_permitidas,
+        )
+
         payload = {
             'empresa_id': evaluacion.empresa_id,
             'framework': framework_codigo or 'MULTI-FRAMEWORK',
             'instruction': instruction,
-            'max_questions': max_preguntas,
+            'max_questions': max_questions_allowed,
             'evaluation': {
                 'evaluacion_id': evaluacion.id,
                 'nombre': evaluacion.nombre,
@@ -633,7 +650,6 @@ class EvaluacionViewSet(viewsets.ModelViewSet):
                 'selected_question_ids': selected_ids,
                 'recommendations': recomendaciones,
                 'preguntas_sugeridas': preguntas_ordenadas,
-                'model': ai_response.get('model'),
             },
             status=status.HTTP_200_OK
         )
