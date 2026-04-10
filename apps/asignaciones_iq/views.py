@@ -231,6 +231,19 @@ class AsignacionEvaluacionIQViewSet(viewsets.ModelViewSet):
             )['porcentaje_completado__avg'] or 0,
         })
 
+    # ── Por evaluación ─────────────────────────────────────────────────────────
+    @action(detail=False, methods=['get'],
+            permission_classes=[EsAdminOSuperAdmin],
+            url_path='por-evaluacion/(?P<evaluacion_id>[^/.]+)')
+    def por_evaluacion(self, request, evaluacion_id=None):
+        qs = self.get_queryset().filter(evaluacion_id=evaluacion_id)
+        serializer = AsignacionIQListSerializer(qs, many=True)
+        return Response({
+            'evaluacion_id': evaluacion_id,
+            'total': qs.count(),
+            'asignaciones': serializer.data,
+        })
+        
     # ── GAP de una asignación ──────────────────────────────────────────────────
 
     @action(detail=True, methods=['get'], url_path='gap')
