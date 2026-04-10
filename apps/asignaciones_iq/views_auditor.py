@@ -179,20 +179,6 @@ class AuditorIQViewSet(ResponseMixin, viewsets.GenericViewSet):
     @action(detail=False, methods=['post'],
             url_path='cerrar_revision/(?P<asignacion_id>[^/.]+)')
     def cerrar_revision(self, request, asignacion_id=None):
-        """
-        POST /api/auditor-iq/cerrar_revision/{asignacion_id}/
-
-        Al cerrar:
-        1. Respuestas sin calificar → NO_CUMPLE automático
-        2. Calcula GAP por sección/framework (crea CalculoNivelIQ)
-        3. Estado asignación → 'auditada'
-        4. Notifica al administrador
-
-        Body (opcional):
-        {
-            "notas_auditoria": "Comentarios generales..."
-        }
-        """
         try:
             asignacion = AsignacionEvaluacionIQ.objects.select_related(
                 'empresa', 'evaluacion', 'usuario_asignado'
@@ -227,18 +213,22 @@ class AuditorIQViewSet(ResponseMixin, viewsets.GenericViewSet):
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+        # Refrescar desde BD para obtener estado actualizado
+        asignacion.refresh_from_db()
+
         # Construir resumen del GAP para el frontend
         from .models import CalculoNivelIQ
         from django.db.models import Avg
 
         calculos = CalculoNivelIQ.objects.filter(asignacion=asignacion)
+        print(f"🔍 VIEW: calculos encontrados = {calculos.count()}")
         stats    = calculos.aggregate(
             gap_avg=Avg('gap'),
             nivel_actual_avg=Avg('nivel_actual'),
             nivel_deseado_avg=Avg('nivel_deseado'),
             cumplimiento_avg=Avg('porcentaje_cumplimiento'),
         )
-
+        print(f"🔍 VIEW: stats = {stats}")
         # Contar respuestas que se marcaron automáticamente
         pendientes_auto_nc = RespuestaEvaluacionIQ.objects.filter(
             asignacion=asignacion,
@@ -268,16 +258,18 @@ class AuditorIQViewSet(ResponseMixin, viewsets.GenericViewSet):
             'brechas_criticas':        calculos.filter(clasificacion_gap='critico').count(),
             'brechas_altas':           calculos.filter(clasificacion_gap='alto').count(),
         }
-
-        return self.success_response(
-            data={
-                'asignacion_id':      asignacion.id,
-                'estado':             asignacion.estado,
+        print(f"🔍 gap_info: {gap_info}")
+        from rest_framework.response import Response as DRFResponse
+        return DRFResponse({
+            'success': True,
+            'message': 'Revisión cerrada. GAP calculado exitosamente.',
+            'data': {
+                'asignacion_id':      int(asignacion.id),
+                'estado':             str(asignacion.estado),
                 'gap_info':           gap_info,
-                'pendientes_auto_nc': pendientes_auto_nc,
-            },
-            message='Revisión cerrada. GAP calculado exitosamente.'
-        )
+                'pendientes_auto_nc': int(pendientes_auto_nc),
+            }
+        }, status=200)
 
     # ── historial ─────────────────────────────────────────────────────────────
 
