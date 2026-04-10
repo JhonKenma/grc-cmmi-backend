@@ -186,12 +186,6 @@ class AsignacionEvaluacionIQ(models.Model):
             print(f'⚠️  Error al notificar auditor IQ: {e}')
 
     def cerrar_revision_auditoria(self, auditor, notas=''):
-        """
-        Llamado cuando el auditor termina de calificar todas las respuestas.
-        1. Marca respuestas sin calificar como NO_CUMPLE automáticamente
-        2. Calcula GAP por sección/framework
-        3. Cambia estado a 'auditada'
-        """
         from django.utils import timezone
 
         # 1. Marcar sin calificar como NO_CUMPLE
@@ -200,19 +194,29 @@ class AsignacionEvaluacionIQ(models.Model):
             estado='enviado',
             calificacion_auditor__isnull=True
         )
+        print(f"🔍 Sin calificar: {sin_calificar.count()}")
         for resp in sin_calificar:
             resp.marcar_no_cumple_automatico(auditor)
 
-        # 2. Calcular GAP
-        self._calcular_gap_iq()
-
-        # 3. Cerrar
+        # 2. Cerrar PRIMERO
         self.estado = 'auditada'
         self.auditado_por = auditor
         self.fecha_auditada = timezone.now()
         if notas:
             self.notas_auditoria = notas
         self.save()
+        print(f"✅ Estado guardado: {self.estado}")
+
+        # 3. Calcular GAP
+        self._calcular_gap_iq()
+        print(f"✅ GAP calculado")
+
+        # Verificar
+        from .models import CalculoNivelIQ
+        calculos = CalculoNivelIQ.objects.filter(asignacion=self)
+        print(f"✅ Cálculos creados: {calculos.count()}")
+        for c in calculos:
+            print(f"   - {c.seccion}: GAP={c.gap}")
 
     def _calcular_gap_iq(self):
         """
@@ -226,6 +230,7 @@ class AsignacionEvaluacionIQ(models.Model):
         secciones = (
             RespuestaEvaluacionIQ.objects
             .filter(asignacion=self, estado='auditado')
+            .exclude(respuesta='NO_APLICA')          # ← AGREGAR ESTA LÍNEA
             .values('pregunta__seccion_general', 'pregunta__framework__id', 'pregunta__framework__nombre')
             .annotate(promedio_nivel=Avg('nivel_madurez'))
         )
