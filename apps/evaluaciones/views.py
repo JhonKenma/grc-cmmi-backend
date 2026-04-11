@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.db import transaction
 from django.db.models import Count, Q
+from django.conf import settings
 from apps.core.permissions import EsSuperAdmin, EsAdminOSuperAdmin
 import pandas as pd
 import re
@@ -39,6 +40,7 @@ from .serializers import (
     NotaEvidenciaSerializer,
     ComentarioEvaluacionSerializer
 )
+from .services import CopilotQuestionSelectorClient
 
 class FrameworkViewSet(viewsets.ReadOnlyModelViewSet):
 
@@ -480,6 +482,177 @@ class EvaluacionViewSet(viewsets.ModelViewSet):
                     )
 
         return super().create(request, *args, **kwargs)
+
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='sugerir-preguntas-ia'
+    )
+    def sugerir_preguntas_ia(self, request, pk=None):
+        """Sugiere preguntas priorizadas con IA segun el contexto de la evaluacion."""
+        evaluacion = self.get_object()
+
+        framework_codigo = request.data.get('framework_codigo')
+        instruction = str(request.data.get('instruction', '')).strip()
+        seccion = str(request.data.get('seccion', '')).strip()
+
+        max_preguntas_raw = request.data.get('max_preguntas')
+        max_preguntas: int | None = None
+        if max_preguntas_raw not in (None, ''):
+            try:
+                max_preguntas = int(max_preguntas_raw)
+            except (TypeError, ValueError):
+                return Response(
+                    {'error': 'max_preguntas debe ser un numero entero'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if max_preguntas < 1:
+                return Response(
+                    {'error': 'max_preguntas debe ser mayor o igual a 1'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        max_preguntas_permitidas = 60
+
+        nivel_madurez_raw = request.data.get('nivel_madurez')
+        nivel_madurez = None
+        if nivel_madurez_raw is not None and str(nivel_madurez_raw) != '':
+            try:
+                nivel_madurez = int(nivel_madurez_raw)
+            except (TypeError, ValueError):
+                return Response(
+                    {'error': 'nivel_madurez debe ser un numero entero'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        candidatas_qs = PreguntaEvaluacion.objects.filter(
+            framework__in=evaluacion.frameworks.all(),
+            activo=True,
+        ).select_related('framework')
+
+        if framework_codigo:
+            candidatas_qs = candidatas_qs.filter(framework__codigo=framework_codigo)
+
+        if nivel_madurez is not None:
+            candidatas_qs = candidatas_qs.filter(nivel_madurez=nivel_madurez)
+
+        if seccion:
+            candidatas_qs = candidatas_qs.filter(seccion_general__icontains=seccion)
+
+        candidatas_qs = candidatas_qs.order_by('framework__codigo', 'correlativo')[:300]
+        candidatas = list(candidatas_qs)
+
+        if not candidatas:
+            return Response(
+                {
+                    'success': False,
+                    'message': 'No hay preguntas candidatas con los filtros enviados',
+                    'selected_question_ids': [],
+                    'recommendations': [],
+                    'preguntas_sugeridas': [],
+                },
+                status=status.HTTP_200_OK
+            )
+
+        # Evita preselecciones masivas por defecto y aplica un tope de seguridad.
+        default_max_preguntas = min(25, len(candidatas))
+        max_questions_requested = max_preguntas or default_max_preguntas
+        max_questions_allowed = min(
+            max_questions_requested,
+            len(candidatas),
+            max_preguntas_permitidas,
+        )
+
+        payload = {
+            'empresa_id': evaluacion.empresa_id,
+            'framework': framework_codigo or 'MULTI-FRAMEWORK',
+            'instruction': instruction,
+            'max_questions': max_questions_allowed,
+            'evaluation': {
+                'evaluacion_id': evaluacion.id,
+                'nombre': evaluacion.nombre,
+                'descripcion': evaluacion.descripcion,
+                'nivel_deseado': evaluacion.nivel_deseado,
+                'frameworks': list(evaluacion.frameworks.values_list('codigo', flat=True)),
+            },
+            'candidates': [
+                {
+                    'question_id': pregunta.id,
+                    'framework_codigo': pregunta.framework.codigo,
+                    'codigo_control': pregunta.codigo_control,
+                    'seccion_general': pregunta.seccion_general,
+                    'nivel_madurez': pregunta.nivel_madurez,
+                    'pregunta': pregunta.pregunta[:1200],
+                }
+                for pregunta in candidatas
+            ],
+        }
+
+        auth_header = request.headers.get('Authorization')
+        client = CopilotQuestionSelectorClient(
+            base_url=settings.AI_MICROSERVICE_URL,
+            timeout_seconds=settings.AI_MICROSERVICE_TIMEOUT,
+        )
+
+        try:
+            ai_response = client.suggest_questions(
+                authorization_header=auth_header,
+                payload=payload,
+            )
+        except ValueError as exc:
+            return Response(
+                {'error': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except RuntimeError as exc:
+            return Response(
+                {'error': str(exc)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+
+        selected_raw = ai_response.get('selected_question_ids', [])
+        if not isinstance(selected_raw, list):
+            return Response(
+                {'error': 'Respuesta invalida del microservicio de IA'},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+
+        candidate_ids = {pregunta.id for pregunta in candidatas}
+        selected_ids = [
+            question_id
+            for question_id in selected_raw
+            if isinstance(question_id, int) and question_id in candidate_ids
+        ]
+
+        recomendaciones_raw = ai_response.get('recommendations', [])
+        recomendaciones = []
+        if isinstance(recomendaciones_raw, list):
+            for item in recomendaciones_raw:
+                if not isinstance(item, dict):
+                    continue
+                question_id = item.get('question_id')
+                if isinstance(question_id, int) and question_id in candidate_ids:
+                    recomendaciones.append(item)
+
+        sugeridas_qs = PreguntaEvaluacion.objects.filter(id__in=selected_ids).select_related('framework')
+        serializer = PreguntaEvaluacionListSerializer(sugeridas_qs, many=True)
+        by_id = {item['id']: item for item in serializer.data}
+        preguntas_ordenadas = [by_id[question_id] for question_id in selected_ids if question_id in by_id]
+
+        return Response(
+            {
+                'success': True,
+                'evaluacion_id': evaluacion.id,
+                'framework': payload['framework'],
+                'criterio': ai_response.get('criterio', ''),
+                'total_candidatas': len(candidatas),
+                'total_sugeridas': len(selected_ids),
+                'selected_question_ids': selected_ids,
+                'recommendations': recomendaciones,
+                'preguntas_sugeridas': preguntas_ordenadas,
+            },
+            status=status.HTTP_200_OK
+        )
 
     @action(
         detail=True,
