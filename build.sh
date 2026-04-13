@@ -14,4 +14,7 @@ python manage.py crear_superadmin --no-input
 echo "📊 Cargando datos iniciales de proveedores..."
 python manage.py cargar_datos_proveedores
 
+echo "🛡️  Cargando categorías globales de riesgo..."
+python manage.py seed_categorias_riesgo
+
 echo "✅ Build completado exitosamente"
