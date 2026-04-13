@@ -13,6 +13,7 @@ class Usuario(AbstractUser):
         ('superadmin', 'Super Administrador'),  # <-- NUEVO ROL
         ('administrador', 'Administrador'),
         ('usuario', 'Usuario'),
+        ('analista_riesgos', 'Analista de Riesgos'),
         ('auditor', 'Auditor'),
     ]
     
