@@ -740,15 +740,15 @@ class CalculoNivel(BaseModel):
     )
     
     nivel_actual = models.DecimalField(
-        max_digits=2,
-        decimal_places=1,
+        max_digits=4,
+        decimal_places=2, 
         verbose_name='Nivel Actual',
         help_text='Promedio de nivel_madurez de todas las respuestas del usuario'
     )
     
     gap = models.DecimalField(
-        max_digits=3,
-        decimal_places=1,
+        max_digits=4,
+        decimal_places=2, 
         verbose_name='GAP',
         help_text='Diferencia: Nivel Deseado - Nivel Actual'
     )
@@ -796,6 +796,17 @@ class CalculoNivel(BaseModel):
     calculado_at = models.DateTimeField(
         auto_now=True,
         verbose_name='Fecha de Cálculo'
+    )
+    
+    remediado = models.BooleanField(
+        default=False,
+        verbose_name='Remediado',
+        help_text='True cuando el proyecto de cierre de brecha fue aprobado'
+    )
+    fecha_remediacion = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Fecha de Remediación'
     )
     
     class Meta:

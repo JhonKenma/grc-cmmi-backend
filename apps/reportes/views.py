@@ -705,45 +705,29 @@ class ReporteViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
     def gap_evaluacion_iq(self, request):
         """
-        GET /api/reportes/gap_evaluacion_iq/?asignacion_id={id}
-        Reporte GAP completo para una AsignacionEvaluacionIQ auditada.
+        GET /api/reportes/gap_evaluacion_iq/?evaluacion_id={id}
+        Reporte GAP completo de una Evaluacion IQ (todos los usuarios auditados).
         """
         from .services_iq import ReporteGAPIQService
-        from apps.asignaciones_iq.models import AsignacionEvaluacionIQ
-
-        asignacion_id = request.query_params.get('asignacion_id')
-        if not asignacion_id:
+ 
+        evaluacion_id = request.query_params.get('evaluacion_id')
+        if not evaluacion_id:
             return self.error_response(
-                message='Parámetro asignacion_id es requerido',
+                message='Parámetro evaluacion_id es requerido',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-
-        try:
-            asignacion = AsignacionEvaluacionIQ.objects.select_related(
-                'empresa', 'usuario_asignado'
-            ).get(id=asignacion_id)
-        except AsignacionEvaluacionIQ.DoesNotExist:
-            return self.error_response(
-                message='Asignación no encontrada',
-                status_code=status.HTTP_404_NOT_FOUND
-            )
-
+ 
         user = request.user
-        if user.rol == 'administrador':
-            if asignacion.empresa != user.empresa:
-                return self.error_response(
-                    message='No tienes permiso para ver esta asignación',
-                    status_code=status.HTTP_403_FORBIDDEN
-                )
-        elif user.rol not in ['superadmin', 'auditor']:
-            if asignacion.usuario_asignado != user:
-                return self.error_response(
-                    message='No tienes permiso para ver este reporte',
-                    status_code=status.HTTP_403_FORBIDDEN
-                )
-
+        if user.rol == 'superadmin':
+            empresa_id = request.query_params.get('empresa_id') or user.empresa_id
+        else:
+            empresa_id = user.empresa.id
+ 
         try:
-            reporte = ReporteGAPIQService.obtener_reporte_asignacion(int(asignacion_id))
+            reporte = ReporteGAPIQService.obtener_reporte_evaluacion(
+                evaluacion_id=int(evaluacion_id),
+                empresa_id=empresa_id,
+            )
             return self.success_response(
                 data=reporte,
                 message='Reporte IQ generado exitosamente'
@@ -751,19 +735,21 @@ class ReporteViewSet(viewsets.ViewSet):
         except ValueError as e:
             return self.error_response(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             return self.error_response(
                 message='Error al generar reporte IQ',
                 errors=str(e),
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
+            
     @action(detail=False, methods=['get'])
     def listar_evaluaciones_iq(self, request):
+        """
+        GET /api/reportes/listar_evaluaciones_iq/
+        Lista evaluaciones IQ auditadas de la empresa del usuario.
+        """
         from .services_iq import ReporteGAPIQService
-
-        # Tomar empresa del usuario autenticado en lugar de query param
+ 
         user = request.user
         if user.rol == 'superadmin':
             empresa_id = request.query_params.get('empresa_id')
@@ -774,11 +760,12 @@ class ReporteViewSet(viewsets.ViewSet):
                 )
         else:
             empresa_id = user.empresa.id
-
+ 
         try:
-            data = ReporteGAPIQService.obtener_reportes_empresa(empresa_id)
-            return self.success_response(data={'asignaciones': data})
+            data = ReporteGAPIQService.obtener_evaluaciones_empresa(empresa_id)
+            return self.success_response(data={'evaluaciones': data})
         except Exception as e:
+            import traceback; traceback.print_exc()
             return self.error_response(
                 message=str(e),
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -787,73 +774,76 @@ class ReporteViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
     def export_pdf_evaluacion_iq(self, request):
         """
-        GET /api/reportes/export_pdf_evaluacion_iq/?asignacion_id={id}
+        GET /api/reportes/export_pdf_evaluacion_iq/?evaluacion_id={id}
         """
         from .exporters_iq import PDFExporterIQ
-        from apps.asignaciones_iq.models import AsignacionEvaluacionIQ, CalculoNivelIQ
-
-        asignacion_id = request.query_params.get('asignacion_id')
-        if not asignacion_id:
+        from .services_iq import ReporteGAPIQService
+        from apps.evaluaciones.models import Evaluacion
+ 
+        evaluacion_id = request.query_params.get('evaluacion_id')
+        if not evaluacion_id:
             return self.error_response(
-                message='asignacion_id es requerido',
+                message='evaluacion_id es requerido',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-
+ 
+        user = request.user
+        empresa_id = user.empresa.id if user.rol != 'superadmin' else (
+            request.query_params.get('empresa_id') or user.empresa_id
+        )
+ 
         try:
-            asignacion = AsignacionEvaluacionIQ.objects.select_related(
-                'evaluacion', 'empresa', 'usuario_asignado', 'auditado_por'
-            ).get(id=asignacion_id)
-
-            calculos = CalculoNivelIQ.objects.filter(asignacion=asignacion)
-            exporter = PDFExporterIQ(asignacion, calculos)
-            return exporter.export()
-
-        except AsignacionEvaluacionIQ.DoesNotExist:
-            return self.error_response(
-                message='Asignación no encontrada',
-                status_code=status.HTTP_404_NOT_FOUND
+            reporte = ReporteGAPIQService.obtener_reporte_evaluacion(
+                evaluacion_id=int(evaluacion_id),
+                empresa_id=empresa_id,
             )
+            evaluacion = Evaluacion.objects.get(id=evaluacion_id)
+            exporter = PDFExporterIQ(evaluacion, reporte)
+            return exporter.export()
+        except ValueError as e:
+            return self.error_response(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             return self.error_response(
                 message='Error al generar PDF IQ',
                 errors=str(e),
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+ 
 
     @action(detail=False, methods=['get'])
     def export_excel_evaluacion_iq(self, request):
         """
-        GET /api/reportes/export_excel_evaluacion_iq/?asignacion_id={id}
+        GET /api/reportes/export_excel_evaluacion_iq/?evaluacion_id={id}
         """
         from .exporters_iq import ExcelExporterIQ
-        from apps.asignaciones_iq.models import AsignacionEvaluacionIQ, CalculoNivelIQ
-
-        asignacion_id = request.query_params.get('asignacion_id')
-        if not asignacion_id:
+        from .services_iq import ReporteGAPIQService
+        from apps.evaluaciones.models import Evaluacion
+ 
+        evaluacion_id = request.query_params.get('evaluacion_id')
+        if not evaluacion_id:
             return self.error_response(
-                message='asignacion_id es requerido',
+                message='evaluacion_id es requerido',
                 status_code=status.HTTP_400_BAD_REQUEST
             )
-
+ 
+        user = request.user
+        empresa_id = user.empresa.id if user.rol != 'superadmin' else (
+            request.query_params.get('empresa_id') or user.empresa_id
+        )
+ 
         try:
-            asignacion = AsignacionEvaluacionIQ.objects.select_related(
-                'evaluacion', 'empresa', 'usuario_asignado', 'auditado_por'
-            ).get(id=asignacion_id)
-
-            calculos = CalculoNivelIQ.objects.filter(asignacion=asignacion)
-            exporter = ExcelExporterIQ(asignacion, calculos)
-            return exporter.export()
-
-        except AsignacionEvaluacionIQ.DoesNotExist:
-            return self.error_response(
-                message='Asignación no encontrada',
-                status_code=status.HTTP_404_NOT_FOUND
+            reporte = ReporteGAPIQService.obtener_reporte_evaluacion(
+                evaluacion_id=int(evaluacion_id),
+                empresa_id=empresa_id,
             )
+            evaluacion = Evaluacion.objects.get(id=evaluacion_id)
+            exporter = ExcelExporterIQ(evaluacion, reporte)
+            return exporter.export()
+        except ValueError as e:
+            return self.error_response(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             return self.error_response(
                 message='Error al generar Excel IQ',
                 errors=str(e),
