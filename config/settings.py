@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     'apps.proveedores',
     'apps.documentos',
     'django_extensions',
+    'apps.riesgos',
 
     'drf_spectacular',
     'drf_spectacular_sidecar',
