@@ -106,15 +106,15 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # ═══════════════════════════════════════════════════════
 
 if ENVIRONMENT == 'production':
-    # Cloud SQL via Unix socket (Cloud Run lo conecta automáticamente)
+    # OVHcloud (Cloud SQL Proxy)
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
             'NAME': config('DB_NAME'),
             'USER': config('DB_USER'),
             'PASSWORD': config('DB_PASSWORD'),
-            'HOST': f"/cloudsql/{config('CLOUD_SQL_CONNECTION_NAME')}",
-            'PORT': '5432',
+            'HOST': config('DB_HOST'),
+            'PORT': config('DB_PORT', default='5432'),
         }
     }
 else:
