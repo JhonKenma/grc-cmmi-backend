@@ -60,3 +60,4 @@ celerybeat.pid
 # Logs
 logs/
 *.logapps/respuestas/create.txt
+.env.production
