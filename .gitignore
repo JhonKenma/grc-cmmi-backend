@@ -6,7 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-
+!build.sh
 # Django
 *.log
 local_settings.py
@@ -60,3 +60,4 @@ celerybeat.pid
 # Logs
 logs/
 *.logapps/respuestas/create.txt
+.env.production

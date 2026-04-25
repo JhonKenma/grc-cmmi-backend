@@ -10,11 +10,14 @@ RUN apk add --no-cache \
     bash
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    -i https://pypi.org/simple \
+    --timeout=300 \
+    --retries=5
 
 COPY . .
 RUN chmod +x build.sh
-
+RUN sed -i 's/\r//' build.sh
 EXPOSE 8080
 
 
